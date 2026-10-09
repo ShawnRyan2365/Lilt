@@ -139,18 +139,24 @@ struct MainView: View {
                 Button("管理") { model.selectedPage = .accounts }.buttonStyle(.lilt(.ghost, size: .small))
                     .accessibilityLabel("管理账号")
             }
-            ScrollView(.horizontal) {
-                RunnerTrack(runners: model.runners, activeID: model.library.activeID, disabled: model.busy || model.loading,
-                            onSelect: { id in Task { await model.apply(id) } },
-                            onAdd: model.canAdd ? { model.requestAdd() } : nil) { runner in
-                    accountMenu(runner.id)
-                }
-                .padding(.horizontal, 2).padding(.top, 4)
+            // A row that fits is not a scroll view: macOS still draws a scrollbar when the preference is
+            // “always”, and a row that barely overflows becomes a grey bar under the quota labels.
+            ViewThatFits(in: .horizontal) {
+                runnerTrack
+                ScrollView(.horizontal) { runnerTrack }
+                    .scrollIndicators(.never)
             }
-            .scrollIndicators(.hidden)
         }
         .padding(.leading, 20).padding(.trailing, 12).padding(.top, 12).padding(.bottom, 18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).object()
+    }
+    private var runnerTrack: some View {
+        RunnerTrack(runners: model.runners, activeID: model.library.activeID, disabled: model.busy || model.loading,
+                    onSelect: { id in Task { await model.apply(id) } },
+                    onAdd: model.canAdd ? { model.requestAdd() } : nil) { runner in
+            accountMenu(runner.id)
+        }
+        .padding(.horizontal, 2).padding(.top, 4).padding(.bottom, 2)
     }
     @ViewBuilder private func accountMenu(_ id: UUID) -> some View {
         if let account = model.accounts.first(where: { $0.id == id }) {

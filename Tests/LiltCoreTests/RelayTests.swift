@@ -61,10 +61,39 @@ final class RelayTests {
         active.usage = snapshot(40, 70)
         expectEqual(live.decide(active: active, candidates: [unproven], at: now), .wait)
     }
+    func testRelayKeepsATriggerWhileOtherAccountsAreRead() {
+        var active = Account(label: "Fixture A", kind: .oauth)
+        active.usage = snapshot(0, 40, age: 180)
+        active.usage?.source = UsageParser.statusLineSource
+        var ready = Account(label: "Fixture B", kind: .oauth); ready.usage = snapshot(50, 50)
+        let live = RelayPolicy(threshold: 1, allowUnverifiedHotSwitch: true)
+        // Three minutes old is no longer "just queried", so a plain decision waits.
+        expectEqual(live.decide(active: active, candidates: [ready], at: now), .wait)
+        // Once the hand-off has accepted the reading, time spent reading other accounts does not cancel it.
+        expect(active.usage!.remainsExhausted(threshold: 1, at: now))
+        expectEqual(live.decide(active: active, candidates: [ready], at: now, holdActiveReading: true), .select(ready.id))
+        // A window that has already reset is not held open.
+        active.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(-1)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-180))
+        expectFalse(active.usage!.remainsExhausted(threshold: 1, at: now))
+        expectEqual(live.decide(active: active, candidates: [ready], at: now, holdActiveReading: true), .wait)
+        // The status line is trusted for five minutes, matching how long the endpoint is left alone.
+        expect(snapshot(0, 40, age: 180).exhausted(threshold: 1, at: now, lifetime: 300))
+        expectFalse(snapshot(0, 40, age: 301).exhausted(threshold: 1, at: now, lifetime: 300))
+    }
+    func testSecurityPrintsNonASCIIPasswordsAsHex() {
+        let json = Data(#"{"claudeAiOauth":{"accessToken":"fixture-access","displayName":"fixture-name"}}"#.utf8)
+        let named = Data(#"{"note":"测试 fixture"}"#.utf8)
+        let hex = named.map { String(format: "%02x", $0) }.joined()
+        expectEqual(KeychainPassword.decode(Data((hex + "\n").utf8)), named)
+        expectEqual(KeychainPassword.decode(json + Data([0x0A])), json)
+        // Printed text that is not a hex-encoded JSON object stays as printed.
+        let token = Data("fixture-not-hex".utf8)
+        expectEqual(KeychainPassword.decode(token), token)
+    }
     func testPreferencesWrittenBeforeAutoRelayStillLoad() throws {
         let old = Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8)
         let decoded = try JSONDecoder().decode(Preferences.self, from: old)
-        expectEqual(decoded.autoRelay, nil); expect(decoded.scopeEnabled); expect(decoded.scopeTarget == nil)
+        expectEqual(decoded.autoRelay, nil); expect(decoded.scopeEnabled); expect(decoded.scopeTarget == nil); expectEqual(decoded.soonerWeekly, nil)
         let current = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"scopeTarget":"system"}"#.utf8))
         expect(current.scopeTarget == .system)
     }
@@ -160,6 +189,97 @@ final class RelayTests {
         let s = try UsageParser.parse(Data("{\"five_hour\":{\"utilization\":99},\"seven_day\":null}".utf8), at: now)
         expect(s.exhausted(threshold: 1, at: now)); expectFalse(s.available(threshold: 1, at: now))
     }
+    /// Ten minutes is twice Claude Code's own five-minute refresh buffer. The default threshold stays 1%.
+    func testRenewalLeadIsTwiceTheCLIBuffer() {
+        expectEqual(RelayPolicy.renewalLead, 600)
+        expectEqual(RelayPolicy().threshold, 1)
+        expectEqual(Preferences().threshold, 1)
+        expectFalse(Preferences().soonerWeekly == true)
+    }
+    /// A rejected refresh token stays out of automatic relay even when a later sample looks plentiful.
+    /// Clearing the flag is what reauthorization does. A network message alone does not isolate anyone.
+    func testRejectedRefreshLeavesAutomaticRelayUntilReauthorized() throws {
+        var active = Account(label: "Fixture A", kind: .oauth)
+        active.usage = snapshot(1, 70)
+        var rejected = Account(label: "Fixture B", kind: .oauth)
+        rejected.hotSwitchCapability = .verified
+        rejected.usage = snapshot(90, 90)
+        rejected.refreshRejected = true
+        let policy = RelayPolicy(allowUnverifiedHotSwitch: true)
+        expectEqual(policy.obstacle(for: rejected, at: now), "需重新授权")
+        rejected.usage = snapshot(99, 99)
+        expectEqual(policy.obstacle(for: rejected, at: now), "需重新授权")
+        var open = Account(label: "Fixture C", kind: .oauth)
+        open.hotSwitchCapability = .verified
+        open.usage = snapshot(40, 40)
+        expectEqual(policy.decide(active: active, candidates: [rejected, open], at: now), .select(open.id))
+        guard case .pause = policy.decide(active: active, candidates: [rejected], at: now) else { fatalError("Expected pause") }
+        rejected.refreshRejected = nil
+        expectEqual(policy.obstacle(for: rejected, at: now), nil)
+        expectEqual(policy.decide(active: active, candidates: [rejected], at: now), .select(rejected.id))
+        let old = Data(#"{"id":"00000000-0000-0000-0000-000000000001","label":"Fixture","kind":"oauth","enabled":true,"usageCapability":"unknown","hotSwitchCapability":"unknown"}"#.utf8)
+        expectEqual(try JSONDecoder().decode(Account.self, from: old).refreshRejected, nil)
+        var shaky = open
+        shaky.issue = UsageFailure.network.message
+        expectEqual(policy.obstacle(for: shaky, at: now), nil)
+    }
+    /// The account just left is skipped for 300 seconds, including when it is the only one that looks ready.
+    /// After the cooldown the same account can be chosen again.
+    func testAccountJustLeftIsSkippedUntilTheCooldownEnds() {
+        expectEqual(RelayPolicy.departureCooldown, 300)
+        var active = Account(label: "Fixture A", kind: .oauth)
+        active.usage = snapshot(0.5, 40)
+        var left = Account(label: "Fixture B", kind: .oauth)
+        left.hotSwitchCapability = .verified
+        left.usage = snapshot(80, 80)
+        var other = Account(label: "Fixture C", kind: .oauth)
+        other.hotSwitchCapability = .verified
+        other.usage = snapshot(70, 70)
+        let cooling = RelayPolicy(allowUnverifiedHotSwitch: true, leftRecently: left.id)
+        expectEqual(cooling.obstacle(for: left, at: now), "刚刚离开")
+        expectEqual(cooling.decide(active: active, candidates: [left, other], at: now), .select(other.id))
+        guard case .pause = cooling.decide(active: active, candidates: [left], at: now) else { fatalError("Expected pause") }
+        expectEqual(RelayPolicy.coolingDown(left.id, since: now.addingTimeInterval(-299), at: now), Optional(left.id))
+        expectEqual(RelayPolicy.coolingDown(left.id, since: now.addingTimeInterval(-300), at: now), nil)
+        expectEqual(RelayPolicy.coolingDown(left.id, since: now.addingTimeInterval(10), at: now), nil)
+        let cooled = RelayPolicy(allowUnverifiedHotSwitch: true, leftRecently: RelayPolicy.coolingDown(left.id, since: now.addingTimeInterval(-300), at: now))
+        expectEqual(cooled.decide(active: active, candidates: [left], at: now), .select(left.id))
+    }
+    /// Off by default, so a healthy account is not handed off early. On, it picks the earlier weekly reset
+    /// when both windows are above the threshold, and ignores an unknown reset. At the threshold the user's
+    /// order wins, and nobody under the threshold is chosen just because their window resets sooner.
+    func testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay() {
+        let day = 86_400.0
+        let active = placed("Fixture A", five: 40, week: 50, weekResetsIn: 3 * day)
+        let sooner = placed("Fixture B", five: 30, week: 30, weekResetsIn: day)
+        let later = placed("Fixture C", five: 90, week: 90, weekResetsIn: 6 * day)
+        let unknown = placed("Fixture D", five: 90, week: 90, weekResetsIn: nil)
+        let tied = placed("Fixture I", five: 80, week: 80, weekResetsIn: 3 * day)
+        expectEqual(RelayPolicy().decide(active: active, candidates: [later, sooner], at: now), .wait)
+        let on = RelayPolicy(soonerWeekly: true)
+        expectEqual(on.decide(active: active, candidates: [later, unknown, sooner], at: now), .select(sooner.id))
+        expectEqual(on.decide(active: active, candidates: [unknown], at: now), .wait)
+        expectEqual(on.decide(active: active, candidates: [later], at: now), .wait)
+        expectEqual(on.decide(active: active, candidates: [tied], at: now), .wait)
+        let thin = placed("Fixture E", five: 0.4, week: 80, weekResetsIn: day)
+        expectEqual(on.decide(active: active, candidates: [thin], at: now), .wait)
+        let spent = placed("Fixture A", five: 0.4, week: 40, weekResetsIn: 6 * day)
+        let first = placed("Fixture F", five: 50, week: 50, weekResetsIn: 4 * day)
+        let thinnerSooner = placed("Fixture G", five: 15, week: 15, weekResetsIn: day)
+        expectEqual(on.decide(active: spent, candidates: [first, thinnerSooner], at: now), .select(first.id))
+        let alsoSpent = placed("Fixture H", five: 0.2, week: 0.2, weekResetsIn: day)
+        guard case .pause = on.decide(active: spent, candidates: [alsoSpent], at: now) else { fatalError("Expected pause") }
+    }
+    private func placed(_ label: String, five: Double, week: Double, weekResetsIn: TimeInterval?) -> Account {
+        var account = Account(label: label, kind: .oauth)
+        account.hotSwitchCapability = .verified
+        account.usage = UsageSnapshot(
+            fiveHour: UsageWindow(used: 100 - five, resetsAt: now.addingTimeInterval(3 * 3600)),
+            sevenDay: UsageWindow(used: 100 - week, resetsAt: weekResetsIn.map { now.addingTimeInterval($0) }),
+            sampledAt: now
+        )
+        return account
+    }
 }
 
 func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #file, line: UInt = #line) { precondition(condition(), "Check failed", file: file, line: line) }
@@ -176,6 +296,8 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testResetDoesNotAssumeRefill()
         suite.testCandidatesOrderedEnabledFreshAndVerified()
         suite.testLiveRelayAcceptsUnprovenHotSwitchButNeverUnknownQuota()
+        suite.testRelayKeepsATriggerWhileOtherAccountsAreRead()
+        suite.testSecurityPrintsNonASCIIPasswordsAsHex()
         try suite.testPreferencesWrittenBeforeAutoRelayStillLoad()
         suite.testRenewalKeepsTheRestOfTheDocument()
         suite.testReadBackOnlyAdoptsWhatIsProvablyTheSameLogin()
@@ -183,8 +305,12 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testDuplicateEventClaimedOnce()
         suite.testRetryAfterAndAuthentication()
         try suite.testParserRejectsMalformedAndBooleanUsage()
+        suite.testRenewalLeadIsTwiceTheCLIBuffer()
+        try suite.testRejectedRefreshLeavesAutomaticRelayUntilReauthorized()
+        suite.testAccountJustLeftIsSkippedUntilTheCooldownEnds()
+        suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
         try storageChecks()
-        print("PASS: 13 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing")
+        print("PASS: 19 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly")
     }
 }
 

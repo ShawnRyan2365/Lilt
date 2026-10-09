@@ -15,6 +15,8 @@ struct Runner: Identifiable, Equatable, Sendable {
     var note: String
     /// Colours the note when it needs attention; the note's words still carry the meaning.
     var noteTone: Tone = .neutral
+    /// When each of this account's own windows refreshes, one short line each ("5时 2小时后").
+    var resets: [String] = []
     /// A stopped account: shown, greyed, not selectable.
     var stopped = false
     /// The account's state as an expression.
@@ -36,13 +38,16 @@ struct RunnerTrack<MenuContent: View>: View {
 
     private var activeIndex: Int? { runners.firstIndex { $0.id == activeID } }
 
+    /// Wide enough for “5时 2小时后”. A row that still overflows scrolls without a visible bar.
+    private var column: CGFloat { max(88, orbSize + 44) }
+
     var body: some View {
-        HStack(alignment: .top, spacing: orbSize * 0.14) {
+        HStack(alignment: .top, spacing: 0) {
             ForEach(Array(runners.enumerated()), id: \.element.id) { index, runner in
                 if index > 0 {
                     // Order without words: each account hands on to the one after it.
                     Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(Tokens.faint)
-                        .frame(width: 8, height: orbSize * 1.18 + 10).accessibilityHidden(true)
+                        .frame(width: 14, height: orbSize * 1.18 + 10).accessibilityHidden(true)
                 }
                 let active = runner.id == activeID
                 // Distance from the selected item drives both how far a neighbour leans and how late it moves.
@@ -68,17 +73,21 @@ struct RunnerTrack<MenuContent: View>: View {
                                 .foregroundStyle(active ? AnyShapeStyle(Tokens.ink) : AnyShapeStyle(Tokens.muted))
                             Text(runner.note).font(Typo.caption).monospacedDigit()
                                 .foregroundStyle(runner.noteTone == .neutral ? AnyShapeStyle(Tokens.muted) : runner.noteTone.text)
+                            // Each account's own clocks. The big figures above only describe the account in use.
+                            ForEach(Array(runner.resets.enumerated()), id: \.offset) { _, line in
+                                Text(line).font(Typo.caption).monospacedDigit().foregroundStyle(Tokens.ink)
+                            }
                         }
-                        .lineLimit(1).minimumScaleFactor(0.9)
+                        .lineLimit(1).minimumScaleFactor(0.8)
                     }
-                    .frame(width: orbSize * 1.18 + 30)
+                    .frame(width: column)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(OrbButtonStyle())
                 .disabled(disabled || active || runner.stopped)
                 .contextMenu { menu(runner) }
-                .help(active ? "\(runner.name)（使用中）" : runner.stopped ? "\(runner.name)（已停用）" : "切换到 \(runner.name)")
-                .accessibilityLabel("\(runner.name)，\(runner.note)\(active ? "，使用中" : runner.stopped ? "，已停用" : "")")
+                .help([runner.name, runner.note, runner.resets.joined(separator: "，"), active ? "使用中" : runner.stopped ? "已停用" : "点击切换"].filter { !$0.isEmpty }.joined(separator: "，"))
+                .accessibilityLabel("\(runner.name)，\(runner.note)\(runner.resets.isEmpty ? "" : "，" + runner.resets.joined(separator: "，"))\(active ? "，使用中" : runner.stopped ? "，已停用" : "")")
                 .accessibilityHint(active || runner.stopped ? "" : "切换到此账号")
                 .accessibilityAddTraits(active ? .isSelected : [])
                 .animation(reduceMotion ? nil : Motion.magnetic(distance: far).delay(far * 0.022), value: activeID)
@@ -92,7 +101,7 @@ struct RunnerTrack<MenuContent: View>: View {
                             .frame(width: orbSize * 1.18 + 10, height: orbSize * 1.18 + 10)
                         Text("添加").font(.system(size: 11, weight: .medium)).foregroundStyle(Tokens.muted)
                     }
-                    .frame(width: orbSize * 1.18 + 30)
+                    .frame(width: column)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(OrbButtonStyle())

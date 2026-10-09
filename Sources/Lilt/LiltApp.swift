@@ -28,7 +28,7 @@ struct LiltApp: App {
             MenuPanel(model: model)
         } label: { Image(systemName: model.autoRelay ? "arrow.trianglehead.2.clockwise.rotate.90" : "waveform.path") }
         .menuBarExtraStyle(.window)
-        Settings { SettingsView(model: model).frame(width: 480, height: 340) }
+        Settings { SettingsView(model: model).frame(width: 480, height: 430) }
     }
 }
 @MainActor

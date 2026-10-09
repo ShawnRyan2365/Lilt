@@ -28,7 +28,7 @@ struct AddAccountView: View {
                 .pickerStyle(.segmented).labelsHidden().disabled(model.loggingIn)
             if kind == .oauth {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("在浏览器里用官方 Claude Code 登录，凭据存入本机钥匙串。")
+                    Text("在浏览器里用官方 Claude Code 登录，凭据只保存在这台 Mac 上，仅当前用户可读。")
                         .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
                     if model.loggingIn {
                         HStack(spacing: 8) { ProgressView().controlSize(.small); Text("等待浏览器授权，最多 3 分钟…").font(Typo.caption) }
@@ -285,6 +285,11 @@ struct SettingsView: View {
                 }
             } footer: { Text("默认 1%，可设 0–20%。任一有效窗口的剩余额度达到阈值即触发；未知额度不作为可用候选。") }
             Section {
+                LabeledContent("先用快重置的周额度") {
+                    LiquidToggle(label: "先用快重置的周额度", isOn: Binding(get: { model.soonerWeekly }, set: { model.setSoonerWeekly($0) }), width: 44)
+                }
+            } footer: { Text("这是可选策略，默认关闭，会在当前账号还有额度时提前换走，从而多付一次缓存写入。") }
+            Section {
                 Picker("快速面板快捷键", selection: shortcut) { Text("⌘⌥L").tag(UInt32(37)); Text("⌘⌥J").tag(UInt32(38)); Text("⌘⌥K").tag(UInt32(40)) }
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
             } footer: { Text("在任何应用里按下，打开或收起菜单栏面板。Lilt 无法得知其他应用是否占用了同一组合；按下没有反应时请换一个。") }
@@ -344,7 +349,7 @@ struct MenuPanel: View {
                                 onSelect: { id in Task { if !(await model.apply(id)) { openMain() } } })
                         .padding(.horizontal, 2).padding(.top, 4)
                 }
-                .scrollIndicators(.hidden)
+                .scrollIndicators(.never)
             }
             HStack {
                 let blocker = model.autoRelay ? nil : model.relayBlocker

@@ -12,6 +12,14 @@ enum Wording {
         if seconds < 86400 { return "\(Int((seconds / 3600).rounded())) 小时后重置" }
         return "\(Int((seconds / 86400).rounded())) 天后重置"
     }
+    /// How long until a window refreshes, without the trailing “重置”. Nil after that moment.
+    static func resetAmount(_ date: Date?, now: Date) -> String? {
+        guard let date, date > now else { return nil }
+        let seconds = date.timeIntervalSince(now)
+        if seconds < 3600 { return "\(max(1, Int(seconds / 60))) 分钟" }
+        if seconds < 86400 { return "\(Int((seconds / 3600).rounded())) 小时" }
+        return "\(Int((seconds / 86400).rounded())) 天"
+    }
     static func age(_ date: Date, now: Date) -> String {
         let seconds = now.timeIntervalSince(date)
         if seconds < 60 { return "刚刚更新" }
@@ -71,19 +79,33 @@ struct QuotaSummary {
     /// "72%", "8% 偏低", "已到阈值", "未知".
     var note: String
     var tone: Tone = .neutral
-    /// Both windows, for a row that has room: "5 小时 72% · 7 天 54%", with the reading's age when it is old.
+    /// Both windows, for a row that has room: "5 小时 72% · 2 小时后重置".
     var both: String
+    /// One line per window for the accounts page, remaining and time until that window refreshes.
+    var detailLines: [String]
+    /// One short line per window under a sprite: "5时 2小时后", "7天 3天后".
+    var refreshLines: [String]
     var spoken: String
     /// The same state as an expression for the account's sprite.
     var mood: Mood = .idle
     init(snapshot: UsageSnapshot?, threshold: Double, now: Date) {
-        guard let snapshot else { note = "未获取"; both = "尚未获取额度"; spoken = "尚未获取额度"; return }
-        let entries = [("5 小时", snapshot.fiveHour), ("7 天", snapshot.sevenDay)].compactMap { name, window in
-            snapshot.lastKnownRemaining(window, at: now).map { (name: name, value: $0) }
+        guard let snapshot else {
+            note = "未获取"; both = "尚未获取额度"; detailLines = ["尚未获取额度"]; refreshLines = []; spoken = "尚未获取额度"; return
         }
-        guard let tight = entries.min(by: { $0.value < $1.value }) else { note = "未知"; both = "需重新查询"; spoken = "额度未知，需重新查询"; return }
+        let specs: [(String, String, UsageWindow?)] = [("5 小时", "5时", snapshot.fiveHour), ("7 天", "7天", snapshot.sevenDay)]
+        let entries = specs.compactMap { name, short, window -> (name: String, short: String, value: Double, when: String, compact: String)? in
+            guard let window, let value = snapshot.lastKnownRemaining(window, at: now) else { return nil }
+            let when = Wording.reset(window.resetsAt, now: now) ?? (window.resetsAt == nil ? "重置时间未知" : "已到重置点")
+            let compact = Wording.resetAmount(window.resetsAt, now: now).map { "\(short) \($0.replacingOccurrences(of: " ", with: ""))后" }
+                ?? (window.resetsAt == nil ? "\(short) 未知" : "\(short) 已到点")
+            return (name, short, value, when, compact)
+        }
+        guard let tight = entries.min(by: { $0.value < $1.value }) else {
+            note = "未知"; both = "需重新查询"; detailLines = ["需重新查询"]; refreshLines = []; spoken = "额度未知，需重新查询"; return
+        }
         let state = UsageState(shown: tight.value, sampledAt: snapshot.sampledAt, threshold: threshold, now: now)
-        // Short enough to sit under a sprite; an old reading is just the number, its age is on the accounts page.
+        // The percent stays, but each account also says when its own windows refresh. A percent with no
+        // clock does not answer "when can this one be used again".
         switch state {
         case .reached: note = "已到阈值"
         case .low: note = Wording.percent(tight.value) + " 偏低"
@@ -91,8 +113,10 @@ struct QuotaSummary {
         }
         tone = state?.isOld == false ? state?.tone ?? .neutral : .neutral
         mood = state == .reached ? .asleep : state == .low ? .drowsy : .idle
-        both = entries.map { "\($0.name) \(Wording.percent($0.value))" }.joined(separator: " · ") + (state.map { " · " + $0.text } ?? "")
-        spoken = entries.map { "\($0.name)剩余 \(Wording.percent($0.value))" }.joined(separator: "，") + (state.map { "，" + $0.text } ?? "")
+        detailLines = entries.map { "\($0.name) \(Wording.percent($0.value)) · \($0.when)" }
+        refreshLines = entries.map(\.compact)
+        both = detailLines.joined(separator: " · ") + (state.map { " · " + $0.text } ?? "")
+        spoken = entries.map { "\($0.name)剩余 \(Wording.percent($0.value))，\($0.when)" }.joined(separator: "，") + (state.map { "，" + $0.text } ?? "")
     }
 }
 extension AppModel {
@@ -102,8 +126,10 @@ extension AppModel {
         let slots = spriteSlots
         return accounts.map { account in
             let summary = QuotaSummary(snapshot: account.usage, threshold: threshold, now: now)
-            let note = !account.enabled ? "已停用" : account.usage == nil && account.usageCapability == .unavailable ? "读不到额度" : summary.note
-            return Runner(id: account.id, slot: slots[account.id] ?? 0, name: account.label, note: note, noteTone: account.enabled ? summary.tone : .neutral, stopped: !account.enabled, mood: summary.mood)
+            let blocked = !account.enabled ? "已停用" : account.usage == nil && account.usageCapability == .unavailable ? "读不到额度" : nil
+            let note = blocked ?? summary.note
+            let resets = blocked == nil ? summary.refreshLines : []
+            return Runner(id: account.id, slot: slots[account.id] ?? 0, name: account.label, note: note, noteTone: account.enabled ? summary.tone : .neutral, resets: resets, stopped: !account.enabled, mood: summary.mood)
         }
     }
     /// Each account's sprite silhouette.
@@ -232,9 +258,18 @@ struct AccountRow: View {
                     }
                 }
                 Spacer(minLength: 8)
-                Text(account.usage == nil && account.usageCapability == .unavailable ? "读不到额度" : summary.both).font(Typo.captionStrong).monospacedDigit()
-                    .foregroundStyle(summary.tone == .neutral ? AnyShapeStyle(Tokens.muted) : summary.tone.text)
-                    .accessibilityLabel(summary.spoken)
+                VStack(alignment: .trailing, spacing: 2) {
+                    if account.usage == nil && account.usageCapability == .unavailable {
+                        Text("读不到额度").font(Typo.captionStrong).foregroundStyle(Tokens.muted)
+                    } else {
+                        ForEach(Array(summary.detailLines.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(Typo.captionStrong).monospacedDigit().lineLimit(1)
+                        }
+                        .foregroundStyle(summary.tone == .neutral ? AnyShapeStyle(Tokens.muted) : summary.tone.text)
+                    }
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(summary.spoken)
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("优先级 \(index + 1)，\(account.label)\(active ? "，使用中" : "")\(account.enabled ? "" : "，已停用")，\(capabilities)，\(summary.spoken)\(account.issue.map { "，" + $0 } ?? "")")

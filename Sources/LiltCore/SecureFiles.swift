@@ -2,6 +2,33 @@ import Foundation
 import Darwin
 
 public enum SecureFileError: Error { case unsafePath, cannotCreate, cannotReplace }
+
+/// `security find-generic-password -w` prints an ASCII secret unchanged, and prints a secret that
+/// contains non-ASCII bytes as hex. Both shapes occur for the JSON documents Lilt stores.
+public enum KeychainPassword {
+    public static func decode(_ output: Data) -> Data {
+        var data = output
+        while let last = data.last, last == 0x0A || last == 0x0D { data.removeLast() }
+        guard data.count >= 2, data.count.isMultiple(of: 2), data.allSatisfy(isHex),
+              let decoded = hex(data),
+              (try? JSONSerialization.jsonObject(with: decoded)) is [String: Any] else { return data }
+        return decoded
+    }
+    private static func isHex(_ byte: UInt8) -> Bool {
+        (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+    }
+    private static func hex(_ data: Data) -> Data? {
+        var out = Data(); out.reserveCapacity(data.count / 2)
+        var index = data.startIndex
+        while index < data.endIndex {
+            let next = data.index(index, offsetBy: 2)
+            guard let byte = UInt8(String(bytes: data[index..<next], encoding: .ascii) ?? "", radix: 16) else { return nil }
+            out.append(byte)
+            index = next
+        }
+        return out
+    }
+}
 public enum SecureFiles {
     public static func directory(_ url: URL) throws {
         // Inspect every existing path component, including dangling symlinks.

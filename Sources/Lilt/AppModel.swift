@@ -80,6 +80,9 @@ final class AppModel {
     private var lastStatusLineCheck = Date.distantPast
     private var lastStatusLineRepair = Date.distantPast
     private var latch = RelayLatch()
+    /// Who automatic relay just left, and when. `RelayPolicy.coolingDown` decides whether that still blocks them.
+    private var departedID: UUID?
+    private var departedAt: Date?
     private var monitor: Task<Void, Never>?
     private var usageClient = UsageClient()
     enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", scope = "接入", diagnostics = "诊断"
@@ -108,6 +111,8 @@ final class AppModel {
     var active: Account? { accounts.first { $0.id == library.activeID } }
     var enabledCount: Int { accounts.filter(\.enabled).count }
     var threshold: Double { library.preferences.threshold }
+    /// Off unless the user turns it on. Nil in an older preferences file means off.
+    var soonerWeekly: Bool { library.preferences.soonerWeekly == true }
     var canAdd: Bool { !demo && !busy && storageAvailable }
     var setupComplete: Bool { !accounts.isEmpty && library.preferences.scopeEnabled && active != nil }
     func save() {
@@ -124,6 +129,7 @@ final class AppModel {
         if demo, var real = savedLibrary { change(&real.preferences); savedLibrary = real; persist(real) } else { save() }
     }
     func setThreshold(_ value: Double) { updatePreferences { $0.threshold = min(20, max(0, value)) } }
+    func setSoonerWeekly(_ on: Bool) { updatePreferences { $0.soonerWeekly = on } }
     func setShortcut(_ key: UInt32) { updatePreferences { $0.shortcutKey = key } }
     /// What still stands between the user and live automatic relay, in a few words; nil when it can be turned on.
     /// The demo has no prerequisites.
@@ -176,10 +182,10 @@ final class AppModel {
         guard !busy else { return }
         guard library.activeID != id else { message = "此账号正在使用。请先切换到另一个账号，再删除本地记录。"; return }
         do {
-            if !demo { try Keychain.delete(account: id.uuidString) }
-            if !demo { try? Keychain.delete(account: Keychain.identityAccount(id)) }
+            if !demo { try AccountVault.delete(account: id.uuidString) }
+            if !demo { try? AccountVault.delete(account: Keychain.identityAccount(id)) }
             library.accounts.removeAll { $0.id == id }; backoffs[id] = nil; failures[id] = nil; save()
-        } catch { message = "本地凭据未能删除，请检查钥匙串。" }
+        } catch { message = "本地凭据未能删除。" }
     }
     /// Returns the reason when nothing was saved, so the sheet can show it in place.
     func addToken(label: String, token: String, replacing id: UUID? = nil) async -> String? {
@@ -203,7 +209,7 @@ final class AppModel {
     /// True while `credential` is still what is stored for the account. An answer that arrives after the stored
     /// credential was replaced describes the old one and must not be recorded against the new one.
     private func isCurrent(_ credential: Credential, for id: UUID) -> Bool {
-        guard let stored = (try? Keychain.read(account: id.uuidString)) ?? nil else { return false }
+        guard let stored = (try? storedSecret(id.uuidString)) ?? nil else { return false }
         return OAuthDocument.accessToken(stored) == credential.token
     }
     /// The other account, if any, that is the same Claude account as this identity.
@@ -216,12 +222,12 @@ final class AppModel {
         if let id, !accounts.contains(where: { $0.id == id }) { throw AppFailure("要更新的账号已不存在，未保存任何凭据。") }
         // Without a server-verified stable identity, do not deduplicate by nickname or token.
         let accountID = id ?? UUID()
-        try Keychain.write(credential.data, account: accountID.uuidString)
+        try AccountVault.write(credential.data, account: accountID.uuidString)
         // Whose login this is, when the CLI recorded it. A credential without one must not inherit the previous owner's.
-        if let identity { try Keychain.write(identity, account: Keychain.identityAccount(accountID)) }
-        else { try? Keychain.delete(account: Keychain.identityAccount(accountID)) }
+        if let identity { try AccountVault.write(identity, account: Keychain.identityAccount(accountID)) }
+        else { try? AccountVault.delete(account: Keychain.identityAccount(accountID)) }
         if let id {
-            update(id) { $0.kind = kind; $0.usageCapability = .unknown; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = nil }
+            update(id) { $0.kind = kind; $0.usageCapability = .unknown; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = nil; $0.refreshRejected = nil }
             failures[id] = nil; backoffs[id] = nil
         } else {
             var account = Account(id: accountID, label: label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "新账号 \(accounts.count + 1)" : label, kind: kind)
@@ -229,7 +235,7 @@ final class AppModel {
             library.accounts.append(account); save()
         }
         if !storageAvailable {
-            if id == nil { try? Keychain.delete(account: accountID.uuidString); library.accounts.removeAll { $0.id == accountID } }
+            if id == nil { try? AccountVault.delete(account: accountID.uuidString); library.accounts.removeAll { $0.id == accountID } }
             throw AppFailure("凭据保存后账号资料写入失败，请检查存储。")
         }
     }
@@ -256,23 +262,38 @@ final class AppModel {
             status = "授权已保存"; return nil
         } catch { status = "授权未完成"; return (error as? AppFailure)?.message ?? "官方授权未完成。" }
     }
+    /// Reads a stored secret, and the first time it still lives in the login keychain says so. That move can
+    /// ask for the Mac password once; after the file exists, switching does not touch that item again.
+    private func storedSecret(_ account: String) throws -> Data? {
+        if !demo, !AccountVault.hasFile(account: account) {
+            status = "正在把凭据从钥匙串移到本机，这一次之后切换不再询问密码"
+        }
+        return try AccountVault.read(account: account)
+    }
     private func credential(for id: UUID) throws -> Credential {
-        guard let data = try Keychain.read(account: id.uuidString) else { throw AppFailure("钥匙串中未找到此账号，请重新授权。") }
+        guard let data = try storedSecret(id.uuidString) else { throw AppFailure("没有找到这个账号的本地凭据，请重新授权。") }
         let result = Credential(data: data); try result.validate(); return result
     }
-    private func identity(for id: UUID) -> Data? { (try? Keychain.read(account: Keychain.identityAccount(id))) ?? nil }
+    private func identity(for id: UUID) -> Data? { (try? storedSecret(Keychain.identityAccount(id))) ?? nil }
     /// A stored full login, renewed first when it is about to expire. Never for the account in the scope: there the
     /// official CLI renews it and Lilt reads the result back, so the two cannot spend the same refresh token.
+    /// The lead is `RelayPolicy.renewalLead` (ten minutes), twice Claude Code's own five-minute refresh buffer,
+    /// so the token written into the scope is not already due for the CLI to refresh it again.
     private func renewedCredential(for id: UUID) async throws -> Credential {
         let stored = try credential(for: id)
-        guard !demo, id != library.activeID, stored.refreshable, stored.expires(within: 300) else { return stored }
+        guard !demo, id != library.activeID, stored.refreshable, stored.expires(within: RelayPolicy.renewalLead) else { return stored }
         do {
             let fresh = try await TokenRenewer().renew(stored)
             // Saved before anything else uses it: the old refresh token may already be spent.
-            try Keychain.write(fresh.data, account: id.uuidString)
-            update(id) { $0.expiresAt = fresh.expiresAt }
+            try AccountVault.write(fresh.data, account: id.uuidString)
+            update(id) { $0.expiresAt = fresh.expiresAt; $0.refreshRejected = nil }
             return fresh
-        } catch TokenRenewer.Failure.rejected { throw UsageFailure.authentication }
+        } catch TokenRenewer.Failure.rejected {
+            // A dead refresh token leaves automatic relay until the user authorizes again.
+            // A later usage sample must not put it back. Network failures and 429 are not this error.
+            update(id) { $0.refreshRejected = true }
+            throw UsageFailure.authentication
+        }
         catch is TokenRenewer.Failure { throw UsageFailure.network }
     }
     /// Compare the scope with what Lilt last wrote there. A renewal by the official CLI is taken in silently when it is
@@ -297,7 +318,7 @@ final class AppModel {
     /// profile endpoint is asked. Nil when the question could not be answered at all.
     private func readBack(into account: Account) async -> OAuthDocument.ReadBack? {
         guard !runtime.transactionPending,
-              let stored = (try? Keychain.read(account: account.id.uuidString)) ?? nil,
+              let stored = (try? storedSecret(account.id.uuidString)) ?? nil,
               let found = (try? runtime.currentCredential()) ?? nil, (try? found.validate()) != nil else { return .unverifiable }
         let mine = OAuthDocument.Identity(oauthAccount: identity(for: account.id))
         var verdict = OAuthDocument.readBack(stored: stored, runtime: found.data, storedIdentity: mine,
@@ -309,10 +330,10 @@ final class AppModel {
         }
         guard verdict == .adopt || verdict == .unchanged else { return verdict }
         do {
-            if verdict == .adopt { try Keychain.write(found.data, account: account.id.uuidString) }
+            if verdict == .adopt { try AccountVault.write(found.data, account: account.id.uuidString) }
             try runtime.rebaseline()
             if verdict == .adopt {
-                update(account.id) { $0.expiresAt = found.expiresAt; $0.issue = nil }
+                update(account.id) { $0.expiresAt = found.expiresAt; $0.issue = nil; $0.refreshRejected = nil }
                 failures[account.id] = nil; backoffs[account.id] = nil; status = "已同步官方 CLI 续期的凭据"
             }
             return verdict
@@ -345,7 +366,7 @@ final class AppModel {
             backoffs[id, default: Backoff()].succeed(); failures[id] = nil; status = "额度已更新"
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
             if identity(for: id) == nil, credential.refreshable, let record = await IdentityClient().fetch(credential), isCurrent(credential, for: id) {
-                try? Keychain.write(record, account: Keychain.identityAccount(id))
+                try? AccountVault.write(record, account: Keychain.identityAccount(id))
             }
         } catch {
             // Likewise a failure: if the credential was replaced while the request was out, it says nothing about the new one.
@@ -504,6 +525,7 @@ final class AppModel {
     func startDemo() {
         guard !busy, !loading, !demo else { return }
         savedLibrary = library; savedPending = appliedPending; demo = true; library = Library(); autoRelay = false; appliedPending = false; relayPause = nil
+        departedID = nil; departedAt = nil
         library.preferences = savedLibrary?.preferences ?? Preferences()
         for (i, name) in ["日常创作", "深度工作", "备用账号"].enumerated() {
             var account = Account(label: name, kind: i == 2 ? .setupToken : .oauth)
@@ -516,6 +538,7 @@ final class AppModel {
     func endDemo() {
         guard demo else { return }
         library = savedLibrary ?? Library(); savedLibrary = nil; demo = false; relayPause = nil; appliedPending = savedPending
+        departedID = nil; departedAt = nil
         autoRelay = library.preferences.autoRelay == true && relayBlocker == nil
         lastEvent = "尚无接力记录"; status = "已退出演示"; selectedPage = .overview
     }
@@ -535,28 +558,68 @@ final class AppModel {
         if autoRelay { await relay() } else { status = "演示额度已到阈值，开启自动接力可查看结果" }
     }
     private func relay() async {
-        guard autoRelay, !busy, !loading, let active, let snapshot = active.usage,
-              snapshot.exhausted(threshold: threshold, at: .now) else { return }
+        guard autoRelay, !busy, !loading, let active, let snapshot = active.usage else { return }
+        // A status-line reading is already the session's own report, and the endpoint is not asked again
+        // for five minutes. The hand-off has to be allowed to start from that reading for the whole five
+        // minutes. An endpoint reading is only acted on while it is still the just-queried minute.
+        let lifetime: TimeInterval = (!demo && snapshot.source == UsageParser.statusLineSource) ? 300 : 60
+        let triggered = snapshot.exhausted(threshold: threshold, at: .now, lifetime: lifetime)
+        // The weekly preference may move before the threshold, but only off a fresh reading of the account in use.
+        // Once the threshold is reached that preference stays out of the decision.
+        let early = library.preferences.soonerWeekly == true && !triggered && snapshot.isFresh(at: .now)
+        guard triggered || early else { return }
         // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
         // give up on relaying.
-        if !demo, let until = usagePausedUntil, until > .now { status = "已到阈值，等额度接口恢复后接力"; return }
-        guard latch.claim(account: active.id, snapshot: snapshot) else { return }
-        let policy = RelayPolicy(threshold: threshold, allowUnverifiedHotSwitch: !demo)
+        if !demo, let until = usagePausedUntil, until > .now {
+            if triggered { status = "已到阈值，等额度接口恢复后接力" }
+            return
+        }
+        let policy = RelayPolicy(
+            threshold: threshold,
+            allowUnverifiedHotSwitch: !demo,
+            leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
+            soonerWeekly: early
+        )
         if !demo {
-            // Other accounts are read only now, when a hand-off is due: in priority order, and only until one qualifies.
-            for candidate in accounts where candidate.id != active.id && candidate.enabled && candidate.usageCapability != .unavailable {
-                if policy.obstacle(for: candidate, at: .now) == nil { break }
-                await refresh(candidate.id)
-                if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.obstacle(for: fresh, at: .now) == nil { break }
+            if triggered {
+                // Other accounts are read only now, when a hand-off is due: in priority order, and only until one qualifies.
+                // A rejected refresh token is not asked again, and the account just left is not read in order to come back.
+                for candidate in accounts where candidate.id != active.id && candidate.enabled && candidate.usageCapability != .unavailable {
+                    if candidate.refreshRejected == true || candidate.id == policy.leftRecently { continue }
+                    if policy.obstacle(for: candidate, at: .now) == nil { break }
+                    await refresh(candidate.id)
+                    if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.obstacle(for: fresh, at: .now) == nil { break }
+                }
+            } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > .now {
+                // Only a stored weekly reset that is already earlier can justify a read. Unknown resets stay out,
+                // and a recent check is not repeated on the 15-second monitor.
+                for candidate in accounts where candidate.id != active.id && candidate.enabled && candidate.usageCapability != .unavailable {
+                    if candidate.refreshRejected == true || candidate.id == policy.leftRecently { continue }
+                    guard let reset = candidate.usage?.sevenDay?.resetsAt, reset > .now, reset < activeReset else { continue }
+                    if policy.obstacle(for: candidate, at: .now) == nil { continue }
+                    // Five minutes matches the ordinary relay watch, so opting in does not poll on every monitor tick.
+                    if Date.now.timeIntervalSince(candidate.lastChecked ?? .distantPast) < 300 { continue }
+                    await refresh(candidate.id)
+                }
             }
             // The readings above took time; the user may have switched or turned relay off meanwhile.
-            guard autoRelay, self.active?.id == active.id else { return }
+            // A newer reading of the same account is a different event and is left for the next pass.
+            guard autoRelay, self.active?.id == active.id, self.active?.usage?.sampledAt == snapshot.sampledAt else { return }
         }
-        switch policy.decide(active: self.active, candidates: accounts, at: .now) {
+        switch policy.decide(active: self.active, candidates: accounts, at: .now, holdActiveReading: !demo && triggered) {
         case .select(let id):
+            // Claim only once a candidate is actually chosen. Claiming before the other accounts were
+            // read used up the event whenever that reading took longer than the freshness window:
+            // the decision then came back as "wait" and this exact sample could never trigger again.
+            guard latch.claim(account: active.id, snapshot: snapshot) else { return }
             let name = accounts.first { $0.id == id }?.label ?? ""
-            if await apply(id), !demo { lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)" }
+            if await apply(id) {
+                departedID = active.id; departedAt = .now
+                if !demo { lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)" }
+            }
         case .pause(let reason):
+            // An early look that finds nobody must not stop relay: the account in use still has room.
+            guard triggered else { break }
             let reasons = accounts.filter { $0.id != active.id }
                 .compactMap { account in policy.obstacle(for: account, at: .now).map { "\(account.label)：\($0)" } }
             stopRelay(because: reasons.isEmpty ? reason : reasons.joined(separator: "；"))
@@ -650,7 +713,7 @@ final class AppModel {
         do {
             guard let credential = try runtime.currentCredential() else { throw AppFailure("\(scopeName)里没有可采纳的登录。") }
             try credential.validate()
-            try Keychain.write(credential.data, account: active.id.uuidString)
+            try AccountVault.write(credential.data, account: active.id.uuidString)
             try runtime.rebaseline()
             update(active.id) {
                 $0.expiresAt = credential.expiresAt; $0.issue = nil

@@ -80,7 +80,8 @@ struct BigNumeral: View {
                     .font(Typo.numeral(size)).monospacedDigit().tracking(-size * 0.04)
                     .foregroundStyle(Tokens.ink)
                     .contentTransition(.numericText(value: value))
-                Text("%").font(.system(size: size * 0.42, weight: .medium)).foregroundStyle(Tokens.faint)
+                // The unit is part of the figure. Faint at 0.42 of the number read as a separate mark.
+                Text("%").font(.system(size: size * 0.5, weight: .semibold)).foregroundStyle(Tokens.muted)
             } else {
                 Text(placeholder).font(.system(size: size * 0.5, weight: .medium)).foregroundStyle(Tokens.muted)
             }

@@ -71,15 +71,17 @@ struct Keychain {
 enum CLIKeychain {
     private static let tool = URL(fileURLWithPath: "/usr/bin/security")
     /// The keychain account the CLI files its login under: the macOS user name.
-    static func account() throws -> String {
-        let name = NSUserName()
-        guard !name.isEmpty, name.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else {
-            throw AppFailure("这个 macOS 用户名不能用作钥匙串条目名。")
+    static func account() throws -> String { try validated(NSUserName()) }
+    /// Account names are interpolated into a `security` command. Only the characters a macOS user name
+    /// or a Lilt account id can contain are accepted, so a stored label cannot change the command.
+    private static func validated(_ account: String) throws -> String {
+        guard !account.isEmpty, account.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else {
+            throw AppFailure("这个名称不能用作钥匙串条目名。")
         }
-        return name
+        return account
     }
     @discardableResult
-    private static func run(_ arguments: [String], input: String? = nil) throws -> (status: Int32, output: Data) {
+    private static func run(_ arguments: [String], input: String? = nil, wait: TimeInterval = 5) throws -> (status: Int32, output: Data) {
         let process = Process(); let output = Pipe(); let stdin = Pipe()
         process.executableURL = tool; process.arguments = arguments
         process.standardOutput = output; process.standardError = FileHandle.nullDevice; process.standardInput = stdin
@@ -87,18 +89,17 @@ enum CLIKeychain {
         if let input { try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8)) }
         try? stdin.fileHandleForWriting.close()
         // A keychain waiting for the user to allow access would otherwise hold Lilt up indefinitely.
-        let deadline = Date.now.addingTimeInterval(5)
+        let deadline = Date.now.addingTimeInterval(wait)
         while process.isRunning && Date.now < deadline { usleep(10_000) }
         if process.isRunning { process.terminate(); throw AppFailure("钥匙串没有响应，可能在等你允许访问。") }
         return (process.terminationStatus, output.fileHandleForReading.readDataToEndOfFile())
     }
-    static func read(service: String) throws -> Data? {
-        let result = try run(["find-generic-password", "-s", service, "-a", try account(), "-w"])
+    static func read(service: String, account explicit: String? = nil, wait: TimeInterval = 5) throws -> Data? {
+        let name = try explicit.map { try validated($0) } ?? account()
+        let result = try run(["find-generic-password", "-s", service, "-a", name, "-w"], wait: wait)
         if result.status == 44 { return nil }
-        guard result.status == 0 else { throw AppFailure("读取 Claude Code 登录失败（钥匙串返回 \(result.status)）。") }
-        var data = result.output
-        if data.last == 0x0A { data.removeLast() }
-        return data
+        guard result.status == 0 else { throw AppFailure("读取钥匙串失败（返回 \(result.status)）。") }
+        return KeychainPassword.decode(result.output)
     }
     static func write(_ data: Data, service: String) throws {
         let hex = data.map { String(format: "%02x", $0) }.joined()
@@ -108,9 +109,52 @@ enum CLIKeychain {
         let result = try run(["-i"], input: command)
         guard result.status == 0 else { throw AppFailure("写入 Claude Code 登录失败（钥匙串返回 \(result.status)）。") }
     }
-    static func delete(service: String) throws {
-        let result = try run(["delete-generic-password", "-s", service, "-a", try account()])
+    static func delete(service: String, account explicit: String? = nil) throws {
+        let name = try explicit.map { try validated($0) } ?? account()
+        let result = try run(["delete-generic-password", "-s", service, "-a", name])
         guard result.status == 0 || result.status == 44 else { throw AppFailure("无法删除钥匙串里的临时登录。") }
+    }
+}
+/// Lilt's own copies of account logins and identity records. These used to live in the login keychain
+/// under `app.lilt.accounts`. An ad-hoc signature changes on every rebuild, which drops the keychain's
+/// "always allow" and asks for the Mac password on the next access — once per account, so every switch
+/// asked. A 0600 file in Lilt's own directory does not. The official CLI's login item is untouched.
+enum AccountVault {
+    private static var directory: URL { Disk.root.appendingPathComponent("secrets") }
+    private static func file(_ account: String) throws -> URL {
+        guard !account.isEmpty, account.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else {
+            throw AppFailure("凭据名称无效。")
+        }
+        return directory.appendingPathComponent(account)
+    }
+    static func hasFile(account: String) -> Bool {
+        guard let url = try? file(account), FileManager.default.fileExists(atPath: url.path) else { return false }
+        return (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true
+    }
+    static func read(account: String) throws -> Data? {
+        let url = try file(account)
+        if FileManager.default.fileExists(atPath: url.path) {
+            guard try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { throw AppFailure("凭据文件是符号链接，已拒绝读取。") }
+            return try Data(contentsOf: url)
+        }
+        // One-time move. The wait is long enough to type the login password if macOS asks this once.
+        guard let legacy = try CLIKeychain.read(service: Keychain.service, account: account, wait: 90) else { return nil }
+        try write(legacy, account: account)
+        return legacy
+    }
+    static func write(_ data: Data, account: String) throws {
+        try Disk.directory(directory)
+        try Disk.write(data, to: try file(account))
+        // The login-keychain copy is what kept prompting. It is only removed after the file is in place.
+        try? CLIKeychain.delete(service: Keychain.service, account: account)
+    }
+    static func delete(account: String) throws {
+        let url = try file(account)
+        if FileManager.default.fileExists(atPath: url.path) {
+            guard try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { throw AppFailure("凭据文件是符号链接，没有删除。") }
+            try FileManager.default.removeItem(at: url)
+        }
+        try? CLIKeychain.delete(service: Keychain.service, account: account)
     }
 }
 struct Disk {

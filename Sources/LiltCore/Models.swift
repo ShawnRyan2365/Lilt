@@ -23,8 +23,8 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         let age = now.timeIntervalSince(sampledAt)
         return age >= 0 && age <= lifetime
     }
-    public func validRemaining(_ window: UsageWindow?, at now: Date) -> Double? {
-        guard isFresh(at: now), let window, window.resetsAt.map({ $0 > now }) ?? true else { return nil }
+    public func validRemaining(_ window: UsageWindow?, at now: Date, lifetime: TimeInterval = 60) -> Double? {
+        guard isFresh(at: now, lifetime: lifetime), let window, window.resetsAt.map({ $0 > now }) ?? true else { return nil }
         return window.remaining
     }
     /// Display only: the last observed value even after the sample went stale. Relay decisions never read this.
@@ -32,8 +32,14 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         guard sampledAt <= now, let window, window.resetsAt.map({ $0 > now }) ?? true else { return nil }
         return window.remaining
     }
-    public func exhausted(threshold: Double, at now: Date) -> Bool {
-        [fiveHour, sevenDay].contains { validRemaining($0, at: now).map { $0 <= threshold + 0.000001 } ?? false }
+    public func exhausted(threshold: Double, at now: Date, lifetime: TimeInterval = 60) -> Bool {
+        [fiveHour, sevenDay].contains { validRemaining($0, at: now, lifetime: lifetime).map { $0 <= threshold + 0.000001 } ?? false }
+    }
+    /// The reading still puts a window at or under the threshold, after it has already qualified and Lilt has
+    /// spent time reading the other accounts. Age no longer matters; a window that has since reset does not count.
+    public func remainsExhausted(threshold: Double, at now: Date) -> Bool {
+        guard sampledAt <= now else { return false }
+        return [fiveHour, sevenDay].contains { lastKnownRemaining($0, at: now).map { $0 <= threshold + 0.000001 } ?? false }
     }
     public func available(threshold: Double, at now: Date) -> Bool {
         [fiveHour, sevenDay].allSatisfy { validRemaining($0, at: now).map { $0 > threshold + 0.000001 } ?? false }
@@ -50,6 +56,10 @@ public struct Account: Identifiable, Codable, Equatable, Sendable {
     public var expiresAt: Date?
     public var lastChecked: Date?
     public var issue: String?
+    /// The refresh token was rejected. Automatic relay skips this account until a new authorization
+    /// is stored. A later usage sample does not clear it. A dropped connection or a 429 never sets it.
+    /// Optional so account files written before it existed still load.
+    public var refreshRejected: Bool?
     public init(id: UUID = UUID(), label: String, kind: AuthKind) { self.id = id; self.label = label; self.kind = kind }
 }
 /// Where Lilt puts the selected account's login.
@@ -71,6 +81,10 @@ public struct Preferences: Codable, Sendable {
     public var scopeTarget: ScopeTarget?
     /// Read quota from Claude Code's status line. Nil means on.
     public var liveUsage: Bool?
+    /// Use an account whose 7-day window resets sooner, even while the active account is still above
+    /// the threshold. Nil and false keep the user's order and wait for the threshold. Optional so
+    /// preference files written before the choice existed still load.
+    public var soonerWeekly: Bool?
     public init() {}
 }
 public struct Library: Codable, Sendable {
@@ -87,25 +101,76 @@ public struct RelayPolicy: Sendable {
     /// Live accounts have no way yet to prove that a running CLI picks up swapped credentials. When true,
     /// "not proven" is accepted and only "known not to work" is refused; the demo keeps the strict rule.
     public var allowUnverifiedHotSwitch: Bool
-    public init(threshold: Double = 1, allowUnverifiedHotSwitch: Bool = false) {
+    /// The account automatic relay just left, while `departureCooldown` still applies. Nil once that
+    /// window has passed. AppModel only remembers who left and when; `coolingDown` turns that into this value.
+    public var leftRecently: UUID?
+    /// When true, a healthy active account may hand off to one whose 7-day window resets sooner.
+    /// Off by default. Reaching the threshold ignores this and keeps the user's order.
+    public var soonerWeekly: Bool
+    /// How long before expiry a target account's access token is renewed.
+    /// Claude Code refreshes on its own about five minutes ahead. Ten minutes is twice that buffer,
+    /// so a token written into the scope is not already inside the CLI's refresh window.
+    /// The account currently in the scope is never renewed here.
+    public static let renewalLead: TimeInterval = 600
+    /// After an automatic hand-off, the account just left cannot be selected again until this many
+    /// seconds have passed. Two accounts sitting just above the threshold would otherwise swap on
+    /// every sample. This is not a second threshold and not a ten-point lag.
+    public static let departureCooldown: TimeInterval = 300
+    public init(threshold: Double = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false) {
         self.threshold = min(100, max(0, threshold)); self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
+        self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly
+    }
+    /// The id to pass as `leftRecently`, or nil once the cooldown has elapsed or the clock is skewed.
+    public static func coolingDown(_ account: UUID?, since leftAt: Date?, at now: Date) -> UUID? {
+        guard let account, let leftAt else { return nil }
+        let age = now.timeIntervalSince(leftAt)
+        guard age >= 0, age < departureCooldown else { return nil }
+        return account
     }
     /// Why an account cannot take the baton right now, or nil when it can. Unknown quota is a reason, never a pass.
     public func obstacle(for candidate: Account, at now: Date) -> String? {
         if !candidate.enabled { return "已停用" }
+        // A dead refresh token stays out through later plentiful samples. Only a new authorization clears it.
+        if candidate.refreshRejected == true { return "需重新授权" }
         if let expiry = candidate.expiresAt, expiry <= now { return "令牌已到期，需续期" }
         if candidate.hotSwitchCapability == .unavailable || (candidate.hotSwitchCapability == .unknown && !allowUnverifiedHotSwitch) { return "热切换未验证" }
         if candidate.usageCapability == .unavailable { return "读不到额度" }
         guard let usage = candidate.usage else { return "额度未知" }
         guard usage.isFresh(at: now) else { return "读数不是刚查的" }
-        return usage.available(threshold: threshold, at: now) ? nil : "额度不足或不完整"
+        if !usage.available(threshold: threshold, at: now) { return "额度不足或不完整" }
+        // Only an account that would otherwise qualify says it just left. Anyone else keeps their own reason.
+        if candidate.id == leftRecently { return "刚刚离开" }
+        return nil
     }
-    public func decide(active: Account?, candidates: [Account], at now: Date) -> RelayDecision {
-        guard let active, let usage = active.usage, usage.exhausted(threshold: threshold, at: now) else { return .wait }
+    public func decide(active: Account?, candidates: [Account], at now: Date, holdActiveReading: Bool = false) -> RelayDecision {
+        guard let active, let usage = active.usage else { return .wait }
+        let triggered = holdActiveReading ? usage.remainsExhausted(threshold: threshold, at: now) : usage.exhausted(threshold: threshold, at: now)
+        // Below the threshold nothing moves, unless the user opted into spending a weekly window that resets sooner.
+        // At the threshold the user's order stands: this preference must not pull a worse account forward.
+        if !triggered {
+            guard soonerWeekly else { return .wait }
+            return soonerWeeklyDecision(active: active, usage: usage, candidates: candidates, at: now)
+        }
         for candidate in candidates where candidate.id != active.id {
             if obstacle(for: candidate, at: now) == nil { return .select(candidate.id) }
         }
         return .pause("没有已确认可接力的账号；保留当前会话。")
+    }
+    /// The account whose 7-day window resets first, when that is sooner than the active account and both of its
+    /// windows are above the threshold. An unknown reset does not qualify. Wait, rather than pause, when nobody
+    /// does: the active account still has room.
+    private func soonerWeeklyDecision(active: Account, usage: UsageSnapshot, candidates: [Account], at now: Date) -> RelayDecision {
+        guard usage.isFresh(at: now), let activeReset = usage.sevenDay?.resetsAt, activeReset > now else { return .wait }
+        var chosen: UUID?
+        var earliest: Date?
+        for candidate in candidates where candidate.id != active.id {
+            guard obstacle(for: candidate, at: now) == nil else { continue }
+            guard let reset = candidate.usage?.sevenDay?.resetsAt, reset > now, reset < activeReset else { continue }
+            if let earliest, reset >= earliest { continue }
+            chosen = candidate.id; earliest = reset
+        }
+        if let chosen { return .select(chosen) }
+        return .wait
     }
 }
 /// A trigger remains consumed even if applying fails. Explicit rearming requires a new observation.
