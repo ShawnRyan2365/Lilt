@@ -33,6 +33,20 @@ enum DebugLaunch {
         if environment["LILT_RELAY"] == "1" { model.setAutoRelay(true) }
         if environment["LILT_SIMULATE"] == "1" { Task { await model.simulateThreshold() } }
         if environment["LILT_PENDING"] == "1" { model.appliedPending = true }
+        // LILT_STATUSLINE=install|uninstall exercises the status line bridge. Only inside a fake home
+        // (CFFIXED_USER_HOME), so a check can never touch the real ~/.claude/settings.json.
+        if let action = environment["LILT_STATUSLINE"], let fake = environment["CFFIXED_USER_HOME"], !fake.isEmpty,
+           FileManager.default.homeDirectoryForCurrentUser.path == fake {
+            do {
+                if action == "install" { try StatusLineBridge.install(); StatusLineBridge.setLabel("Fixture") }
+                if action == "uninstall" { try StatusLineBridge.uninstall() }
+                print("statusline \(action): ok, installed=\(StatusLineBridge.isInstalled)")
+            } catch { print("statusline \(action): \(error)") }
+        }
+        // LILT_AGE=<seconds> backdates the demo readings, to look at how old readings are shown.
+        if let age = environment["LILT_AGE"].flatMap(Double.init), model.demo {
+            for account in model.accounts { model.update(account.id) { $0.usage?.sampledAt = Date.now.addingTimeInterval(-age) } }
+        }
     }
 }
 #endif

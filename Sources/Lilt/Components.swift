@@ -20,14 +20,20 @@ enum Wording {
     }
 }
 /// What a reading means for the user right now, in words as well as colour.
-enum UsageState {
-    case reached, low, stale
-    var text: String { switch self { case .reached: "已到阈值"; case .low: "偏低"; case .stale: "已过期" } }
-    var tone: Tone { switch self { case .reached: .danger; case .low: .warning; case .stale: .neutral } }
-    /// `fresh` is the value relay rules may use; `shown` may be an older reading kept on screen for reference.
-    init?(fresh: Double?, shown: Double?, threshold: Double) {
-        if let fresh { if fresh <= threshold + 0.000001 { self = .reached } else if fresh <= 10 { self = .low } else { return nil } }
-        else if shown != nil { self = .stale } else { return nil }
+/// Readings are taken every few minutes, so a reading of a few minutes is current. Only one that is over an hour old
+/// is called out, by its age; nothing here ever says "expired", which reads as if the account had run out.
+enum UsageState: Equatable {
+    case reached, low, old(String)
+    static let oldAfter: TimeInterval = 3600
+    var text: String { switch self { case .reached: "已到阈值"; case .low: "偏低"; case .old(let age): age } }
+    var tone: Tone { switch self { case .reached: .danger; case .low: .warning; case .old: .neutral } }
+    var isOld: Bool { if case .old = self { true } else { false } }
+    init?(shown: Double?, sampledAt: Date?, threshold: Double, now: Date) {
+        guard let shown else { return nil }
+        if let sampledAt, now.timeIntervalSince(sampledAt) > Self.oldAfter {
+            self = .old(Wording.age(sampledAt, now: now).replacingOccurrences(of: "更新", with: "的读数")); return
+        }
+        if shown <= threshold + 0.000001 { self = .reached } else if shown <= 10 { self = .low } else { return nil }
     }
 }
 /// One quota window of an account, drawn with the design layer's readout.
@@ -43,11 +49,10 @@ struct UsageMeter: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 15)) { context in
             let now = max(context.date, .now)
-            let fresh = snapshot?.validRemaining(window, at: now)
-            let shown = fresh ?? snapshot?.lastKnownRemaining(window, at: now)
-            let state = UsageState(fresh: fresh, shown: shown, threshold: threshold)
+            let shown = snapshot?.lastKnownRemaining(window, at: now)
+            let state = UsageState(shown: shown, sampledAt: snapshot?.sampledAt, threshold: threshold, now: now)
             let reset = Wording.reset(window?.resetsAt, now: now)
-            QuotaReadout(title: title, remaining: shown, threshold: threshold, stale: state == .stale,
+            QuotaReadout(title: title, remaining: shown, threshold: threshold, staleNote: state?.isOld == true ? state?.text : nil,
                          placeholder: snapshot == nil ? (unreadable ? "读不到" : "未获取") : "未知",
                          footnote: reset ?? (snapshot == nil ? (unreadable ? "此凭据没有额度权限" : "尚未获取额度") : shown == nil ? "需重新查询" : "重置时间未知"),
                          compact: compact)
@@ -58,16 +63,15 @@ struct UsageMeter: View {
     private func spoken(shown: Double?, state: UsageState?, reset: String?) -> String {
         let name = "\(title)窗口"
         guard let shown else { return "\(name)，\(snapshot == nil ? (unreadable ? "此凭据没有额度权限" : "尚未获取额度") : "额度未知，需重新查询")" }
-        let reading = state == .stale ? "上次读数剩余 \(Wording.percent(shown))，数据已过期" : "剩余 \(Wording.percent(shown))"
-        return ([name, reading] + (state == .stale ? [] : [state?.text]).compactMap { $0 } + [reset].compactMap { $0 }).joined(separator: "，")
+        return ([name, "剩余 \(Wording.percent(shown))", state?.text, reset].compactMap { $0 }).joined(separator: "，")
     }
 }
 /// An account's quota in a few characters. Only the tighter window is named in `note`, since that is the one that runs out first.
 struct QuotaSummary {
-    /// "72%", "8% 偏低", "已到阈值", "54% 过期", "未知".
+    /// "72%", "8% 偏低", "已到阈值", "未知".
     var note: String
     var tone: Tone = .neutral
-    /// Both windows, for a row that has room: "5 小时 72% · 7 天 54%".
+    /// Both windows, for a row that has room: "5 小时 72% · 7 天 54%", with the reading's age when it is old.
     var both: String
     var spoken: String
     /// The same state as an expression for the account's sprite.
@@ -75,18 +79,17 @@ struct QuotaSummary {
     init(snapshot: UsageSnapshot?, threshold: Double, now: Date) {
         guard let snapshot else { note = "未获取"; both = "尚未获取额度"; spoken = "尚未获取额度"; return }
         let entries = [("5 小时", snapshot.fiveHour), ("7 天", snapshot.sevenDay)].compactMap { name, window in
-            snapshot.lastKnownRemaining(window, at: now).map { (name: name, value: $0, fresh: snapshot.validRemaining(window, at: now)) }
+            snapshot.lastKnownRemaining(window, at: now).map { (name: name, value: $0) }
         }
         guard let tight = entries.min(by: { $0.value < $1.value }) else { note = "未知"; both = "需重新查询"; spoken = "额度未知，需重新查询"; return }
-        let state = UsageState(fresh: tight.fresh, shown: tight.value, threshold: threshold)
-        // Short enough to sit under an orb.
+        let state = UsageState(shown: tight.value, sampledAt: snapshot.sampledAt, threshold: threshold, now: now)
+        // Short enough to sit under a sprite; an old reading is just the number, its age is on the accounts page.
         switch state {
         case .reached: note = "已到阈值"
         case .low: note = Wording.percent(tight.value) + " 偏低"
-        case .stale: note = Wording.percent(tight.value) + " 过期"
-        case nil: note = Wording.percent(tight.value)
+        case .old, nil: note = Wording.percent(tight.value)
         }
-        tone = state?.tone ?? .neutral
+        tone = state?.isOld == false ? state?.tone ?? .neutral : .neutral
         mood = state == .reached ? .asleep : state == .low ? .drowsy : .idle
         both = entries.map { "\($0.name) \(Wording.percent($0.value))" }.joined(separator: " · ") + (state.map { " · " + $0.text } ?? "")
         spoken = entries.map { "\($0.name)剩余 \(Wording.percent($0.value))" }.joined(separator: "，") + (state.map { "，" + $0.text } ?? "")
@@ -238,7 +241,7 @@ struct AccountRow: View {
             if !active {
                 Button("切换") { Task { await model.apply(account.id) } }
                     .buttonStyle(.lilt(.secondary, size: .small)).disabled(!canSwitch)
-                    .help("把此账号的凭据写入 Lilt 作用域").accessibilityLabel("切换到 \(account.label)")
+                    .help("切换到此账号").accessibilityLabel("切换到 \(account.label)")
             }
             Menu {
                 Button("刷新额度") { Task { await model.refresh(account.id) } }

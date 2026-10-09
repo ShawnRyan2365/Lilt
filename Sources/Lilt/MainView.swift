@@ -11,9 +11,8 @@ struct MainView: View {
     @State private var statusToast = Transient()
     @State private var pointer = PointerTracker()
     @State private var refreshSpin = 0
-    @AppStorage(SetupCard.handledKey) private var launchHandled = false
     /// First-run steps are still open. The demo has nothing to set up.
-    private var setupPending: Bool { !model.demo && (!model.setupComplete || !launchHandled) }
+    private var setupPending: Bool { !model.demo && (!model.managesDefaultLogin || !model.setupComplete) }
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
@@ -69,11 +68,11 @@ struct MainView: View {
             Button("删除本地记录与凭据", role: .destructive) { if let account = deleteAccount { model.remove(account.id) }; deleteAccount = nil }
             Button("取消", role: .cancel) { deleteAccount = nil }
         } message: { Text("仅删除 Lilt 保存的资料；不会向官方撤销授权。") }
-        .confirmationDialog("作用域里的凭据不是 Lilt 写的那一份", isPresented: $model.confirmingAdopt, titleVisibility: .visible) {
+        .confirmationDialog("\(model.scopeName)里的登录不是 Lilt 写的那一份", isPresented: $model.confirmingAdopt, titleVisibility: .visible) {
             Button("仍是“\(model.active?.label ?? "")”，采纳它") { model.adoptScopeCredential() }
             Button("不是，改回“\(model.active?.label ?? "")”") { model.reclaimScope() }
             Button("取消", role: .cancel) {}
-        } message: { Text("在 CLI 里运行 /status 看当前是谁。采纳：把现在的凭据存为这个账号的，替换原来保存的那份。改回：用保存的那份覆盖作用域里现在的凭据。") }
+        } message: { Text("在终端运行 claude 后用 /status 看当前是谁。采纳：把现在的登录存为这个账号的，替换原来保存的那份。改回：用 Lilt 保存的那份覆盖现在的登录。") }
     }
 
     // MARK: Demo
@@ -219,7 +218,8 @@ struct MainView: View {
             VStack(spacing: 0) {
                 fact("Claude Code", model.version.replacingOccurrences(of: " (Claude Code)", with: ""))
                 fact("系统", "macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)")
-                fact("凭据作用域", "Lilt 专属目录")
+                fact("接入方式", !model.library.preferences.scopeEnabled ? "未接管" : model.scopeTarget == .system ? "Claude Code 默认登录" : "Lilt 专属目录")
+                fact("实时额度", !model.managesDefaultLogin ? "未接管默认登录" : !model.liveUsageEnabled ? "关闭（按时查询接口）" : model.liveUsageSampledAt.map { "状态栏 · \(Wording.age($0, now: .now))" } ?? "状态栏 · 尚无读数")
                 fact("模型转发", "无", last: true)
             }
             .padding(.horizontal, 20).padding(.vertical, 6).object()

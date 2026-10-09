@@ -54,7 +54,7 @@ final class RelayTests {
         // Unreadable, stale and known-broken accounts are never chosen, and each says why.
         guard case .pause = live.decide(active: active, candidates: [tokenOnly, stale, refused], at: now) else { fatalError("Expected pause") }
         expectEqual(live.obstacle(for: tokenOnly, at: now), "读不到额度")
-        expectEqual(live.obstacle(for: stale, at: now), "额度数据已过期")
+        expectEqual(live.obstacle(for: stale, at: now), "读数不是刚查的")
         expectEqual(live.obstacle(for: refused, at: now), "热切换未验证")
         expectEqual(live.obstacle(for: unproven, at: now), nil)
         // Nothing happens while the account in use is above the threshold.
@@ -64,7 +64,9 @@ final class RelayTests {
     func testPreferencesWrittenBeforeAutoRelayStillLoad() throws {
         let old = Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8)
         let decoded = try JSONDecoder().decode(Preferences.self, from: old)
-        expectEqual(decoded.autoRelay, nil); expect(decoded.scopeEnabled)
+        expectEqual(decoded.autoRelay, nil); expect(decoded.scopeEnabled); expect(decoded.scopeTarget == nil)
+        let current = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"scopeTarget":"system"}"#.utf8))
+        expect(current.scopeTarget == .system)
     }
     // Every token below is a made-up placeholder; none of them has ever been issued.
     func document(access: String, refresh: String?, expiresIn seconds: Double, extra: [String: Any] = [:]) -> Data {
@@ -118,6 +120,29 @@ final class RelayTests {
         expectEqual(OAuthDocument.Identity(oauthAccount: record), me)
         expect(OAuthDocument.identityRecord(fromProfile: Data(#"{"organization":{"uuid":"fixture-org"}}"#.utf8)) == nil)
     }
+    func testStatusLineReadingsAreParsedAndMatchedToTheirAccount() {
+        let record = Data(#"{"at":1800000000,"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1800003600},"seven_day":{"used_percentage":41.200000000000003,"resets_at":1800300000}}}"#.utf8)
+        let live = UsageParser.parseStatusLine(record)!
+        expectEqual(live.sampledAt, now)
+        expectEqual(live.fiveHour?.remaining, 76.5)
+        expectEqual(live.sevenDay?.resetsAt, Date(timeIntervalSince1970: 1800300000))
+        expectEqual(live.source, UsageParser.statusLineSource)
+        for bad in ["garbage", "{}", #"{"at":1800000000}"#, #"{"at":1800000000,"rate_limits":{}}"#, #"{"at":1800000000,"rate_limits":{"five_hour":{"used_percentage":true}}}"#] {
+            expect(UsageParser.parseStatusLine(Data(bad.utf8)) == nil)
+        }
+        // Same account: windows reset at the same moments, give or take rounding.
+        let known = UsageSnapshot(fiveHour: UsageWindow(used: 20, resetsAt: now.addingTimeInterval(3540)), sevenDay: UsageWindow(used: 40, resetsAt: now.addingTimeInterval(300000)), sampledAt: now.addingTimeInterval(-300))
+        expect(live.sharesWindows(with: known, at: now))
+        // A session still on another account: its windows reset at other times.
+        let other = UsageSnapshot(fiveHour: UsageWindow(used: 90, resetsAt: now.addingTimeInterval(9000)), sevenDay: UsageWindow(used: 10, resetsAt: now.addingTimeInterval(500000)), sampledAt: now)
+        expectFalse(live.sharesWindows(with: other, at: now))
+        // Once the known 5-hour window has reset, only the weekly one is compared.
+        let rolled = UsageSnapshot(fiveHour: UsageWindow(used: 99, resetsAt: now.addingTimeInterval(-60)), sevenDay: UsageWindow(used: 40, resetsAt: now.addingTimeInterval(300000)), sampledAt: now.addingTimeInterval(-3000))
+        expect(live.sharesWindows(with: rolled, at: now))
+        // Nothing left to compare: not accepted.
+        let blind = UsageSnapshot(fiveHour: UsageWindow(used: 20), sevenDay: nil, sampledAt: now)
+        expectFalse(live.sharesWindows(with: blind, at: now))
+    }
     func testDuplicateEventClaimedOnce() {
         var latch = RelayLatch(); let id = UUID(); let s = snapshot(1, 1)
         expect(latch.claim(account: id, snapshot: s)); expectFalse(latch.claim(account: id, snapshot: s))
@@ -154,11 +179,12 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try suite.testPreferencesWrittenBeforeAutoRelayStillLoad()
         suite.testRenewalKeepsTheRestOfTheDocument()
         suite.testReadBackOnlyAdoptsWhatIsProvablyTheSameLogin()
+        suite.testStatusLineReadingsAreParsedAndMatchedToTheirAccount()
         suite.testDuplicateEventClaimedOnce()
         suite.testRetryAfterAndAuthentication()
         try suite.testParserRejectsMalformedAndBooleanUsage()
         try storageChecks()
-        print("PASS: 12 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, stored preferences, token renewal, read-back, deduplication, backoff, parsing")
+        print("PASS: 13 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing")
     }
 }
 

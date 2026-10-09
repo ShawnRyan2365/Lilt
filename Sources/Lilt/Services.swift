@@ -76,6 +76,25 @@ struct TokenRenewer {
     }
 }
 
+/// Whether ORCA is switching Claude accounts on this Mac too. Read-only and best effort: a flag in ORCA's own data
+/// file, whose layout may change between ORCA versions. Nothing else from ORCA is read.
+enum OrcaProbe {
+    static func managesDefaultLogin() -> Bool {
+        let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        let apps = (try? FileManager.default.contentsOfDirectory(atPath: support.path))?.filter { $0.lowercased().hasPrefix("orca") } ?? []
+        for app in apps {
+            let profiles = support.appendingPathComponent(app).appendingPathComponent("profiles")
+            for profile in (try? FileManager.default.contentsOfDirectory(atPath: profiles.path)) ?? [] {
+                let file = profiles.appendingPathComponent(profile).appendingPathComponent("orca-data.json")
+                guard let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size < 20_000_000,
+                      let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                if text.range(of: #""activeClaudeManagedAccountId"\s*:\s*"[^"]+""#, options: .regularExpression) != nil { return true }
+            }
+        }
+        return false
+    }
+}
+
 /// Asks the official profile endpoint, the one the CLI itself uses, whose login a credential is.
 /// It is how Lilt tells a token the CLI renewed from a different account logged in inside the scope.
 struct IdentityClient {
@@ -105,7 +124,7 @@ final class CLILogin {
             guard UUID(uuidString: String(file.lastPathComponent.dropFirst(6))) != nil else { continue }
             let values = try file.resourceValues(forKeys: [.creationDateKey, .isSymbolicLinkKey])
             guard values.isSymbolicLink != true, let created = values.creationDate, Date.now.timeIntervalSince(created) > 600 else { continue }
-            try Keychain.delete(service: Keychain.cliService(directory: file), account: NSUserName())
+            try CLIKeychain.delete(service: Keychain.cliService(directory: file))
             try FileManager.default.removeItem(at: file)
         }
     }
@@ -134,7 +153,7 @@ final class CLILogin {
         try Disk.directory(temp)
         let service = Keychain.cliService(directory: temp)
         defer {
-            try? Keychain.delete(service: service, account: NSUserName())
+            try? CLIKeychain.delete(service: service)
             try? FileManager.default.removeItem(at: temp)
             process = nil; input = nil
         }
@@ -161,7 +180,7 @@ final class CLILogin {
         guard !cancelled else { throw AppFailure("授权已取消或超时，临时凭据已清理。") }
         guard p.terminationStatus == 0 else { throw AppFailure("官方登录未完成，请重试；现有账号未修改。") }
         let file = temp.appendingPathComponent(".credentials.json")
-        let data = try Keychain.read(service: service, account: NSUserName()) ?? (FileManager.default.fileExists(atPath: file.path) ? Data(contentsOf: file) : nil)
+        let data = try CLIKeychain.read(service: service) ?? (FileManager.default.fileExists(atPath: file.path) ? Data(contentsOf: file) : nil)
         guard let data else { throw AppFailure("登录完成，但此 CLI 的凭据存储尚不兼容。未导入账号。") }
         let credential = Credential(data: data); try credential.validate()
         return (credential, RuntimeScope.identity(in: temp))

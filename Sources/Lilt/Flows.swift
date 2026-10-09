@@ -46,6 +46,10 @@ struct AddAccountView: View {
                 }
             }
             if target == nil { TextField("备注（可选），例如：日常创作", text: $label).textFieldStyle(.roundedBorder).disabled(model.loggingIn) }
+            // Swapping a full login for a long-lived token is a downgrade; say what is lost before it happens.
+            if let target, target.kind == .oauth, kind == .setupToken {
+                InlineNote(text: "“\(target.label)”现在是浏览器登录。换成长效 Token 后，它将看不到额度，也不能参与自动接力。")
+            }
             if let failure { InlineNote(text: failure) }
             HStack(spacing: 8) {
                 Label("不收集密码，不发送模型请求", systemImage: "lock.shield").font(Typo.caption).foregroundStyle(Tokens.muted)
@@ -75,74 +79,64 @@ struct AddAccountView: View {
     }
 }
 extension View {
-    /// One confirmation for enabling the scope, wherever the user starts it from.
-    func scopeConfirmation(_ isPresented: Binding<Bool>, model: AppModel) -> some View {
-        confirmationDialog("启用 Lilt 专属作用域？", isPresented: isPresented, titleVisibility: .visible) {
-            Button("启用") { model.enableScope() }
+    /// One confirmation for taking over Claude Code's default login, wherever the user starts it from.
+    func takeoverConfirmation(_ isPresented: Binding<Bool>, model: AppModel, orcaActive: Bool) -> some View {
+        confirmationDialog("让 Lilt 接管 Claude Code 默认登录？", isPresented: isPresented, titleVisibility: .visible) {
+            Button("接管") { Task { await model.takeOverDefaultLogin() } }
             Button("取消", role: .cancel) {}
-        } message: { Text("用启动命令打开的所有 CLI 会话共享这里的凭据，切换账号可能一起影响它们。现有 ORCA 与 ~/.claude 不会被导入或覆盖。") }
+        } message: {
+            Text("之后在任何终端直接运行 claude，用的都是 Lilt 里选中的账号，正在运行的会话也会一起换。现在登录着的账号会加入 Lilt，不会被退出。"
+                 + (orcaActive ? "\n\nORCA 现在也在切换这个登录。接管后请在 ORCA 里停用 Claude 账号切换，否则两边会互相覆盖。" : ""))
+        }
     }
 }
 /// First run, one step at a time: the card only ever shows the next thing to do.
-/// The four steps are what has to happen, in order, before Claude Code runs under an account Lilt manages.
 struct SetupCard: View {
     @Bindable var model: AppModel
-    static let handledKey = "setup.launchCommandHandled"
-    /// Lilt cannot observe the CLI being launched, so the last step ends when the command has been copied or put off.
-    @AppStorage(SetupCard.handledKey) private var launchHandled = false
-    @State private var confirmingScope = false
+    @State private var confirming = false
+    @State private var orcaActive = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    private enum Step: Int { case account, scope, choose, launch }
+    private enum Step: Int, CaseIterable { case takeover, account, choose }
     private var step: Step? {
+        if !model.managesDefaultLogin { return .takeover }
         if model.accounts.isEmpty { return .account }
-        if !model.library.preferences.scopeEnabled { return .scope }
-        if model.active == nil { return .choose }
-        return launchHandled ? nil : .launch
+        return model.active == nil ? .choose : nil
     }
     var body: some View {
         VStack(spacing: 0) {
             if let step {
                 VStack(spacing: 18) {
                     content(step).id(step).transition(.liltHandoff(reduceMotion: reduceMotion))
-                    StepDots(count: 4, current: step.rawValue)
+                    StepDots(count: Step.allCases.count, current: step.rawValue)
                 }
                 .padding(.vertical, 34).padding(.horizontal, 28).frame(maxWidth: .infinity).object()
                 .transition(.liltReveal(reduceMotion: reduceMotion))
             }
         }
         .animation(reduceMotion ? Motion.fade : Motion.settle, value: step)
-        .scopeConfirmation($confirmingScope, model: model)
+        .takeoverConfirmation($confirming, model: model, orcaActive: orcaActive)
     }
     @ViewBuilder private func content(_ step: Step) -> some View {
         switch step {
+        case .takeover:
+            stage("terminal", "接管 Claude Code 默认登录", "之后在任何终端直接运行 claude，用的都是这里选中的账号") {
+                Button("接管…") { orcaActive = OrcaProbe.managesDefaultLogin(); confirming = true }
+                    .buttonStyle(.lilt(.primary, size: .large)).disabled(model.busy)
+                if model.accounts.isEmpty { Button("先看看演示") { model.startDemo() }.buttonStyle(.lilt(.ghost, size: .small)) }
+            }
         case .account:
             stage("person.crop.circle.badge.plus", "添加第一个账号", "用官方 Claude Code 登录，凭据只存在本机") {
                 HStack(spacing: 8) {
                     Button("登录添加") { model.requestAdd(.oauth) }.buttonStyle(.lilt(.primary, size: .large))
                     Button("粘贴 Token") { model.requestAdd(.setupToken) }.buttonStyle(.lilt(.secondary, size: .large))
                 }.disabled(!model.canAdd)
-                Button("先看看演示") { model.startDemo() }.buttonStyle(.lilt(.ghost, size: .small))
-            }
-        case .scope:
-            stage("lock.shield", "启用 Lilt 作用域", "Lilt 只管理自己的目录，不动 ORCA 和 ~/.claude") {
-                Button("启用…") { confirmingScope = true }.buttonStyle(.lilt(.primary, size: .large))
             }
         case .choose:
-            stage("arrow.left.arrow.right", "选一个账号开始", "把它的凭据写入 Lilt 作用域") {
+            stage("arrow.left.arrow.right", "选一个账号开始", "终端里的 claude 会用这个账号") {
                 if let first = model.accounts.first(where: \.enabled) {
                     Button("切换到“\(first.label)”") { Task { await model.apply(first.id) } }
                         .buttonStyle(.lilt(.primary, size: .large)).disabled(model.busy || model.loading)
                 }
-            }
-        case .launch:
-            stage("terminal", "用这条命令启动 Claude Code", "在终端运行，之后用 /status 核对账号") {
-                CommandBlock(display: model.runtime.launchCommandDisplay, command: model.runtime.launchCommand) {
-                    // Leave the "copied" mark on screen long enough to be seen before the card goes.
-                    Task { try? await Task.sleep(for: .seconds(1.4)); launchHandled = true }
-                }
-                .frame(maxWidth: 480)
-                Button("以后再说") { launchHandled = true }.buttonStyle(.lilt(.ghost, size: .small))
-                    .help("启动命令随时可以在“作用域”页找到")
             }
         }
     }
@@ -158,59 +152,112 @@ struct SetupCard: View {
         }
     }
 }
+/// Where Lilt puts the selected login, and how to change that.
 struct ScopeView: View {
     @Bindable var model: AppModel
     @State private var confirming = false
     @State private var expanded = false
+    @State private var orcaActive = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    private var enabled: Bool { model.library.preferences.scopeEnabled }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(spacing: 12) {
-                    Image(systemName: "terminal").font(.system(size: 15, weight: .medium)).foregroundStyle(Tokens.ink)
-                        .frame(width: 36, height: 36).background(Tokens.fill, in: Circle()).accessibilityHidden(true)
-                    Text("Lilt 作用域").font(Typo.title)
-                    Spacer()
-                    if enabled { Pill(text: "已启用", symbol: "checkmark", style: .soft(.success)) }
-                    else {
-                        Button("启用…") { confirming = true }.buttonStyle(.lilt(.primary)).disabled(model.demo)
-                            .help(model.demo ? "演示模式下不能启用，退出演示后再操作。" : "启用 Lilt 专属作用域")
-                    }
-                }
-                CommandBlock(display: model.runtime.launchCommandDisplay, command: model.runtime.launchCommand)
-                Text("用这条命令启动的 CLI 才归 Lilt 管。先切换到一个账号再运行；命令里没有凭据。")
-                    .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(24).object()
-            VStack(alignment: .leading, spacing: 0) {
-                Button { expanded.toggle() } label: {
-                    HStack {
-                        Text("切换前要知道的").font(Typo.label)
-                        Spacer()
-                        Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(Tokens.muted)
-                            .rotationEffect(.degrees(expanded ? 180 : 0))
-                    }
-                    .padding(.horizontal, 20).padding(.vertical, 16).contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint(expanded ? "收起" : "展开")
-                if expanded {
-                    VStack(alignment: .leading, spacing: 14) {
-                        note("rectangle.on.rectangle", "作用域里的会话共享凭据，切换可能一起影响它们。首次接入请用一个受控的前台会话。")
-                        note("lock.shield", "现有 ORCA 与默认 ~/.claude 不会被导入或覆盖。固定 Token 环境变量会阻止热切换；启动命令会清除常见的认证覆盖项。")
-                        note("hourglass", "凭据写入成功不等于后续请求身份已切换。切换或自动接力之后，在 CLI 里用 /status 核对。")
-                        note("pause.circle", "检测到外部修改时，Lilt 暂停并保留现场；本预览版不自动恢复事务，也不终止或重放 CLI 指令。")
-                    }
-                    .padding(.horizontal, 20).padding(.bottom, 20)
-                    .transition(.liltReveal(reduceMotion: reduceMotion))
-                }
-            }
-            .object()
-            // Accordion timing from the Image accordion block.
-            .animation(reduceMotion ? Motion.fade : Motion.expoOut(), value: expanded)
+            defaultLoginCard
+            if model.scopeTarget == .dedicated && model.library.preferences.scopeEnabled { dedicatedCard }
+            notes
         }
-        .scopeConfirmation($confirming, model: model)
+        .takeoverConfirmation($confirming, model: model, orcaActive: orcaActive)
+        .onAppear { orcaActive = OrcaProbe.managesDefaultLogin() }
+    }
+    private var defaultLoginCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: "terminal").font(.system(size: 15, weight: .medium)).foregroundStyle(Tokens.ink)
+                    .frame(width: 36, height: 36).background(Tokens.fill, in: Circle()).accessibilityHidden(true)
+                Text("Claude Code 默认登录").font(Typo.title)
+                Spacer()
+                if model.managesDefaultLogin { Pill(text: "由 Lilt 管理", symbol: "checkmark", style: .soft(.success)) }
+                else {
+                    Button("接管…") { orcaActive = OrcaProbe.managesDefaultLogin(); confirming = true }
+                        .buttonStyle(.lilt(.primary)).disabled(model.demo || model.busy)
+                        .help(model.demo ? "演示模式下不能接管，退出演示后再操作。" : "让 Lilt 管理 Claude Code 默认登录")
+                }
+            }
+            Text(model.managesDefaultLogin ? "在任何终端直接运行 claude，用的都是 Lilt 里选中的账号。"
+                                           : "接管后，在任何终端直接运行 claude，用的都是 Lilt 里选中的账号，不需要特别的启动命令。")
+                .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+            if orcaActive {
+                InlineNote(text: "ORCA 也在切换这个登录。两边同时管理会互相覆盖：请在 ORCA 里停用 Claude 账号切换，只留一个。")
+            }
+            if model.managesDefaultLogin {
+                liveUsageRow
+                Button("停止接管") { model.releaseDefaultLogin() }.buttonStyle(.lilt(.ghost, size: .small)).padding(.leading, -11)
+                    .help("Lilt 不再改动默认登录；现在登录着的账号保持不变")
+            }
+        }
+        .padding(24).object()
+    }
+    /// Live quota from Claude Code's status line: on or off, and whether readings are arriving.
+    private var liveUsageRow: some View {
+        let _ = model.clock // the age below moves with the monitor
+        let caption: String = {
+            guard model.liveUsageEnabled else { return "关闭时每几分钟问一次额度接口。" }
+            if let issue = model.statusLineIssue { return issue }
+            if let at = model.liveUsageSampledAt { return "Claude Code 每次回复后更新 · 最近一次\(Wording.age(at, now: .now).replacingOccurrences(of: "更新", with: ""))" }
+            return "已接上。下次 Claude Code 回复后就有读数；原来的状态栏照常显示。"
+        }()
+        return HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("实时额度").font(Typo.label)
+                Text(caption).font(Typo.caption).foregroundStyle(model.statusLineIssue == nil ? AnyShapeStyle(Tokens.muted) : Tone.warning.text)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            LiquidToggle(label: "从 Claude Code 状态栏读取额度", isOn: Binding(get: { model.liveUsageEnabled }, set: { model.setLiveUsage($0) }), width: 44)
+        }
+        .padding(14).well()
+        .help("Lilt 在 ~/.claude/settings.json 的状态栏命令前加一个小脚本，只取额度，再交给原来的命令。关闭后放回原样。")
+    }
+    /// Setups made before Lilt could take over the default login keep working until the user moves on.
+    private var dedicatedCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Lilt 专属作用域").font(Typo.label)
+                Spacer()
+                Pill(text: "旧的接入方式")
+            }
+            Text("目前只有用这条命令启动的终端会用 Lilt 选中的账号。接管默认登录后就不需要它了。")
+                .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+            CommandBlock(display: model.runtime.launchCommandDisplay, command: model.runtime.launchCommand)
+        }
+        .padding(20).object()
+    }
+    private var notes: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { expanded.toggle() } label: {
+                HStack {
+                    Text("切换前要知道的").font(Typo.label)
+                    Spacer()
+                    Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(Tokens.muted)
+                        .rotationEffect(.degrees(expanded ? 180 : 0))
+                }
+                .padding(.horizontal, 20).padding(.vertical, 16).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(expanded ? "收起" : "展开")
+            if expanded {
+                VStack(alignment: .leading, spacing: 14) {
+                    note("rectangle.on.rectangle", "所有使用默认登录的 Claude Code 会话共用一个账号，切换会一起影响它们，包括正在运行的。")
+                    note("lock.shield", "设置了 CLAUDE_CODE_OAUTH_TOKEN、ANTHROPIC_API_KEY 或 CLAUDE_CONFIG_DIR 的终端不走默认登录，Lilt 管不到。")
+                    note("hourglass", "已经发出的请求仍算在原账号上。切换后可以在 CLI 里用 /status 核对。")
+                    note("pause.circle", "发现默认登录被别处改了（例如 ORCA 或 /login），Lilt 会暂停自动接力，等你决定采纳还是改回。")
+                }
+                .padding(.horizontal, 20).padding(.bottom, 20)
+                .transition(.liltReveal(reduceMotion: reduceMotion))
+            }
+        }
+        .object()
+        // Accordion timing from the Image accordion block.
+        .animation(reduceMotion ? Motion.fade : Motion.expoOut(), value: expanded)
     }
     private func note(_ symbol: String, _ text: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {

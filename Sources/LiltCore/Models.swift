@@ -52,6 +52,13 @@ public struct Account: Identifiable, Codable, Equatable, Sendable {
     public var issue: String?
     public init(id: UUID = UUID(), label: String, kind: AuthKind) { self.id = id; self.label = label; self.kind = kind }
 }
+/// Where Lilt puts the selected account's login.
+public enum ScopeTarget: String, Codable, Sendable {
+    /// Claude Code's default login: every terminal that runs `claude` uses it, as with ORCA or CC Switch.
+    case system
+    /// A directory of Lilt's own; only CLIs started with Lilt's launch command use it. Kept for setups made before.
+    case dedicated
+}
 public struct Preferences: Codable, Sendable {
     public var threshold: Double = 1
     public var scopeEnabled = false
@@ -60,6 +67,10 @@ public struct Preferences: Codable, Sendable {
     public var shortcutModifiers: UInt32 = 2304 // command + option
     /// Whether the user left automatic relay on. Optional so account files written before it existed still load.
     public var autoRelay: Bool?
+    /// Nil in files written before there was a choice; those always meant `dedicated`.
+    public var scopeTarget: ScopeTarget?
+    /// Read quota from Claude Code's status line. Nil means on.
+    public var liveUsage: Bool?
     public init() {}
 }
 public struct Library: Codable, Sendable {
@@ -86,7 +97,7 @@ public struct RelayPolicy: Sendable {
         if candidate.hotSwitchCapability == .unavailable || (candidate.hotSwitchCapability == .unknown && !allowUnverifiedHotSwitch) { return "热切换未验证" }
         if candidate.usageCapability == .unavailable { return "读不到额度" }
         guard let usage = candidate.usage else { return "额度未知" }
-        guard usage.isFresh(at: now) else { return "额度数据已过期" }
+        guard usage.isFresh(at: now) else { return "读数不是刚查的" }
         return usage.available(threshold: threshold, at: now) ? nil : "额度不足或不完整"
     }
     public func decide(active: Account?, candidates: [Account], at now: Date) -> RelayDecision {
@@ -113,7 +124,7 @@ public enum UsageFailure: Error, Equatable, Sendable {
         case .authentication: "授权已失效，请重新授权。"
         case .permission: "此凭据读不到额度"
         case .accessExpired: "访问令牌已到期，等待续期"
-        case .rateLimited: "额度接口限流，已按服务端要求延后重试。"
+        case .rateLimited: "额度接口要求稍后再查"
         case .network: "网络连接失败，稍后重试。"
         case .invalidResponse: "额度接口返回了无法识别的数据。"
         }

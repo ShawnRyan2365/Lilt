@@ -17,8 +17,8 @@ struct Notice: Equatable {
             case .reauthorize: "重新授权"
             case .refresh: "刷新"
             case .refreshAll: "刷新全部额度"
-            case .openScope: "查看作用域"
-            case .confirmApplied: "我已核对"
+            case .openScope: "查看接入"
+            case .confirmApplied: "知道了"
             case .adoptScope: "处理"
             }
         }
@@ -55,24 +55,46 @@ final class AppModel {
     private(set) var clock = Date.now
     private(set) var scopeIssue: String?
     private(set) var relayPause: String?
-    let runtime = RuntimeScope()
+    /// Where the selected account's login goes. Files from before there was a choice always meant Lilt's own directory;
+    /// anything set up now takes over Claude Code's default login.
+    var scopeTarget: ScopeTarget { library.preferences.scopeTarget ?? (library.preferences.scopeEnabled ? .dedicated : .system) }
+    var runtime: RuntimeScope { RuntimeScope(target: scopeTarget) }
+    /// Lilt is putting logins into Claude Code's default login, so a plain `claude` in any terminal uses them.
+    var managesDefaultLogin: Bool { library.preferences.scopeEnabled && scopeTarget == .system }
+    /// What the place Lilt writes to is called on screen.
+    var scopeName: String { scopeTarget == .system ? "默认登录" : "Lilt 作用域" }
     let login = CLILogin()
     private var savedLibrary: Library?
     private var savedPending = false
     private var backoffs: [UUID: Backoff] = [:]
     private var failures: [UUID: UsageFailure] = [:]
+    /// The usage endpoint limits everything sent from this Mac, so a 429 for one account pauses them all (ORCA does
+    /// the same). Readings already on screen stay there meanwhile.
+    private(set) var usagePausedUntil: Date?
+    private var lastUsageRequest = Date.distantPast
+    /// Live quota from Claude Code's status line (see `StatusLineBridge`).
+    var liveUsageEnabled: Bool { library.preferences.liveUsage != false }
+    private(set) var statusLineIssue: String?
+    private var lastSwitchAt = Date.distantPast
+    private var liveStamp: Date?
+    private var lastStatusLineCheck = Date.distantPast
+    private var lastStatusLineRepair = Date.distantPast
     private var latch = RelayLatch()
     private var monitor: Task<Void, Never>?
     private var usageClient = UsageClient()
-    enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", scope = "作用域", diagnostics = "诊断"
+    enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", scope = "接入", diagnostics = "诊断"
         var symbol: String { switch self { case .overview: "square.grid.2x2"; case .accounts: "person.2"; case .scope: "terminal"; case .diagnostics: "waveform.path.ecg" } }
     }
     init() {
         do { library = try Disk.load() } catch { storageAvailable = false; message = "账号资料无法读取，已停止写入。请先检查本地数据；不会以空列表覆盖。" }
+        // Being told to wait, or a dropped connection, is not a lasting problem with an account; earlier versions kept it as one.
+        let passing: Set<String> = ["额度接口限流，已按服务端要求延后重试。", UsageFailure.rateLimited(0).message, UsageFailure.network.message]
+        for index in library.accounts.indices where library.accounts[index].issue.map(passing.contains) == true { library.accounts[index].issue = nil }
         if storageAvailable {
             do { try CLILogin.cleanupStaleLogins() } catch { message = "上次授权的临时资料未能清理，请检查钥匙串与目录权限。" }
         }
         autoRelay = library.preferences.autoRelay == true && relayBlocker == nil
+        if storageAvailable, managesDefaultLogin, liveUsageEnabled { connectStatusLine() }
         Task { version = await CLILogin.version() }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
@@ -107,7 +129,7 @@ final class AppModel {
     /// The demo has no prerequisites.
     var relayBlocker: String? {
         guard !demo else { return nil }
-        if !library.preferences.scopeEnabled { return "先启用 Lilt 作用域" }
+        if !library.preferences.scopeEnabled { return "先接管 Claude Code 默认登录" }
         guard let active else { return "先选一个账号" }
         // Without a reading for the account in use there is nothing to tell Lilt when to hand off.
         if active.usageCapability == .unavailable { return "当前账号读不到额度" }
@@ -152,7 +174,7 @@ final class AppModel {
     }
     func remove(_ id: UUID) {
         guard !busy else { return }
-        guard library.activeID != id else { message = "此账号仍应用于作用域。请先切换到另一个账号，再删除本地记录。"; return }
+        guard library.activeID != id else { message = "此账号正在使用。请先切换到另一个账号，再删除本地记录。"; return }
         do {
             if !demo { try Keychain.delete(account: id.uuidString) }
             if !demo { try? Keychain.delete(account: Keychain.identityAccount(id)) }
@@ -166,8 +188,28 @@ final class AppModel {
             let credential = try Credential.manual(token)
             try store(credential, label: label, kind: .setupToken, replacing: id)
             status = "Token 已安全保存；能力待验证"
+            await syncScope(afterReplacing: id)
             return nil
         } catch { return (error as? AppFailure)?.message ?? "无法保存凭据。" }
+    }
+    /// A new credential for the account in use belongs in the scope too; otherwise Lilt and the CLI would hold
+    /// two different logins under one name without anyone being told.
+    private func syncScope(afterReplacing id: UUID?) async {
+        guard let id, id == library.activeID, !demo, library.preferences.scopeEnabled else { return }
+        // Whatever the scope held for this account is superseded by what the user just saved.
+        if (try? runtime.check()) == nil { try? runtime.rebaseline() }
+        await apply(id)
+    }
+    /// True while `credential` is still what is stored for the account. An answer that arrives after the stored
+    /// credential was replaced describes the old one and must not be recorded against the new one.
+    private func isCurrent(_ credential: Credential, for id: UUID) -> Bool {
+        guard let stored = (try? Keychain.read(account: id.uuidString)) ?? nil else { return false }
+        return OAuthDocument.accessToken(stored) == credential.token
+    }
+    /// The other account, if any, that is the same Claude account as this identity.
+    private func twin(of identity: Data?, besides id: UUID?) -> Account? {
+        guard let account = OAuthDocument.Identity(oauthAccount: identity).account else { return nil }
+        return accounts.first { $0.id != id && OAuthDocument.Identity(oauthAccount: self.identity(for: $0.id)).account == account }
     }
     private func store(_ credential: Credential, label: String, kind: AuthKind, replacing id: UUID? = nil, identity: Data? = nil) throws {
         try credential.validate()
@@ -193,14 +235,25 @@ final class AppModel {
     }
     func browserLogin(label: String, replacing id: UUID? = nil) async -> String? {
         guard canAdd else { return "当前无法发起授权。" }
+        let failure = await login(label: label, replacing: id)
+        if failure == nil { await syncScope(afterReplacing: id) }
+        return failure
+    }
+    private func login(label: String, replacing id: UUID?) async -> String? {
         busy = true; loggingIn = true; status = "请在浏览器完成官方授权"
         defer { busy = false; loggingIn = false }
         do {
             let (credential, recorded) = try await login.login()
             // Normally the CLI has written it down; if not, the profile endpoint says whose login this is.
             let identity = if let recorded { recorded } else { await IdentityClient().fetch(credential) }
+            // The browser decides which account signs in. Two entries for one Claude account share one quota,
+            // so relaying between them would achieve nothing.
+            if let twin = twin(of: identity, besides: id) {
+                status = "授权未保存"
+                return "浏览器里登录的是和“\(twin.label)”同一个 Claude 账号，没有保存。先在浏览器里退出或换到另一个账号，再授权一次。"
+            }
             try store(credential, label: label, kind: .oauth, replacing: id, identity: identity)
-            status = "授权已保存，等待能力验证"; return nil
+            status = "授权已保存"; return nil
         } catch { status = "授权未完成"; return (error as? AppFailure)?.message ?? "官方授权未完成。" }
     }
     private func credential(for id: UUID) throws -> Credential {
@@ -234,7 +287,7 @@ final class AppModel {
             case nil: return false // could not tell this time (no network); look again on the next pass
             case .unverifiable, .foreign:
                 stopRelay(because: nil)
-                scopeIssue = (error as? AppFailure)?.message ?? "作用域检查失败。"; status = "作用域里的凭据变了，管理已暂停"
+                scopeIssue = (error as? AppFailure)?.message ?? "登录检查失败。"; status = "\(scopeName)被别处改了，管理已暂停"
                 return false
             }
         }
@@ -272,26 +325,42 @@ final class AppModel {
     func refresh(_ id: UUID) async {
         guard !busy, !loading else { return }
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
+        if let until = usagePausedUntil, until > .now { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续"; return }
         if let next = backoffs[id]?.nextAttempt, next > .now { status = "接口退避中，\(Self.wait(until: next))后可重试"; return }
         loading = true
         defer { loading = false }
+        // Requests stay a couple of seconds apart, even when several accounts are due at once.
+        let gap = Date.now.timeIntervalSince(lastUsageRequest)
+        if gap < 2 { try? await Task.sleep(for: .seconds(2 - gap)) }
+        lastUsageRequest = .now
+        var asked: Credential?
         do {
             // The account in the scope may have been renewed by the CLI since Lilt last looked.
             if id == library.activeID { await reconcileScope() }
             let credential = try await renewedCredential(for: id)
+            asked = credential
             let snapshot = try await usageClient.fetch(credential)
-            guard accounts.contains(where: { $0.id == id }) else { return }
+            guard accounts.contains(where: { $0.id == id }), isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil }
             backoffs[id, default: Backoff()].succeed(); failures[id] = nil; status = "额度已更新"
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
-            if identity(for: id) == nil, credential.refreshable, let record = await IdentityClient().fetch(credential) {
+            if identity(for: id) == nil, credential.refreshable, let record = await IdentityClient().fetch(credential), isCurrent(credential, for: id) {
                 try? Keychain.write(record, account: Keychain.identityAccount(id))
             }
         } catch {
+            // Likewise a failure: if the credential was replaced while the request was out, it says nothing about the new one.
+            if let asked, !isCurrent(asked, for: id) { return }
             let failure = error as? UsageFailure ?? .authentication
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
-            update(id) { $0.issue = failure.message; $0.lastChecked = .now; if failure == .permission { $0.usageCapability = .unavailable } }
-            status = failure.message
+            if case .rateLimited(let seconds) = failure { usagePausedUntil = Date.now.addingTimeInterval(max(60, seconds)) }
+            // Being told to wait, or a dropped connection, says nothing about the account: the last reading stays
+            // on screen, as in ORCA, and nothing is flagged. Only an account with nothing to show says why.
+            let passing: Bool
+            switch failure { case .rateLimited, .network: passing = true; default: passing = false }
+            let hasReading = accounts.first { $0.id == id }?.usage != nil
+            update(id) { if !(passing && hasReading) { $0.issue = failure.message }; $0.lastChecked = .now; if failure == .permission { $0.usageCapability = .unavailable } }
+            if case .rateLimited = failure, let until = usagePausedUntil { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续；先显示上次读数" }
+            else { status = failure.message }
         }
     }
     /// A one-off pass the user asked for; never run on a timer.
@@ -301,20 +370,20 @@ final class AppModel {
     }
     /// The panel just opened or the window came forward: what is on screen should not be a minute old.
     func refreshIfStale() async {
-        guard !demo, let active, backoffs[active.id]?.nextAttempt ?? .distantPast <= .now,
-              Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= 15 else { return }
+        guard !demo, let active, backoffs[active.id]?.nextAttempt ?? .distantPast <= .now, (usagePausedUntil ?? .distantPast) <= .now,
+              Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= 120 else { return }
         await refresh(active.id)
     }
     @discardableResult
     func apply(_ id: UUID) async -> Bool {
         guard !busy, !loading, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
-        if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先启用 Lilt 专属作用域，并查看影响范围。"; return false }
+        if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先接管 Claude Code 默认登录。"; return false }
         busy = true
         defer { busy = false }
         do {
             if !demo {
                 // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
-                if (try? runtime.check()) == nil, let leaving = active { _ = await readBack(into: leaving) }
+                if (try? runtime.check()) == nil, let leaving = active, leaving.id != id { _ = await readBack(into: leaving) }
                 let credential: Credential
                 // A network hiccup is no reason to refuse: the CLI can renew an expired login itself.
                 do { credential = try await renewedCredential(for: id) } catch UsageFailure.network { credential = try self.credential(for: id) }
@@ -322,8 +391,16 @@ final class AppModel {
                 try? runtime.writeIdentity(identity(for: id))
             }
             library.activeID = id; appliedPending = !demo; relayPause = nil; scopeIssue = nil; save()
-            status = demo ? "演示账号已应用" : "凭据已应用，等待请求身份验证"
-            lastEvent = demo ? "演示：已接力至 \(target.label)" : "已应用本地凭据；未确认后续请求身份"
+            if !demo {
+                lastSwitchAt = .now
+                if managesDefaultLogin, liveUsageEnabled { StatusLineBridge.setLabel(target.label) }
+                // Status line readings are matched to the account by when its windows reset, so the account just put in
+                // place needs one current reading of its own.
+                if !(target.usage?.isFresh(at: .now) ?? false) { Task { await self.refresh(id) } }
+            }
+            status = demo ? "演示账号已应用" : "已切换到“\(target.label)”"
+            // The relay card records relays; a switch made by hand is not one.
+            if demo { lastEvent = "演示：已接力至 \(target.label)" }
             return true
         } catch {
             let wasRelaying = autoRelay
@@ -334,13 +411,95 @@ final class AppModel {
     }
     /// The user's own check in the CLI. Lilt records it and does not present it as independent verification.
     func confirmApplied() {
-        appliedPending = false; status = "已记录你的手动核对"
-        lastEvent = "你已在 CLI 中手动核对账号；Lilt 未独立验证"
+        appliedPending = false
     }
-    func enableScope() {
+    /// Take over Claude Code's default login, the way ORCA and CC Switch do: from now on a plain `claude` in any terminal
+    /// uses the account selected here. Whatever is logged in now is kept as an account (or refreshes the entry that is
+    /// the same Claude account), so nothing is lost and nothing is logged out.
+    func takeOverDefaultLogin() async {
+        guard !demo, !busy, storageAvailable else { return }
+        let scope = RuntimeScope(target: .system)
+        let wanted = library.activeID
+        busy = true
+        var adopted: UUID?
+        do {
+            if let found = try scope.currentCredential(), (try? found.validate()) != nil {
+                let identity = scope.readIdentity()
+                let twin = twin(of: identity, besides: nil)
+                try store(found, label: "当前登录", kind: found.refreshable ? .oauth : .setupToken, replacing: twin?.id, identity: identity)
+                adopted = twin?.id ?? accounts.last?.id
+            }
+            try scope.rebaseline()
+        } catch {
+            busy = false
+            message = (error as? AppFailure)?.message ?? "无法接管默认登录，没有改动任何东西。"; return
+        }
+        updatePreferences { $0.scopeTarget = .system; $0.scopeEnabled = true }
+        scopeIssue = nil; relayPause = nil; latch = RelayLatch(); appliedPending = false
+        busy = false
+        if liveUsageEnabled { connectStatusLine() }
+        if let adopted {
+            // What is logged in stays logged in; Lilt only starts keeping track of it.
+            library.activeID = adopted; save()
+            status = "已接管默认登录"
+            await refresh(adopted)
+        } else if let wanted, accounts.contains(where: { $0.id == wanted && $0.enabled }) {
+            library.activeID = nil
+            if await apply(wanted) { status = "已接管默认登录" }
+        } else {
+            library.activeID = nil; save(); status = "已接管默认登录"
+        }
+    }
+    func setLiveUsage(_ on: Bool) {
         guard !demo else { return }
-        do { try runtime.check(); scopeIssue = nil; updatePreferences { $0.scopeEnabled = true }; status = "已启用 Lilt 专属作用域" }
-        catch { message = (error as? AppFailure)?.message ?? "作用域检查失败。" }
+        updatePreferences { $0.liveUsage = on }
+        guard managesDefaultLogin else { return }
+        if on { connectStatusLine() } else { disconnectStatusLine() }
+    }
+    private func connectStatusLine() {
+        do { try StatusLineBridge.install(); statusLineIssue = nil; StatusLineBridge.setLabel(active?.label) }
+        catch { statusLineIssue = (error as? AppFailure)?.message ?? "状态栏没有接上。" }
+        lastStatusLineCheck = .now
+    }
+    private func disconnectStatusLine() {
+        do { try StatusLineBridge.uninstall(); statusLineIssue = nil }
+        catch { statusLineIssue = (error as? AppFailure)?.message ?? "原来的状态栏没能放回去。" }
+    }
+    /// Another tool (ORCA reinstalls its own) may put a different status line back. Lilt takes its place again at most
+    /// every ten minutes, so the two never trade places in a loop.
+    private func checkStatusLine() {
+        guard managesDefaultLogin, liveUsageEnabled, Date.now.timeIntervalSince(lastStatusLineCheck) >= 300 else { return }
+        lastStatusLineCheck = .now
+        guard !StatusLineBridge.isInstalled else { statusLineIssue = nil; return }
+        guard Date.now.timeIntervalSince(lastStatusLineRepair) >= 600 else {
+            statusLineIssue = "状态栏被别的工具换掉了，Lilt 稍后再接上；在这之前按时查询额度。"; return
+        }
+        lastStatusLineRepair = .now
+        connectStatusLine()
+    }
+    /// The latest reading a Claude Code session handed its status line, if it is about the account in use.
+    private func ingestLiveUsage() {
+        guard !demo, managesDefaultLogin, liveUsageEnabled, let active,
+              let live = StatusLineBridge.latest(), live.sampledAt != liveStamp else { return }
+        liveStamp = live.sampledAt
+        let now = Date.now
+        // A session that has not picked the new login up yet still reports the previous account; its readings are
+        // older than the switch, or its windows reset at other times than this account's.
+        guard live.sampledAt > lastSwitchAt, now.timeIntervalSince(live.sampledAt) < 600,
+              let known = active.usage, live.sampledAt > known.sampledAt, live.sharesWindows(with: known, at: now) else { return }
+        update(active.id) { $0.usage = live; $0.usageCapability = .verified; $0.issue = nil }
+        failures[active.id] = nil
+    }
+    /// When the last status line reading arrived, for the 接入 page.
+    var liveUsageSampledAt: Date? { StatusLineBridge.latest()?.sampledAt }
+    /// Stop managing the default login. It keeps whatever account is in it; nothing is logged out.
+    func releaseDefaultLogin() {
+        guard !demo, managesDefaultLogin else { return }
+        stopRelay(because: nil)
+        updatePreferences { $0.scopeEnabled = false }
+        scopeIssue = nil; appliedPending = false
+        disconnectStatusLine()
+        status = "Lilt 不再管理默认登录"
     }
     func startDemo() {
         guard !busy, !loading, !demo else { return }
@@ -378,6 +537,9 @@ final class AppModel {
     private func relay() async {
         guard autoRelay, !busy, !loading, let active, let snapshot = active.usage,
               snapshot.exhausted(threshold: threshold, at: .now) else { return }
+        // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
+        // give up on relaying.
+        if !demo, let until = usagePausedUntil, until > .now { status = "已到阈值，等额度接口恢复后接力"; return }
         guard latch.claim(account: active.id, snapshot: snapshot) else { return }
         let policy = RelayPolicy(threshold: threshold, allowUnverifiedHotSwitch: !demo)
         if !demo {
@@ -393,7 +555,7 @@ final class AppModel {
         switch policy.decide(active: self.active, candidates: accounts, at: .now) {
         case .select(let id):
             let name = accounts.first { $0.id == id }?.label ?? ""
-            if await apply(id), !demo { lastEvent = "已自动接力至 \(name)；请求身份待核对"; status = "已自动接力至 \(name)" }
+            if await apply(id), !demo { lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)" }
         case .pause(let reason):
             let reasons = accounts.filter { $0.id != active.id }
                 .compactMap { account in policy.obstacle(for: account, at: .now).map { "\(account.label)：\($0)" } }
@@ -412,10 +574,20 @@ final class AppModel {
         guard !busy, !loading else { return }
         if demo { touchDemoSamples(); await relay(); return }
         guard await reconcileScope() else { return }
+        checkStatusLine()
+        ingestLiveUsage()
         guard let active else { return }
-        let low = active.usage?.exhausted(threshold: 10, at: .now) ?? false
-        // With relay on the user has asked to be watched, whatever app is in front.
-        let interval: Double = (watching || autoRelay) ? (low ? 15 : 30) : 120
+        // Readings from a working session arrive with every response; the endpoint is only asked when none has come
+        // for five minutes (ORCA waits the same).
+        if let usage = active.usage, usage.source == UsageParser.statusLineSource, Date.now.timeIntervalSince(usage.sampledAt) < 300 {
+            await relay(); return
+        }
+        let remaining = [active.usage?.fiveHour, active.usage?.sevenDay].compactMap { active.usage?.lastKnownRemaining($0, at: .now) }.min()
+        let low = remaining.map { $0 <= 10 } ?? false
+        // ORCA asks every 15 minutes, and only while its window is in front. With relay on Lilt has to keep watching
+        // in the background, but no faster than the endpoint puts up with: every 2 minutes when the account is nearly
+        // out, every 5 while relay is on or a terminal is in front, every 15 otherwise.
+        let interval: Double = autoRelay ? (low ? 120 : 300) : (watching ? 300 : 900)
         if Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= interval { await refresh(active.id) }
         await relay()
     }
@@ -423,8 +595,9 @@ final class AppModel {
         if !storageAvailable { return Notice(symbol: "externaldrive.badge.exclamationmark", text: "本地数据不可用，已停止写入", detail: "检查 ~/Library/Application Support/Lilt 的权限后重新打开 Lilt。", warning: true) }
         if let scopeIssue {
             // The usual cause is harmless: the official CLI renewed the token of the account in use.
-            guard let active else { return Notice(symbol: "exclamationmark.triangle", text: "作用域管理已暂停", detail: scopeIssue, warning: true, action: .openScope) }
-            return Notice(symbol: "exclamationmark.triangle", text: "作用域里的凭据变了", detail: "Lilt 没法确认它还属于“\(active.label)”。在 CLI 里用 /status 看一眼是谁，再决定采纳还是改回。", warning: true, action: .adoptScope)
+            guard let active else { return Notice(symbol: "exclamationmark.triangle", text: "\(scopeName)管理已暂停", detail: scopeIssue, warning: true, action: .openScope) }
+            let cause = scopeTarget == .system ? "可能是 ORCA、/login 或别的工具换了账号。" : ""
+            return Notice(symbol: "exclamationmark.triangle", text: "\(scopeName)被别处改了", detail: "\(cause)Lilt 没法确认它还是“\(active.label)”。在终端运行 claude 后用 /status 看是谁，再决定采纳还是改回。", warning: true, action: .adoptScope)
         }
         guard let active else {
             return accounts.isEmpty ? nil : Notice(symbol: "person.crop.circle.badge.questionmark", text: "尚未切换到任何账号", detail: "在账号列表里选择一个，点“切换”。")
@@ -444,8 +617,16 @@ final class AppModel {
             return notice
         }
         if let relayPause { return Notice(symbol: "pause.circle", text: "自动接力已暂停", detail: relayPause, warning: true, action: .refreshAll) }
-        if appliedPending { return Notice(symbol: "hourglass", text: "凭据已应用，等待请求身份验证", detail: "在此作用域的 CLI 会话里运行 /status 核对账号；Lilt 目前无法自动确认。", action: .confirmApplied) }
-        if let usage = active.usage, !usage.isFresh(at: now) { return Notice(symbol: "clock.badge.exclamationmark", text: "额度数据已过期", detail: "显示的是上次读数，不用于接力判断。", action: .refresh(active.id)) }
+        // Not a problem to fix: the switch is done on Lilt's side. What Lilt cannot see is whether a CLI that was
+        // already running has picked the new login up, so it says so once and leaves it at that.
+        if appliedPending { return Notice(symbol: "checkmark.circle", text: "已切换到“\(active.label)”", detail: scopeTarget == .system ? "新开的终端运行 claude 就是这个账号。已经在运行的会话有没有跟着换，Lilt 看不到；想确认就在里面运行 /status。" : "登录已写入 Lilt 作用域。正在运行的 CLI 有没有跟着换，Lilt 看不到；想确认就在 CLI 里运行 /status。", action: .confirmApplied) }
+        // Readings are a few minutes apart by design; only one that has not been renewed for over half an hour is worth a word.
+        if let usage = active.usage, now.timeIntervalSince(usage.sampledAt) > 1800 {
+            let paused = (usagePausedUntil ?? .distantPast) > now
+            return Notice(symbol: "clock", text: "额度是\(Wording.age(usage.sampledAt, now: now).replacingOccurrences(of: "更新", with: ""))的读数",
+                          detail: paused ? "额度接口要求稍后再查，\(Self.wait(until: usagePausedUntil!, from: now))后自动继续。" : "接力前会重新读取。",
+                          action: paused ? nil : .refresh(active.id))
+        }
         return nil
     }
     static func unreadableQuotaDetail(_ kind: AuthKind) -> String {
@@ -467,13 +648,17 @@ final class AppModel {
     func adoptScopeCredential() {
         guard !demo, !busy, let active else { return }
         do {
-            guard let credential = try runtime.currentCredential() else { throw AppFailure("作用域里没有可采纳的凭据。") }
+            guard let credential = try runtime.currentCredential() else { throw AppFailure("\(scopeName)里没有可采纳的登录。") }
             try credential.validate()
             try Keychain.write(credential.data, account: active.id.uuidString)
             try runtime.rebaseline()
-            update(active.id) { $0.expiresAt = credential.expiresAt; $0.issue = nil }
+            update(active.id) {
+                $0.expiresAt = credential.expiresAt; $0.issue = nil
+                // What was adopted decides what the account is: a login that can renew itself is a full login.
+                $0.kind = credential.refreshable ? .oauth : .setupToken; $0.usageCapability = .unknown
+            }
             failures[active.id] = nil; backoffs[active.id] = nil
-            scopeIssue = nil; status = "已采纳，继续管理作用域"
+            scopeIssue = nil; status = "已采纳，继续管理\(scopeName)"
             // Reading the quota also records whose login this is, so the next renewal can be taken in unasked.
             Task { await refresh(active.id) }
         } catch { message = (error as? AppFailure)?.message ?? "采纳失败，未改动任何凭据。" }
@@ -481,14 +666,14 @@ final class AppModel {
     /// The user says the scope should go back to the account Lilt put there, whatever is in it now.
     func reclaimScope() {
         guard !demo, !busy, let active else { return }
-        do { try runtime.rebaseline(); scopeIssue = nil } catch { message = (error as? AppFailure)?.message ?? "无法接管作用域。"; return }
+        do { try runtime.rebaseline(); scopeIssue = nil } catch { message = (error as? AppFailure)?.message ?? "无法改回。"; return }
         Task { if await apply(active.id) { status = "已改回“\(active.label)”" } }
     }
     func exportDiagnostics() {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Lilt-diagnostics.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // Fixed fields only: no nicknames, account IDs, paths, CLI output, or server error bodies.
-        let text = "Lilt 0.1.0\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
+        let text = "Lilt 0.1.0\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
         do { try Data(text.utf8).write(to: url, options: .atomic); status = "已导出脱敏诊断" } catch { message = "诊断文件保存失败。" }
     }
 }

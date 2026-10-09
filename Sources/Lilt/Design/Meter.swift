@@ -98,9 +98,10 @@ struct QuotaReadout: View {
     /// Remaining percentage to show, or `nil` when there is nothing to show.
     let remaining: Double?
     var threshold: Double = 1
-    /// True when `remaining` is an old reading kept for reference. It stays visible but recedes, and it
-    /// is never flagged as low or at threshold, because relay rules do not act on it.
-    var stale = false
+    /// The age of an old reading ("3 小时前的读数"). When set, the value stays visible but recedes, and it is not
+    /// flagged as low or at threshold.
+    var staleNote: String?
+    private var stale: Bool { staleNote != nil }
     /// Shown in place of the number when `remaining` is nil.
     var placeholder = "未知"
     /// Reset time, or what to do when there is none.
@@ -109,7 +110,7 @@ struct QuotaReadout: View {
 
     private var level: QuotaLevel { QuotaLevel(remaining: remaining, threshold: threshold) }
     private var flag: (text: String, tone: Tone)? {
-        if stale, remaining != nil { return ("已过期", .neutral) }
+        if let staleNote, remaining != nil { return (staleNote, .neutral) }
         return level.label.map { ($0, level.tone) }
     }
 
