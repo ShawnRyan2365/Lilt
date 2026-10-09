@@ -1,0 +1,27 @@
+# macOS and Xcode local state
+.DS_Store
+DerivedData/
+build/
+.build/
+*.xcuserstate
+xcuserdata/
+*.xcarchive
+*.dSYM/
+
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+.credentials.json
+credentials.json
+oauth-account.json
+*.p12
+*.mobileprovision
+
+# Runtime, experiments and diagnostics
+work/
+.firecrawl/
+logs/
+*.log
+runtime/
+private/
