@@ -329,8 +329,8 @@ struct MenuPanel: View {
             if let active = model.active {
                 HStack(alignment: .top, spacing: 20) {
                     let unreadable = active.usageCapability == .unavailable
-                    UsageMeter(title: "5 小时", window: active.usage?.fiveHour, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable, compact: true)
-                    UsageMeter(title: "7 天", window: active.usage?.sevenDay, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable, compact: true)
+                    UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable, compact: true)
+                    UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable, compact: true)
                 }
             } else if model.accounts.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
@@ -345,7 +345,7 @@ struct MenuPanel: View {
             if !model.accounts.isEmpty {
                 ScrollView(.horizontal) {
                     // The panel cannot show the alert or page a refused switch leads to, so it opens the window instead.
-                    RunnerTrack(runners: model.runners, activeID: model.library.activeID, orbSize: 34, disabled: model.busy || model.loading,
+                    RunnerTrack(runners: model.runners, activeID: model.library.activeID, orbSize: 30, disabled: model.busy || model.loading,
                                 onSelect: { id in Task { if !(await model.apply(id)) { openMain() } } })
                         .padding(.horizontal, 2).padding(.top, 4)
                 }

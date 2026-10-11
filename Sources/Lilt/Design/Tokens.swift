@@ -67,6 +67,16 @@ enum Tokens {
     static let faint = Paint(light: .init(0.62, 0.62, 0.65), dark: .init(0.46, 0.46, 0.50),
                              lightHigh: .init(0.40, 0.40, 0.44), darkHigh: .init(0.68, 0.68, 0.72))
 
+    // MARK: Quota windows
+    /// One data colour per quota window, used everywhere that window is drawn (ruler, ring, clock hand,
+    /// legend dot), so the two can be told apart without reading. Blue and aqua from the dataviz
+    /// reference palette, checked for colour-blind separation on both surfaces; both are cool, so the
+    /// warm warning and danger tones still stand out against them.
+    static let fiveHour = Paint(light: .init(0.165, 0.471, 0.839), dark: .init(0.224, 0.529, 0.898),
+                                lightHigh: .init(0.110, 0.361, 0.671), darkHigh: .init(0.427, 0.655, 0.925))
+    static let sevenDay = Paint(light: .init(0.086, 0.627, 0.439), dark: .init(0.098, 0.620, 0.439),
+                                lightHigh: .init(0.039, 0.455, 0.314), darkHigh: .init(0.235, 0.776, 0.565))
+
     // MARK: Accent
     /// Lilt green: the brand mark, and `.tint()` for the few system controls left (settings, focus rings).
     static let accent = Paint(light: .init(0.12, 0.47, 0.41), dark: .init(0.379, 0.777, 0.697))

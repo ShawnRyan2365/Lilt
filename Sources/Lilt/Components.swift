@@ -45,11 +45,20 @@ enum UsageState: Equatable {
     }
 }
 /// One quota window of an account, drawn with the design layer's readout.
+/// The two quota windows. Each keeps one colour wherever it is drawn, so a ring, a clock hand, a ruler
+/// and a legend dot of the same window match without reading.
+enum QuotaWindowKind: CaseIterable, Sendable {
+    case fiveHour, sevenDay
+    var title: String { self == .fiveHour ? "5 小时" : "7 天" }
+    var length: TimeInterval { self == .fiveHour ? 5 * 3600 : 7 * 86400 }
+    var series: Paint { self == .fiveHour ? Tokens.fiveHour : Tokens.sevenDay }
+    func window(in snapshot: UsageSnapshot?) -> UsageWindow? { self == .fiveHour ? snapshot?.fiveHour : snapshot?.sevenDay }
+}
 struct UsageMeter: View {
-    /// "5 小时" or "7 天".
-    let title: String
-    let window: UsageWindow?
+    let kind: QuotaWindowKind
     let snapshot: UsageSnapshot?
+    private var title: String { kind.title }
+    private var window: UsageWindow? { kind.window(in: snapshot) }
     var threshold: Double = 1
     /// The credential is known not to be able to read quota (a long-lived token): say so instead of "not fetched yet".
     var unreadable = false
@@ -63,7 +72,7 @@ struct UsageMeter: View {
             QuotaReadout(title: title, remaining: shown, threshold: threshold, staleNote: state?.isOld == true ? state?.text : nil,
                          placeholder: snapshot == nil ? (unreadable ? "读不到" : "未获取") : "未知",
                          footnote: reset ?? (snapshot == nil ? (unreadable ? "此凭据没有额度权限" : "尚未获取额度") : shown == nil ? "需重新查询" : "重置时间未知"),
-                         compact: compact)
+                         series: kind.series, compact: compact)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(spoken(shown: shown, state: state, reset: reset))
         }
@@ -74,49 +83,81 @@ struct UsageMeter: View {
         return ([name, "剩余 \(Wording.percent(shown))", state?.text, reset].compactMap { $0 }).joined(separator: "，")
     }
 }
-/// An account's quota in a few characters. Only the tighter window is named in `note`, since that is the one that runs out first.
+/// One quota window worded for a small cell: what is left, and when the window refreshes.
+struct WindowGlance: Equatable {
+    var kind: QuotaWindowKind
+    /// "5 小时" or "7 天".
+    var name: String { kind.title }
+    /// What is left, or nil when it is not known.
+    var remaining: Double?
+    var level: QuotaLevel
+    /// "3 小时后", "时间未知", "待刷新", or nil when there is nothing worth saying: a full window that has not started has no clock.
+    var caption: String?
+    var resetsAt: Date?
+    /// How far the window has run, 0...1, for the clock hand. A full window with no reset time has not
+    /// started, and one past its reset is back at the start; otherwise an unknown reset time leaves it nil.
+    var elapsed: Double?
+
+    init(kind: QuotaWindowKind, snapshot: UsageSnapshot, threshold: Double, now: Date) {
+        self.kind = kind
+        let window = kind.window(in: snapshot)
+        remaining = snapshot.lastKnownRemaining(window, at: now)
+        level = QuotaLevel(remaining: remaining, threshold: threshold)
+        resetsAt = window?.resetsAt
+        if let reset = window?.resetsAt {
+            elapsed = reset <= now ? 0 : min(1, max(0, 1 - reset.timeIntervalSince(now) / kind.length))
+        } else if let remaining, remaining >= 100 {
+            elapsed = 0
+        }
+        if let remaining {
+            caption = Wording.resetAmount(window?.resetsAt, now: now).map { "\($0)后" } ?? (remaining >= 100 ? nil : "时间未知")
+        } else if window?.resetsAt.map({ $0 <= now }) == true {
+            // The window refreshed after this reading. It is read again rather than assumed full (PRD).
+            caption = "待刷新"
+        } else {
+            caption = nil
+        }
+    }
+    var figure: String { remaining.map(Wording.percent) ?? "未知" }
+    var spoken: String {
+        guard let remaining else { return "\(name)额度未知" + (caption.map { "，\($0)" } ?? "") }
+        return "\(name)剩余 \(Wording.percent(remaining))" + (caption.map { $0 == "时间未知" ? "，重置时间未知" : "，\($0)重置" } ?? "")
+    }
+}
+/// An account's quota for the places that show it small: the track, the accounts list, VoiceOver.
 struct QuotaSummary {
-    /// "72%", "8% 偏低", "已到阈值", "未知".
-    var note: String
-    var tone: Tone = .neutral
-    /// Both windows, for a row that has room: "5 小时 72% · 2 小时后重置".
-    var both: String
-    /// One line per window for the accounts page, remaining and time until that window refreshes.
-    var detailLines: [String]
-    /// One short line per window under a sprite: "5时 2小时后", "7天 3天后".
-    var refreshLines: [String]
+    /// Both windows, 5-hour first. Empty when nothing has been read.
+    var windows: [WindowGlance] = []
+    /// The state of the window with the least left: it runs out first, and it is the one the relay rule acts on.
+    var state: UsageState?
     var spoken: String
     /// The same state as an expression for the account's sprite.
     var mood: Mood = .idle
+    var stale: Bool { state?.isOld == true }
+
     init(snapshot: UsageSnapshot?, threshold: Double, now: Date) {
-        guard let snapshot else {
-            note = "未获取"; both = "尚未获取额度"; detailLines = ["尚未获取额度"]; refreshLines = []; spoken = "尚未获取额度"; return
-        }
-        let specs: [(String, String, UsageWindow?)] = [("5 小时", "5时", snapshot.fiveHour), ("7 天", "7天", snapshot.sevenDay)]
-        let entries = specs.compactMap { name, short, window -> (name: String, short: String, value: Double, when: String, compact: String)? in
-            guard let window, let value = snapshot.lastKnownRemaining(window, at: now) else { return nil }
-            let when = Wording.reset(window.resetsAt, now: now) ?? (window.resetsAt == nil ? "重置时间未知" : "已到重置点")
-            let compact = Wording.resetAmount(window.resetsAt, now: now).map { "\(short) \($0.replacingOccurrences(of: " ", with: ""))后" }
-                ?? (window.resetsAt == nil ? "\(short) 未知" : "\(short) 已到点")
-            return (name, short, value, when, compact)
-        }
-        guard let tight = entries.min(by: { $0.value < $1.value }) else {
-            note = "未知"; both = "需重新查询"; detailLines = ["需重新查询"]; refreshLines = []; spoken = "额度未知，需重新查询"; return
-        }
-        let state = UsageState(shown: tight.value, sampledAt: snapshot.sampledAt, threshold: threshold, now: now)
-        // The percent stays, but each account also says when its own windows refresh. A percent with no
-        // clock does not answer "when can this one be used again".
-        switch state {
-        case .reached: note = "已到阈值"
-        case .low: note = Wording.percent(tight.value) + " 偏低"
-        case .old, nil: note = Wording.percent(tight.value)
-        }
-        tone = state?.isOld == false ? state?.tone ?? .neutral : .neutral
+        guard let snapshot else { spoken = "尚未获取额度"; return }
+        windows = QuotaWindowKind.allCases.map { WindowGlance(kind: $0, snapshot: snapshot, threshold: threshold, now: now) }
+        spoken = windows.map(\.spoken).joined(separator: "，")
+        guard let tight = windows.compactMap(\.remaining).min() else { return }
+        state = UsageState(shown: tight, sampledAt: snapshot.sampledAt, threshold: threshold, now: now)
         mood = state == .reached ? .asleep : state == .low ? .drowsy : .idle
-        detailLines = entries.map { "\($0.name) \(Wording.percent($0.value)) · \($0.when)" }
-        refreshLines = entries.map(\.compact)
-        both = detailLines.joined(separator: " · ") + (state.map { " · " + $0.text } ?? "")
-        spoken = entries.map { "\($0.name)剩余 \(Wording.percent($0.value))，\($0.when)" }.joined(separator: "，") + (state.map { "，" + $0.text } ?? "")
+        if let state { spoken += "，" + state.text }
+    }
+}
+/// The key to the relay track, said once above it: each window's colour, and on hover what the rings and hands mean.
+struct QuotaLegend: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            ForEach(QuotaWindowKind.allCases, id: \.self) { kind in
+                HStack(spacing: 5) { SeriesDot(series: kind.series); Text(kind.title) }
+            }
+        }
+        .font(Typo.caption).foregroundStyle(Tokens.muted)
+        .contentShape(Rectangle())
+        .help("外圈和长针是 5 小时窗口，内圈和短针是 7 天窗口。圈上亮的部分是剩余额度；指针顺时针走，回到顶端时这个窗口重置。")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("图例：蓝色外圈和长针是 5 小时窗口，绿色内圈和短针是 7 天窗口")
     }
 }
 extension AppModel {
@@ -126,10 +167,18 @@ extension AppModel {
         let slots = spriteSlots
         return accounts.map { account in
             let summary = QuotaSummary(snapshot: account.usage, threshold: threshold, now: now)
-            let blocked = !account.enabled ? "已停用" : account.usage == nil && account.usageCapability == .unavailable ? "读不到额度" : nil
-            let note = blocked ?? summary.note
-            let resets = blocked == nil ? summary.refreshLines : []
-            return Runner(id: account.id, slot: slots[account.id] ?? 0, name: account.label, note: note, noteTone: account.enabled ? summary.tone : .neutral, resets: resets, stopped: !account.enabled, mood: summary.mood)
+            let blocked = !account.enabled ? "已停用" : account.usage == nil && account.usageCapability == .unavailable ? "读不到" : nil
+            let stale = summary.stale ? summary.state?.text : nil
+            func reading(_ kind: QuotaWindowKind) -> RingReading {
+                guard let glance = summary.windows.first(where: { $0.kind == kind }) else { return RingReading() }
+                // An old reading is not flagged as low or used up; its rings only recede.
+                return RingReading(remaining: glance.remaining, level: stale != nil && glance.remaining != nil ? .healthy : glance.level, elapsed: glance.elapsed)
+            }
+            return Runner(id: account.id, slot: slots[account.id] ?? 0, name: account.label,
+                          fiveHour: reading(.fiveHour), sevenDay: reading(.sevenDay),
+                          note: blocked ?? (account.usage == nil ? "未获取" : nil), stale: stale,
+                          detail: blocked.map { $0 == "读不到" ? "此凭据读不到额度" : $0 } ?? summary.spoken,
+                          stopped: !account.enabled, mood: summary.mood)
         }
     }
     /// Each account's sprite silhouette.
@@ -225,11 +274,43 @@ struct EmptyAccounts: View {
         .frame(maxWidth: .infinity).padding(.vertical, 44).object()
     }
 }
-/// One account on the accounts page: who, what it can do, how much is left, and the actions.
+/// Fixed widths on the accounts page, shared by the rows and the column labels above them, so the quota
+/// rulers line up down the list whatever the row's name or state.
+enum AccountColumns {
+    static let cell: CGFloat = 132
+    static let cellGap: CGFloat = 22
+    /// Holds 切换, or the 使用中 pill on the account in use, so the columns never shift.
+    static let action: CGFloat = 60
+    static let menu: CGFloat = 30
+    static let spacing: CGFloat = 12
+    static let trailing: CGFloat = 10
+}
+/// The two column labels, said once above the list instead of on every row.
+struct AccountColumnLabels: View {
+    var body: some View {
+        HStack(spacing: AccountColumns.spacing) {
+            Spacer(minLength: 0)
+            HStack(spacing: AccountColumns.cellGap) {
+                ForEach(QuotaWindowKind.allCases, id: \.self) { kind in
+                    HStack(spacing: 5) { SeriesDot(series: kind.series); Text(kind.title) }
+                        .frame(width: AccountColumns.cell, alignment: .leading)
+                }
+            }
+            Color.clear.frame(width: AccountColumns.action, height: 1)
+            Color.clear.frame(width: AccountColumns.menu, height: 1)
+        }
+        .font(Typo.caption).foregroundStyle(Tokens.muted)
+        .padding(.trailing, AccountColumns.trailing)
+        .accessibilityHidden(true)
+    }
+}
+/// One account on the accounts page: who, what it can do, how much is left in each window, and the actions.
 struct AccountRow: View {
     @Bindable var model: AppModel
     let account: Account
     let index: Int
+    /// Shared by the rows so the 使用中 pill travels to the account that takes over (Icon bar).
+    let selection: Namespace.ID
     var onRename: () -> Void
     var onDelete: () -> Void
     private var active: Bool { account.id == model.library.activeID }
@@ -240,16 +321,17 @@ struct AccountRow: View {
     }
     var body: some View {
         let summary = QuotaSummary(snapshot: account.usage, threshold: model.threshold, now: max(model.clock, .now))
-        HStack(spacing: 12) {
+        HStack(spacing: AccountColumns.spacing) {
             Image(systemName: "line.3.horizontal").font(.system(size: 11, weight: .medium)).foregroundStyle(Tokens.faint)
                 .frame(width: 14).help("拖动调整接力顺序").accessibilityHidden(true)
-            HStack(spacing: 12) {
+            HStack(spacing: AccountColumns.spacing) {
                 Sprite(slot: model.spriteSlot(account.id), size: 34, mood: summary.mood, muted: !account.enabled)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(account.label).font(Typo.label).lineLimit(1)
-                        if active { Pill(text: "使用中", style: .ink) }
                         if !account.enabled { Pill(text: "已停用") }
+                        // An old reading stays on screen, receded, and says how old it is.
+                        if summary.stale, let age = summary.state?.text { Pill(text: age) }
                     }
                     Text(capabilities).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(1)
                     if let issue = account.issue {
@@ -258,26 +340,23 @@ struct AccountRow: View {
                     }
                 }
                 Spacer(minLength: 8)
-                VStack(alignment: .trailing, spacing: 2) {
-                    if account.usage == nil && account.usageCapability == .unavailable {
-                        Text("读不到额度").font(Typo.captionStrong).foregroundStyle(Tokens.muted)
-                    } else {
-                        ForEach(Array(summary.detailLines.enumerated()), id: \.offset) { _, line in
-                            Text(line).font(Typo.captionStrong).monospacedDigit().lineLimit(1)
-                        }
-                        .foregroundStyle(summary.tone == .neutral ? AnyShapeStyle(Tokens.muted) : summary.tone.text)
-                    }
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(summary.spoken)
+                cells(summary)
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("优先级 \(index + 1)，\(account.label)\(active ? "，使用中" : "")\(account.enabled ? "" : "，已停用")，\(capabilities)，\(summary.spoken)\(account.issue.map { "，" + $0 } ?? "")")
-            if !active {
-                Button("切换") { Task { await model.apply(account.id) } }
-                    .buttonStyle(.lilt(.secondary, size: .small)).disabled(!canSwitch)
-                    .help("切换到此账号").accessibilityLabel("切换到 \(account.label)")
+            ZStack {
+                if active {
+                    Pill(text: "使用中", style: .ink)
+                        .matchedGeometryEffect(id: "in-use", in: selection)
+                        .accessibilityHidden(true)
+                } else {
+                    Button("切换") { Task { await model.apply(account.id) } }
+                        .buttonStyle(.lilt(.secondary, size: .small)).disabled(!canSwitch)
+                        .help("切换到此账号").accessibilityLabel("切换到 \(account.label)")
+                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
             }
+            .frame(width: AccountColumns.action)
             Menu {
                 Button("刷新额度") { Task { await model.refresh(account.id) } }
                 Button("修改备注", action: onRename)
@@ -289,12 +368,34 @@ struct AccountRow: View {
                 Button(active ? "删除（需先切换到其他账号）" : "删除…", role: .destructive, action: onDelete).disabled(active)
             } label: {
                 Image(systemName: "ellipsis").font(.system(size: 13, weight: .medium)).foregroundStyle(Tokens.ink)
-                    .frame(width: 30, height: 30).contentShape(Circle())
+                    .frame(width: AccountColumns.menu, height: 30).contentShape(Circle())
             }
             .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
             .disabled(model.busy || model.loading).help("更多").accessibilityLabel("\(account.label) 的更多操作")
         }
-        .padding(.leading, 12).padding(.trailing, 10).padding(.vertical, 12)
+        .padding(.leading, 12).padding(.trailing, AccountColumns.trailing).padding(.vertical, 12)
         .object(radius: 18)
+    }
+    /// The two windows in fixed columns. A credential that cannot read quota, or one not read yet, still
+    /// takes both columns, as dots, so the rows keep their rhythm.
+    @ViewBuilder private func cells(_ summary: QuotaSummary) -> some View {
+        let unreadable = account.usage == nil && account.usageCapability == .unavailable
+        let dimmed = !account.enabled || summary.stale
+        HStack(spacing: AccountColumns.cellGap) {
+            if summary.windows.isEmpty {
+                QuotaCell(remaining: nil, placeholder: unreadable ? "读不到" : "未获取", caption: unreadable ? "无额度权限" : nil, dimmed: dimmed)
+                    .frame(width: AccountColumns.cell)
+                QuotaCell(remaining: nil, placeholder: unreadable ? "读不到" : "未获取", dimmed: dimmed)
+                    .frame(width: AccountColumns.cell)
+            } else {
+                ForEach(summary.windows, id: \.name) { window in
+                    QuotaCell(remaining: window.remaining, caption: window.caption, threshold: model.threshold, series: window.kind.series, dimmed: dimmed)
+                        .frame(width: AccountColumns.cell)
+                        .help(window.spoken)
+                }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(summary.spoken)
     }
 }

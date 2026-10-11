@@ -40,6 +40,10 @@ enum Motion {
     static let pop = Animation.interpolatingSpring(mass: 1, stiffness: 340, damping: 22)
     /// Thumb travel (Liquid toggle at speed 50): stiffness 170, damping 21.5, mass 0.9.
     static let glide = Animation.interpolatingSpring(mass: 0.9, stiffness: 170, damping: 21.5)
+    /// Icon bar's selection pill: the edge on the side it is heading runs ahead and the other one catches up,
+    /// so the pill stretches across and then settles (dilate 100, bounce 50, speed 50).
+    static let stretchLead = Animation.interpolatingSpring(mass: 1, stiffness: 420, damping: 30)
+    static let stretchLag = Animation.interpolatingSpring(mass: 1, stiffness: 180, damping: 21)
     /// Delay between neighbours in a staggered reveal (Radial menu: 25 ms).
     static let stagger: Double = 0.025
 

@@ -11,35 +11,50 @@ struct Runner: Identifiable, Equatable, Sendable {
     /// Sprite silhouette slot.
     var slot: Int
     var name: String
-    /// The tighter quota window, already worded ("72%", "未知").
-    var note: String
-    /// Colours the note when it needs attention; the note's words still carry the meaning.
-    var noteTone: Tone = .neutral
-    /// When each of this account's own windows refreshes, one short line each ("5时 2小时后").
-    var resets: [String] = []
+    /// The outer ring and the clock's long hand.
+    var fiveHour = RingReading()
+    /// The inner ring and the clock's short hand.
+    var sevenDay = RingReading()
+    /// Said in place of the clock when there is nothing to draw ("已停用", "未获取", "读不到").
+    var note: String?
+    /// The age of an old reading ("6 小时前的读数"). The rings recede and the sprite wears a small clock badge.
+    var stale: String?
+    /// Both windows in words, for the tooltip and VoiceOver.
+    var detail: String = ""
     /// A stopped account: shown, greyed, not selectable.
     var stopped = false
     /// The account's state as an expression.
     var mood: Mood = .idle
 }
 
-/// The relay queue as a row of sprites, adapted from Magnetic select: the account in use grows and wears a
-/// ring, its neighbours lean away, and the ring travels when the baton passes. Left to right is relay order.
+/// The relay queue as a row of sprites, left to right in relay order. Each sprite wears its two quota
+/// windows as concentric rings (outer 5 hours, inner 7 days) and has a small clock under its name for
+/// when they refresh, so the row reads at a glance without figures under every account.
+/// The account in use sits on a soft pill that stretches across to the next one when the baton passes
+/// (Icon bar), and its neighbours lean away from it (Magnetic select).
 struct RunnerTrack<MenuContent: View>: View {
     let runners: [Runner]
     let activeID: UUID?
-    var orbSize: CGFloat = 44
+    var orbSize: CGFloat = 36
     var disabled = false
     let onSelect: (UUID) -> Void
     var onAdd: (() -> Void)?
     @ViewBuilder var menu: (Runner) -> MenuContent
-    @Namespace private var ring
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Each column's frame in the track, for placing the pill.
+    @State private var frames: [UUID: CGRect] = [:]
+    /// The pill's edges, animated separately so it can stretch.
+    @State private var left: CGFloat = 0
+    @State private var right: CGFloat = 0
+    /// The account the pill was last placed under. A frame change for any other account is a hand-off,
+    /// which `moveSelection` animates; only a change under this one is followed quietly.
+    @State private var placed: UUID?
 
     private var activeIndex: Int? { runners.firstIndex { $0.id == activeID } }
-
-    /// Wide enough for “5时 2小时后”. A row that still overflows scrolls without a visible bar.
-    private var column: CGFloat { max(88, orbSize + 44) }
+    private var ring: CGFloat { orbSize + 38 }
+    private var column: CGFloat { max(72, ring + 8) }
+    private var clock: CGFloat { orbSize >= 36 ? 30 : 26 }
+    private let space = "runner-track"
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -47,60 +62,20 @@ struct RunnerTrack<MenuContent: View>: View {
                 if index > 0 {
                     // Order without words: each account hands on to the one after it.
                     Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(Tokens.faint)
-                        .frame(width: 14, height: orbSize * 1.18 + 10).accessibilityHidden(true)
+                        .frame(width: 14, height: ring).padding(.top, 8).accessibilityHidden(true)
                 }
-                let active = runner.id == activeID
-                // Distance from the selected item drives both how far a neighbour leans and how late it moves.
-                let far = Double(abs(index - (activeIndex ?? index)))
-                let fall = active || activeIndex == nil ? 0 : exp(-(far - 1) / 2.8)
-                let direction: CGFloat = index < (activeIndex ?? index) ? -1 : 1
-                Button { onSelect(runner.id) } label: {
-                    VStack(spacing: 8) {
-                        Sprite(slot: runner.slot, size: orbSize, mood: runner.mood, muted: runner.stopped, celebrating: active)
-                            .scaleEffect(active ? 1.18 : 1 - 0.06 * fall)
-                            .padding(5)
-                            .background {
-                                if active {
-                                    Circle().strokeBorder(Tokens.ink, lineWidth: 2)
-                                        .frame(width: orbSize * 1.18 + 10, height: orbSize * 1.18 + 10)
-                                        .matchedGeometryEffect(id: "ring", in: ring)
-                                }
-                            }
-                            .frame(width: orbSize * 1.18 + 10, height: orbSize * 1.18 + 10)
-                            .offset(x: reduceMotion ? 0 : direction * 3 * fall)
-                        VStack(spacing: 2) {
-                            Text(runner.name).font(.system(size: 11, weight: active ? .semibold : .medium))
-                                .foregroundStyle(active ? AnyShapeStyle(Tokens.ink) : AnyShapeStyle(Tokens.muted))
-                            Text(runner.note).font(Typo.caption).monospacedDigit()
-                                .foregroundStyle(runner.noteTone == .neutral ? AnyShapeStyle(Tokens.muted) : runner.noteTone.text)
-                            // Each account's own clocks. The big figures above only describe the account in use.
-                            ForEach(Array(runner.resets.enumerated()), id: \.offset) { _, line in
-                                Text(line).font(Typo.caption).monospacedDigit().foregroundStyle(Tokens.ink)
-                            }
-                        }
-                        .lineLimit(1).minimumScaleFactor(0.8)
-                    }
-                    .frame(width: column)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(OrbButtonStyle())
-                .disabled(disabled || active || runner.stopped)
-                .contextMenu { menu(runner) }
-                .help([runner.name, runner.note, runner.resets.joined(separator: "，"), active ? "使用中" : runner.stopped ? "已停用" : "点击切换"].filter { !$0.isEmpty }.joined(separator: "，"))
-                .accessibilityLabel("\(runner.name)，\(runner.note)\(runner.resets.isEmpty ? "" : "，" + runner.resets.joined(separator: "，"))\(active ? "，使用中" : runner.stopped ? "，已停用" : "")")
-                .accessibilityHint(active || runner.stopped ? "" : "切换到此账号")
-                .accessibilityAddTraits(active ? .isSelected : [])
-                .animation(reduceMotion ? nil : Motion.magnetic(distance: far).delay(far * 0.022), value: activeID)
+                runnerButton(runner, index: index)
             }
             if let onAdd {
                 Button(action: onAdd) {
-                    VStack(spacing: 8) {
+                    VStack(spacing: 6) {
                         Image(systemName: "plus").font(.system(size: orbSize * 0.34, weight: .medium)).foregroundStyle(Tokens.muted)
                             .frame(width: orbSize, height: orbSize)
                             .background(Tokens.fill, in: Circle())
-                            .frame(width: orbSize * 1.18 + 10, height: orbSize * 1.18 + 10)
+                            .frame(width: ring, height: ring)
                         Text("添加").font(.system(size: 11, weight: .medium)).foregroundStyle(Tokens.muted)
                     }
+                    .padding(.vertical, 8)
                     .frame(width: column)
                     .contentShape(Rectangle())
                 }
@@ -109,12 +84,124 @@ struct RunnerTrack<MenuContent: View>: View {
                 .help("添加账号").accessibilityLabel("添加账号")
             }
         }
+        .background(alignment: .topLeading) {
+            if let activeID, let frame = frames[activeID] {
+                SpanLeft(left: left, right: right, top: frame.minY, height: frame.height)
+                    .allowsHitTesting(false)
+            }
+        }
+        .coordinateSpace(.named(space))
+        .onChange(of: activeID) { old, new in moveSelection(from: old, to: new) }
+        .onChange(of: activeID.flatMap { frames[$0] }) { _, frame in
+            // Layout changed under the pill (a reorder, a new account, the first layout): follow it without a show.
+            guard let frame, placed == activeID || placed == nil else { return }
+            var quiet = Transaction(); quiet.disablesAnimations = true
+            withTransaction(quiet) { left = frame.minX; right = frame.maxX; placed = activeID }
+        }
+    }
+
+    private func runnerButton(_ runner: Runner, index: Int) -> some View {
+        let active = runner.id == activeID
+        // Distance from the selected item drives both how far a neighbour leans and how late it moves.
+        let far = Double(abs(index - (activeIndex ?? index)))
+        let fall = active || activeIndex == nil ? 0 : exp(-(far - 1) / 2.8)
+        let direction: CGFloat = index < (activeIndex ?? index) ? -1 : 1
+        return Button { onSelect(runner.id) } label: {
+            VStack(spacing: 6) {
+                ZStack {
+                    WindowRings(outer: runner.fiveHour, inner: runner.sevenDay, diameter: ring, dimmed: runner.stale != nil, muted: runner.stopped)
+                    Sprite(slot: runner.slot, size: orbSize, mood: runner.mood, muted: runner.stopped, celebrating: active)
+                        .scaleEffect(active ? 1.06 : 1 - 0.05 * fall)
+                    if runner.stale != nil {
+                        // A status dot on the avatar, as in Reorder list: the reading is old.
+                        Image(systemName: "clock.arrow.circlepath").font(.system(size: 8, weight: .bold)).foregroundStyle(Tokens.muted)
+                            .frame(width: 15, height: 15).background(Tokens.surface, in: Circle())
+                            .overlay(Circle().strokeBorder(Tokens.fill, lineWidth: 1))
+                            .offset(x: orbSize * 0.42, y: orbSize * 0.38)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .frame(width: ring, height: ring)
+                .offset(x: reduceMotion ? 0 : direction * 3 * fall)
+                VStack(spacing: 4) {
+                    Text(runner.name).font(.system(size: 11, weight: active ? .semibold : .medium))
+                        .foregroundStyle(active ? AnyShapeStyle(Tokens.ink) : AnyShapeStyle(Tokens.muted))
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                    Group {
+                        if let note = runner.note {
+                            Text(note).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(1).minimumScaleFactor(0.8)
+                        } else {
+                            ResetClock(fiveHour: runner.fiveHour, sevenDay: runner.sevenDay, size: clock)
+                        }
+                    }
+                    // Every column has the same height, so the pill fits them all.
+                    .frame(height: clock)
+                }
+            }
+            .padding(.vertical, 8)
+            .frame(width: column)
+            .contentShape(Rectangle())
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(space)) } action: { frames[runner.id] = $0 }
+        }
+        .buttonStyle(OrbButtonStyle())
+        .disabled(disabled || active || runner.stopped)
+        .contextMenu { menu(runner) }
+        .help([runner.name, runner.detail, active ? "使用中" : runner.stopped ? "已停用" : "点击切换"].filter { !$0.isEmpty }.joined(separator: "\n"))
+        .accessibilityLabel([runner.name, runner.detail, active ? "使用中" : runner.stopped ? "已停用" : ""].filter { !$0.isEmpty }.joined(separator: "，"))
+        .accessibilityHint(active || runner.stopped ? "" : "切换到此账号")
+        .accessibilityAddTraits(active ? .isSelected : [])
+        .animation(reduceMotion ? nil : Motion.magnetic(distance: far).delay(far * 0.022), value: activeID)
+    }
+
+    /// The leading edge (in the direction of travel) springs ahead and the trailing one follows on a softer spring.
+    private func moveSelection(from old: UUID?, to new: UUID?) {
+        guard let new, let target = frames[new] else { placed = nil; return }
+        defer { placed = new }
+        guard !reduceMotion, old != nil, right > left else {
+            var quiet = Transaction(); quiet.disablesAnimations = true
+            withTransaction(quiet) { left = target.minX; right = target.maxX }
+            return
+        }
+        let forward = target.minX > left
+        withAnimation(forward ? Motion.stretchLead : Motion.stretchLag) { right = target.maxX }
+        withAnimation(forward ? Motion.stretchLag : Motion.stretchLead) { left = target.minX }
     }
 }
 
 extension RunnerTrack where MenuContent == EmptyView {
     init(runners: [Runner], activeID: UUID?, orbSize: CGFloat = 44, disabled: Bool = false, onSelect: @escaping (UUID) -> Void, onAdd: (() -> Void)? = nil) {
         self.init(runners: runners, activeID: activeID, orbSize: orbSize, disabled: disabled, onSelect: onSelect, onAdd: onAdd) { _ in EmptyView() }
+    }
+}
+
+/// The selection pill under the account in use. Its edges live in two nested animatable views, so each
+/// edge follows its own spring: one view interpolates `left`, the one inside it interpolates `right`.
+private struct SpanLeft: View, Animatable {
+    var left: CGFloat
+    var right: CGFloat
+    var top: CGFloat
+    var height: CGFloat
+    nonisolated var animatableData: CGFloat {
+        get { left }
+        set { left = newValue }
+    }
+    var body: some View { SpanRight(left: left, right: right, top: top, height: height) }
+}
+
+private struct SpanRight: View, Animatable {
+    var left: CGFloat
+    var right: CGFloat
+    var top: CGFloat
+    var height: CGFloat
+    nonisolated var animatableData: CGFloat {
+        get { right }
+        set { right = newValue }
+    }
+    var body: some View {
+        RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .fill(Tokens.fill)
+            .frame(width: max(0, right - left), height: height)
+            .offset(x: left, y: top)
     }
 }
 

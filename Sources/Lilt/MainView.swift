@@ -11,6 +11,7 @@ struct MainView: View {
     @State private var statusToast = Transient()
     @State private var pointer = PointerTracker()
     @State private var refreshSpin = 0
+    @Namespace private var inUse
     /// First-run steps are still open. The demo has nothing to set up.
     private var setupPending: Bool { !model.demo && (!model.managesDefaultLogin || !model.setupComplete) }
     var body: some View {
@@ -127,8 +128,8 @@ struct MainView: View {
     }
     @ViewBuilder private func meters(_ active: Account) -> some View {
         let unreadable = active.usageCapability == .unavailable
-        UsageMeter(title: "5 小时", window: active.usage?.fiveHour, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable)
-        UsageMeter(title: "7 天", window: active.usage?.sevenDay, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable)
+        UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable)
+        UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable)
     }
     /// Who runs next. Left to right is relay order; pressing an orb passes the baton.
     private var track: some View {
@@ -136,6 +137,7 @@ struct MainView: View {
             HStack {
                 Text("接力顺序").font(Typo.caption).foregroundStyle(Tokens.muted)
                 Spacer()
+                QuotaLegend().padding(.trailing, 8)
                 Button("管理") { model.selectedPage = .accounts }.buttonStyle(.lilt(.ghost, size: .small))
                     .accessibilityLabel("管理账号")
             }
@@ -199,9 +201,9 @@ struct MainView: View {
     // MARK: Accounts
     private var accountsPage: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if model.accounts.isEmpty { EmptyAccounts(model: model) }
+            if model.accounts.isEmpty { EmptyAccounts(model: model) } else { AccountColumnLabels().padding(.bottom, -4) }
             ForEach(Array(model.accounts.enumerated()), id: \.element.id) { index, account in
-                AccountRow(model: model, account: account, index: index,
+                AccountRow(model: model, account: account, index: index, selection: inUse,
                            onRename: { rename = account.label; renameID = account.id }, onDelete: { deleteAccount = account })
                     .staggeredAppear(index: index * 2)
                     .draggable(account.id.uuidString)
@@ -216,6 +218,7 @@ struct MainView: View {
             }
         }
         .animation(reduceMotion ? nil : Motion.settle, value: model.accounts.map(\.id))
+        .animation(reduceMotion ? Motion.fade : Motion.magnetic(), value: model.library.activeID)
     }
 
     // MARK: Diagnostics
