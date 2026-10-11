@@ -25,7 +25,8 @@ struct RootView: View {
 #if DEBUG
 enum DebugLaunch {
     /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PAGE=overview|accounts|scope|diagnostics, LILT_RELAY=1,
-    /// LILT_SIMULATE=1 (demo quota reaches the threshold), LILT_PENDING=1 (shows the "applied, not yet verified" notice),
+    /// LILT_SIMULATE=1 (demo quota reaches the threshold), LILT_SIMULATE_AFTER=<seconds> (the same, later),
+    /// LILT_PENDING=1 (shows the "applied, not yet verified" notice),
     /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>.
     @MainActor static func apply(to model: AppModel) {
         let environment = ProcessInfo.processInfo.environment
@@ -37,6 +38,10 @@ enum DebugLaunch {
         if let name = environment["LILT_PAGE"], let page = AppModel.Page.allCases.first(where: { "\($0)" == name }) { model.selectedPage = page }
         if environment["LILT_RELAY"] == "1" { model.setAutoRelay(true) }
         if environment["LILT_SIMULATE"] == "1" { Task { await model.simulateThreshold() } }
+        // The demo hand-off is instant, so a screen recording started after launch needs it to wait.
+        if let delay = environment["LILT_SIMULATE_AFTER"].flatMap(Double.init) {
+            Task { try? await Task.sleep(for: .seconds(delay)); await model.simulateThreshold() }
+        }
         if environment["LILT_PENDING"] == "1" { model.appliedPending = true }
         // LILT_STATUSLINE=install|uninstall exercises the status line bridge. Only inside a fake home
         // (CFFIXED_USER_HOME), so a check can never touch the real ~/.claude/settings.json.
