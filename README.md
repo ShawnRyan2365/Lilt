@@ -4,6 +4,26 @@
 
 原生 SwiftUI macOS 26+ 菜单栏工具，管理本机 Claude Pro / Max 凭据与额度。工具栏、面板和浮层用 Apple 原生 Liquid Glass（`glassEffect`），内容区是灰色画布上的白色物件，系统字体和 SF Symbols。模型请求由官方 Claude Code 直接发出。
 
+## Lilt 不是反代
+
+**Lilt 和反代、网关、模型中转没有任何关系。**
+
+- **不经手模型请求。** 你在终端里用的仍是官方 `claude`，对话由它直接发给 Anthropic。Lilt 不在中间，不转发、不改写，也不记录任何对话内容。
+- **只发三种请求，全部发往官方域名，并拒绝重定向：** 读额度、核对账号身份、给不在用的登录续期。没有第三方服务器，也没有统计上报。
+- **登录走官方流程。** 添加账号时运行官方的 `claude auth login --claudeai`，在浏览器里登录 Claude 官网，Lilt 碰不到你的密码。
+- **凭据只留在本机。** 存在只有当前用户能读的文件里，不上传到任何地方。
+- **切换账号相当于替你在 Claude Code 里重新登录一次：** 把选中账号的登录写到 Claude Code 读取登录的位置。
+- **代码全部公开**，可以自己核对、自己构建。
+
+### 封号风险
+
+Lilt 没有得到 Anthropic 的认可，作者也无法保证不会封号：账号会不会被处理，只有 Anthropic 能决定。使用前请自己读一下相关条款：
+
+- [Consumer Terms](https://www.anthropic.com/legal/consumer-terms)：账号不能分享给别人，违反条款的账号可能被停用。
+- [Claude Code 法律与合规](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)：Pro / Max 的额度按“普通的个人使用”来定。自动接力（一个账号额度用完就换下一个）算不算普通的个人使用，条款没有明说。
+
+只用 Lilt 管理你自己的账号，不要把账号或登录交给别人用。
+
 ## 当前交付
 
 2026-10-09：**0.1 研究预览版**。可构建与运行；不是已经通过全部 PRD 验收的正式版。
