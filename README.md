@@ -23,6 +23,23 @@
 
 长效 Token（`claude setup-token`）只能发模型请求，官方额度接口不接受它，所以这类账号看不到额度，也不参与自动接力；可以手动切换到它。运行中的 CLI 是否立即用上新账号仍未实测，切换后请在 CLI 里用 `/status` 核对。当前不会终止、恢复或重放用户 CLI 操作。
 
+## 下载安装
+
+在 [Releases](https://github.com/ShawnRyan2365/Lilt/releases) 下载 `Lilt-<版本>.dmg`，打开后把 Lilt 拖进“应用程序”。需要 macOS 26+，Apple 芯片和 Intel 都能用。
+
+安装包没有 Apple 开发者签名，也没有经过公证，所以第一次打开会被系统拦下：
+
+1. 双击 Lilt，系统提示“无法验证”，点“完成”。
+2. 打开“系统设置 → 隐私与安全性”，在“安全性”一栏找到 Lilt，点“仍要打开”，输入开机密码确认。之后正常打开，不会再问。
+
+如果提示“已损坏，无法打开”，在终端运行下面这行，再打开一次：
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lilt.app
+```
+
+不想信任别人编好的程序，可以按下一节自己构建；自己构建的应用不会被拦。
+
 ## 构建与打开
 
 需要 macOS 26+ 与 Swift 6.2+。无第三方依赖；本机 Command Line Tools 即可构建，不要求完整 Xcode。装有 Xcode 时，打包脚本会顺带编译强调色资源，让系统绘制的控件也用 Lilt 绿；没有时退回系统强调色。
@@ -33,7 +50,7 @@ swift run LiltChecks
 open build/Lilt.app
 ```
 
-也可以用 Xcode 打开 `Package.swift`。产物为本地 ad-hoc 签名，未公证、未发布。当前打包脚本生成本机架构版本。
+也可以用 Xcode 打开 `Package.swift`。产物为本地 ad-hoc 签名，未公证。`build-app.sh` 默认生成本机架构版本；`./scripts/package.sh` 生成 Apple 芯片与 Intel 通用版本，并打成 `build/Lilt-<版本>.dmg`，需要装有 Xcode。
 
 第一次启动时，概览页一次只显示一步：接管 Claude Code 默认登录、添加账号、选一个账号。接管之后，在任何终端直接运行 `claude` 用的都是 Lilt 里选中的账号，不需要特别的启动命令（和 ORCA、CC Switch 一样）。接管时现在登录着的账号会加入 Lilt，不会被退出。点击“先看看演示”体验界面和规则，不需要真实账号。开启演示自动接力后点击“模拟到阈值”，可观察切号和重复事件处理。真实模式中，接管默认登录后才能切换账号。
 
@@ -61,3 +78,7 @@ open build/Lilt.app
 - [研究证据](docs/RESEARCH.md)
 - [实现与已知限制](docs/IMPLEMENTATION.md)
 - [验收记录](docs/VALIDATION.md)
+
+## 许可
+
+[MIT](LICENSE)。Lilt 是个人项目，不是 Anthropic 官方产品，与 Anthropic 没有关联。

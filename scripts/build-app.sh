@@ -1,11 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-swift build -c release --product Lilt
+# UNIVERSAL=1 builds for Apple silicon and Intel, for a copy handed to other Macs.
+# Multi-arch builds need Xcode's build system; a plain local build only needs Command Line Tools.
+if [ "${UNIVERSAL:-0}" = 1 ]; then
+  DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}" \
+    swift build -c release --product Lilt --arch arm64 --arch x86_64
+  BIN=.build/apple/Products/Release/Lilt
+else
+  swift build -c release --product Lilt
+  BIN=.build/release/Lilt
+fi
 APP="$PWD/build/Lilt.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/zh-Hans.lproj"
 # Swapped in by rename: a copy of the app that is running keeps the file it started from.
-cp .build/release/Lilt "$APP/Contents/MacOS/Lilt.new" && mv -f "$APP/Contents/MacOS/Lilt.new" "$APP/Contents/MacOS/Lilt"
+cp "$BIN" "$APP/Contents/MacOS/Lilt.new" && mv -f "$APP/Contents/MacOS/Lilt.new" "$APP/Contents/MacOS/Lilt"
 # Always rewrite: PlistBuddy "Print" exits 0 for a missing file, so an existence probe never created it.
 # The zh-Hans region and .lproj make AppKit's own menus, dialogs and tooltips follow the Chinese UI.
 cat > "$APP/Contents/Info.plist" <<'PLIST'
