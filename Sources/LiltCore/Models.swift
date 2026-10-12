@@ -77,6 +77,10 @@ public struct Preferences: Codable, Sendable {
     public var shortcutModifiers: UInt32 = 2304 // command + option
     /// Whether the user left automatic relay on. Optional so account files written before it existed still load.
     public var autoRelay: Bool?
+    /// A safety stop must remain explainable after relaunch. Never contains credentials or account identifiers.
+    public var autoRelayStopReason: String?
+    /// User chose to keep an API provider. Manual subscription selection clears this choice.
+    public var keepAPIMode: Bool?
     /// Nil in files written before there was a choice; those always meant `dedicated`.
     public var scopeTarget: ScopeTarget?
     /// Read quota from Claude Code's status line. Nil means on.

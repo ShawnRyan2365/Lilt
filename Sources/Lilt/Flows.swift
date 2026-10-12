@@ -247,7 +247,7 @@ struct ScopeView: View {
             if expanded {
                 VStack(alignment: .leading, spacing: 14) {
                     note("rectangle.on.rectangle", "所有使用默认登录的 Claude Code 会话共用一个账号，切换会一起影响它们，包括正在运行的。")
-                    note("lock.shield", "设置了 CLAUDE_CODE_OAUTH_TOKEN、ANTHROPIC_API_KEY 或 CLAUDE_CONFIG_DIR 的终端不走默认登录，Lilt 管不到。")
+                    note("lock.shield", "从 CC Switch 切到 API 后，可保留 API，也可点订阅账号切回。终端启动时固定的环境变量或自定义配置目录需单独处理。")
                     note("hourglass", "已经发出的请求仍算在原账号上。切换后可以在 CLI 里用 /status 核对。")
                     note("pause.circle", "发现默认登录被别处改了（例如 ORCA 或 /login），Lilt 会暂停自动接力，等你决定采纳还是改回。")
                 }
@@ -345,7 +345,7 @@ struct MenuPanel: View {
             if !model.accounts.isEmpty {
                 ScrollView(.horizontal) {
                     // The panel cannot show the alert or page a refused switch leads to, so it opens the window instead.
-                    RunnerTrack(runners: model.runners, activeID: model.library.activeID, orbSize: 30, disabled: model.busy || model.loading,
+                    RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, orbSize: 30, disabled: model.busy || model.loading,
                                 onSelect: { id in Task { if !(await model.apply(id)) { openMain() } } })
                         .padding(.horizontal, 2).padding(.top, 4)
                 }
@@ -355,7 +355,9 @@ struct MenuPanel: View {
                 let blocker = model.autoRelay ? nil : model.relayBlocker
                 VStack(alignment: .leading, spacing: 2) {
                     Text("自动接力").font(Typo.label)
-                    if let blocker { Text(blocker).font(Typo.caption).foregroundStyle(Tokens.muted) }
+                    if let explanation = model.relayExplanation ?? blocker {
+                        Text(explanation).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3).help(explanation)
+                    }
                 }
                 .help("剩余 ≤\(model.threshold.formatted())% 时换下一个")
                 Spacer()

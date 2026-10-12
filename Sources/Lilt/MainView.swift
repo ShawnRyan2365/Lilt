@@ -153,7 +153,7 @@ struct MainView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).object()
     }
     private var runnerTrack: some View {
-        RunnerTrack(runners: model.runners, activeID: model.library.activeID, disabled: model.busy || model.loading,
+        RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, disabled: model.busy || model.loading,
                     onSelect: { id in Task { await model.apply(id) } },
                     onAdd: model.canAdd ? { model.requestAdd() } : nil) { runner in
             accountMenu(runner.id)
@@ -181,8 +181,8 @@ struct MainView: View {
                 LiquidToggle(label: "自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }))
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")
             }
-            Text(blocker ?? "剩余 ≤\(model.threshold.formatted())% 时换下一个")
-                .font(Typo.caption).foregroundStyle(Tokens.muted)
+            Text(model.relayExplanation ?? blocker ?? "剩余 ≤\(model.threshold.formatted())% 时换下一个")
+                .font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)
             if model.demo || model.lastEvent != "尚无接力记录" {
                 Spacer(minLength: 6)
                 Text(model.lastEvent).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)

@@ -55,6 +55,11 @@ final class AppModel {
     private(set) var clock = Date.now
     private(set) var scopeIssue: String?
     private(set) var relayPause: String?
+    private(set) var apiModeDetected = false
+    var keepsAPIMode: Bool { library.preferences.keepAPIMode == true }
+    var displayedActiveID: UUID? { apiModeDetected || keepsAPIMode || scopeIssue != nil ? nil : library.activeID }
+    private var relayRetryAt: Date?
+    private let retryClock: () -> Date
     /// Where the selected account's login goes. Files from before there was a choice always meant Lilt's own directory;
     /// anything set up now takes over Claude Code's default login.
     var scopeTarget: ScopeTarget { library.preferences.scopeTarget ?? (library.preferences.scopeEnabled ? .dedicated : .system) }
@@ -66,6 +71,7 @@ final class AppModel {
     let login = CLILogin()
     private var savedLibrary: Library?
     private var savedPending = false
+    private var savedAPIMode = false
     private var backoffs: [UUID: Backoff] = [:]
     private var failures: [UUID: UsageFailure] = [:]
     /// The usage endpoint limits everything sent from this Mac, so a 429 for one account pauses them all (ORCA does
@@ -89,6 +95,7 @@ final class AppModel {
         var symbol: String { switch self { case .overview: "square.grid.2x2"; case .accounts: "person.2"; case .scope: "terminal"; case .diagnostics: "waveform.path.ecg" } }
     }
     init() {
+        retryClock = { .now }
         do { library = try Disk.load() } catch { storageAvailable = false; message = "账号资料无法读取，已停止写入。请先检查本地数据；不会以空列表覆盖。" }
         // Being told to wait, or a dropped connection, is not a lasting problem with an account; earlier versions kept it as one.
         let passing: Set<String> = ["额度接口限流，已按服务端要求延后重试。", UsageFailure.rateLimited(0).message, UsageFailure.network.message]
@@ -96,8 +103,9 @@ final class AppModel {
         if storageAvailable {
             do { try CLILogin.cleanupStaleLogins() } catch { message = "上次授权的临时资料未能清理，请检查钥匙串与目录权限。" }
         }
-        autoRelay = library.preferences.autoRelay == true && relayBlocker == nil
-        if storageAvailable, managesDefaultLogin, liveUsageEnabled { connectStatusLine() }
+        restoreRelayPreference()
+        if storageAvailable, library.preferences.scopeEnabled { _ = checkAPIMode() }
+        if storageAvailable, managesDefaultLogin, liveUsageEnabled, !apiModeDetected { connectStatusLine() }
         Task { version = await CLILogin.version() }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
@@ -106,6 +114,17 @@ final class AppModel {
                 await self.tick()
             }
         }
+    }
+    /// A fully local model for previews and regression checks: no disk, keychain, network or monitor task.
+    init(preview library: Library, retryClock: @escaping () -> Date = { .now }) {
+        self.retryClock = retryClock
+        demo = true
+        self.library = library
+        restoreRelayPreference()
+    }
+    private func restoreRelayPreference() {
+        autoRelay = library.preferences.autoRelay == true && relayBlocker == nil
+        relayPause = library.preferences.autoRelay == true ? relayBlocker : library.preferences.autoRelayStopReason
     }
     var accounts: [Account] { library.accounts }
     var active: Account? { accounts.first { $0.id == library.activeID } }
@@ -121,7 +140,11 @@ final class AppModel {
     }
     private func persist(_ value: Library) {
         guard storageAvailable else { return }
-        do { try Disk.save(value) } catch { autoRelay = false; storageAvailable = false; message = "本地数据保存失败，自动接力已停止。" }
+        do { try Disk.save(value) } catch {
+            autoRelay = false; storageAvailable = false
+            relayPause = "本地数据保存失败，请检查存储后重新打开 Lilt。"
+            lastEvent = relayPause!; message = "本地数据保存失败，自动接力已停止。"
+        }
     }
     /// Preferences belong to the real library even while a demo is on screen, so a change made there still sticks.
     private func updatePreferences(_ change: (inout Preferences) -> Void) {
@@ -135,6 +158,8 @@ final class AppModel {
     /// The demo has no prerequisites.
     var relayBlocker: String? {
         guard !demo else { return nil }
+        if !storageAvailable { return "先恢复本地数据存储" }
+        if apiModeDetected || keepsAPIMode { return "先选择订阅账号切回订阅模式" }
         if !library.preferences.scopeEnabled { return "先接管 Claude Code 默认登录" }
         guard let active else { return "先选一个账号" }
         // Without a reading for the account in use there is nothing to tell Lilt when to hand off.
@@ -146,14 +171,54 @@ final class AppModel {
     func setAutoRelay(_ on: Bool) {
         if on, let relayBlocker { status = relayBlocker; return }
         autoRelay = on
-        if on { relayPause = nil; latch = RelayLatch() }
-        if !demo { updatePreferences { $0.autoRelay = on } }
+        relayPause = nil; relayRetryAt = nil
+        if on { latch = RelayLatch() }
+        if demo { library.preferences.autoRelay = on; library.preferences.autoRelayStopReason = nil }
+        else { updatePreferences { $0.autoRelay = on; $0.autoRelayStopReason = nil } }
     }
     /// Relay stopped itself. The saved switch goes off too, so a relaunch does not quietly resume it.
-    private func stopRelay(because reason: String?) {
+    func stopRelay(because reason: String) {
         autoRelay = false
-        if let reason { relayPause = reason; status = "自动接力已暂停"; lastEvent = reason }
-        if !demo, storageAvailable { updatePreferences { $0.autoRelay = false } }
+        relayRetryAt = nil
+        relayPause = reason; status = "自动接力已停止：\(reason)"; lastEvent = reason
+        library.preferences.autoRelay = false
+        library.preferences.autoRelayStopReason = reason
+        if !demo, storageAvailable { save() }
+    }
+    /// Waiting for quota or a cooldown is not withdrawal of the user's consent.
+    private func waitForRelay(because reason: String, until retryAt: Date) {
+        relayPause = reason; relayRetryAt = retryAt
+        status = "自动接力等待中"; lastEvent = reason
+    }
+    var relayExplanation: String? {
+        guard let relayPause else { return nil }
+        return "\(autoRelay ? "等待" : "已停止")：\(relayPause)"
+    }
+    /// The monitor only observes API settings. It never clears them without a manual account selection.
+    @discardableResult private func checkAPIMode() -> Bool {
+        do { observeAPIMode(try runtime.hasAPIOverride()); return apiModeDetected }
+        catch {
+            scopeIssue = (error as? AppFailure)?.message ?? "无法读取 Claude 登录配置。"
+            stopRelay(because: scopeIssue!)
+            return true
+        }
+    }
+    func observeAPIMode(_ detected: Bool) {
+        guard detected != apiModeDetected else { return }
+        apiModeDetected = detected
+        if detected {
+            relayPause = "检测到 API 配置；选择保留 API，或点击订阅账号切回。"
+            relayRetryAt = nil; status = "检测到 API 模式，等待你的选择"
+        } else {
+            relayPause = keepsAPIMode ? "API 配置已移除；点击订阅账号恢复管理。" : nil
+            status = "API 配置已移除"
+        }
+    }
+    func keepAPI() {
+        guard apiModeDetected, !busy else { return }
+        setAutoRelay(false)
+        updatePreferences { $0.keepAPIMode = true }
+        status = "已保留 API 模式；点击任一订阅账号即可切回"
     }
     func requestAdd(_ kind: AuthKind = .oauth, replacing id: UUID? = nil) {
         guard canAdd else { return }
@@ -301,13 +366,14 @@ final class AppModel {
     @discardableResult
     private func reconcileScope() async -> Bool {
         guard !demo, library.preferences.scopeEnabled, let active else { return true }
+        if checkAPIMode() || keepsAPIMode { return false }
         do { try runtime.check(); scopeIssue = nil; return true }
         catch {
             switch await readBack(into: active) {
             case .adopt, .unchanged: scopeIssue = nil; return true
             case nil: return false // could not tell this time (no network); look again on the next pass
             case .unverifiable, .foreign:
-                stopRelay(because: nil)
+                stopRelay(because: "无法确认当前登录仍属于所选账号，请到“接入”检查并决定采纳还是改回。")
                 scopeIssue = (error as? AppFailure)?.message ?? "登录检查失败。"; status = "\(scopeName)被别处改了，管理已暂停"
                 return false
             }
@@ -396,22 +462,26 @@ final class AppModel {
         await refresh(active.id)
     }
     @discardableResult
-    func apply(_ id: UUID) async -> Bool {
-        guard !busy, !loading, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
+    func apply(_ id: UUID, automatically: Bool = false) async -> Bool {
+        guard !busy, !loading, storageAvailable, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
+        if automatically, apiModeDetected || keepsAPIMode { return false }
         if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先接管 Claude Code 默认登录。"; return false }
         busy = true
         defer { busy = false }
         do {
             if !demo {
                 // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
-                if (try? runtime.check()) == nil, let leaving = active, leaving.id != id { _ = await readBack(into: leaving) }
+                if (try? runtime.hasAPIOverride()) == false, (try? runtime.check()) == nil,
+                   let leaving = active, leaving.id != id { _ = await readBack(into: leaving) }
                 let credential: Credential
                 // A network hiccup is no reason to refuse: the CLI can renew an expired login itself.
                 do { credential = try await renewedCredential(for: id) } catch UsageFailure.network { credential = try self.credential(for: id) }
-                try runtime.apply(credential)
+                try runtime.apply(credential, replacingExternalState: !automatically)
                 try? runtime.writeIdentity(identity(for: id))
             }
-            library.activeID = id; appliedPending = !demo; relayPause = nil; scopeIssue = nil; save()
+            library.activeID = id; appliedPending = !demo; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
+            apiModeDetected = false; library.preferences.keepAPIMode = nil
+            library.preferences.autoRelayStopReason = nil; save()
             if !demo {
                 lastSwitchAt = .now
                 if managesDefaultLogin, liveUsageEnabled { StatusLineBridge.setLabel(target.label) }
@@ -425,7 +495,7 @@ final class AppModel {
             return true
         } catch {
             let wasRelaying = autoRelay
-            stopRelay(because: nil); status = "切换未完成"
+            stopRelay(because: "凭据切换未完成，请检查登录和存储状态后重新开启。"); status = "切换未完成"
             message = ((error as? AppFailure)?.message ?? (error as? UsageFailure)?.message ?? "凭据应用失败。") + (wasRelaying ? " 自动接力已关闭。" : "")
             return false
         }
@@ -516,7 +586,7 @@ final class AppModel {
     /// Stop managing the default login. It keeps whatever account is in it; nothing is logged out.
     func releaseDefaultLogin() {
         guard !demo, managesDefaultLogin else { return }
-        stopRelay(because: nil)
+        setAutoRelay(false)
         updatePreferences { $0.scopeEnabled = false }
         scopeIssue = nil; appliedPending = false
         disconnectStatusLine()
@@ -525,8 +595,11 @@ final class AppModel {
     func startDemo() {
         guard !busy, !loading, !demo else { return }
         savedLibrary = library; savedPending = appliedPending; demo = true; library = Library(); autoRelay = false; appliedPending = false; relayPause = nil
+        savedAPIMode = apiModeDetected; apiModeDetected = false
+        relayRetryAt = nil
         departedID = nil; departedAt = nil
         library.preferences = savedLibrary?.preferences ?? Preferences()
+        library.preferences.keepAPIMode = nil
         for (i, name) in ["日常创作", "深度工作", "备用账号"].enumerated() {
             var account = Account(label: name, kind: i == 2 ? .setupToken : .oauth)
             account.usage = UsageSnapshot(fiveHour: UsageWindow(used: [28.0, 8, 56][i], resetsAt: .now.addingTimeInterval(7200)), sevenDay: UsageWindow(used: [46.0, 21, 62][i], resetsAt: .now.addingTimeInterval(259200)), source: "本地演示数据")
@@ -538,8 +611,9 @@ final class AppModel {
     func endDemo() {
         guard demo else { return }
         library = savedLibrary ?? Library(); savedLibrary = nil; demo = false; relayPause = nil; appliedPending = savedPending
+        apiModeDetected = savedAPIMode
         departedID = nil; departedAt = nil
-        autoRelay = library.preferences.autoRelay == true && relayBlocker == nil
+        relayRetryAt = nil; restoreRelayPreference()
         lastEvent = "尚无接力记录"; status = "已退出演示"; selectedPage = .overview
     }
     /// Demo samples stay current the way a live poll would keep them, so the walkthrough does not expire mid-read.
@@ -557,8 +631,10 @@ final class AppModel {
         }
         if autoRelay { await relay() } else { status = "演示额度已到阈值，开启自动接力可查看结果" }
     }
-    private func relay() async {
+    func relay() async {
         guard autoRelay, !busy, !loading, let active, let snapshot = active.usage else { return }
+        guard storageAvailable, library.preferences.scopeEnabled || demo, scopeIssue == nil,
+              !apiModeDetected, !keepsAPIMode else { return }
         // A status-line reading is already the session's own report, and the endpoint is not asked again
         // for five minutes. The hand-off has to be allowed to start from that reading for the whole five
         // minutes. An endpoint reading is only acted on while it is still the just-queried minute.
@@ -567,13 +643,17 @@ final class AppModel {
         // The weekly preference may move before the threshold, but only off a fresh reading of the account in use.
         // Once the threshold is reached that preference stays out of the decision.
         let early = library.preferences.soonerWeekly == true && !triggered && snapshot.isFresh(at: .now)
-        guard triggered || early else { return }
+        guard triggered || early else {
+            if snapshot.available(threshold: threshold, at: .now) { relayPause = nil; relayRetryAt = nil }
+            return
+        }
         // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
         // give up on relaying.
         if !demo, let until = usagePausedUntil, until > .now {
-            if triggered { status = "已到阈值，等额度接口恢复后接力" }
+            if triggered { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
             return
         }
+        if let relayRetryAt, relayRetryAt > retryClock() { return }
         let policy = RelayPolicy(
             threshold: threshold,
             allowUnverifiedHotSwitch: !demo,
@@ -605,6 +685,11 @@ final class AppModel {
             // The readings above took time; the user may have switched or turned relay off meanwhile.
             // A newer reading of the same account is a different event and is left for the next pass.
             guard autoRelay, self.active?.id == active.id, self.active?.usage?.sampledAt == snapshot.sampledAt else { return }
+            // A candidate query can start a global backoff after the check above.
+            if let until = usagePausedUntil, until > .now {
+                if triggered { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
+                return
+            }
         }
         switch policy.decide(active: self.active, candidates: accounts, at: .now, holdActiveReading: !demo && triggered) {
         case .select(let id):
@@ -613,7 +698,7 @@ final class AppModel {
             // the decision then came back as "wait" and this exact sample could never trigger again.
             guard latch.claim(account: active.id, snapshot: snapshot) else { return }
             let name = accounts.first { $0.id == id }?.label ?? ""
-            if await apply(id) {
+            if await apply(id, automatically: true) {
                 departedID = active.id; departedAt = .now
                 if !demo { lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)" }
             }
@@ -622,7 +707,8 @@ final class AppModel {
             guard triggered else { break }
             let reasons = accounts.filter { $0.id != active.id }
                 .compactMap { account in policy.obstacle(for: account, at: .now).map { "\(account.label)：\($0)" } }
-            stopRelay(because: reasons.isEmpty ? reason : reasons.joined(separator: "；"))
+            let detail = reasons.isEmpty ? reason : reasons.joined(separator: "；")
+            waitForRelay(because: "\(detail) 保持开启，稍后自动重查。", until: retryClock().addingTimeInterval(120))
         case .wait: break
         }
     }
@@ -656,6 +742,10 @@ final class AppModel {
     }
     func notice(at now: Date = .now) -> Notice? {
         if !storageAvailable { return Notice(symbol: "externaldrive.badge.exclamationmark", text: "本地数据不可用，已停止写入", detail: "检查 ~/Library/Application Support/Lilt 的权限后重新打开 Lilt。", warning: true) }
+        if apiModeDetected {
+            return Notice(symbol: "arrow.triangle.branch", text: keepsAPIMode ? "已保留 API 模式" : "检测到 API 模式",
+                          detail: "点击订阅账号会清除用户配置中的 API 覆盖项并应用所选登录。", warning: !keepsAPIMode)
+        }
         if let scopeIssue {
             // The usual cause is harmless: the official CLI renewed the token of the account in use.
             guard let active else { return Notice(symbol: "exclamationmark.triangle", text: "\(scopeName)管理已暂停", detail: scopeIssue, warning: true, action: .openScope) }
@@ -679,7 +769,7 @@ final class AppModel {
             }
             return notice
         }
-        if let relayPause { return Notice(symbol: "pause.circle", text: "自动接力已暂停", detail: relayPause, warning: true, action: .refreshAll) }
+        if let relayPause { return Notice(symbol: "pause.circle", text: autoRelay ? "自动接力等待中" : "自动接力已停止", detail: relayPause, warning: true, action: autoRelay ? .refreshAll : .openScope) }
         // Not a problem to fix: the switch is done on Lilt's side. What Lilt cannot see is whether a CLI that was
         // already running has picked the new login up, so it says so once and leaves it at that.
         if appliedPending { return Notice(symbol: "checkmark.circle", text: "已切换到“\(active.label)”", detail: scopeTarget == .system ? "新开的终端运行 claude 就是这个账号。已经在运行的会话有没有跟着换，Lilt 看不到；想确认就在里面运行 /status。" : "登录已写入 Lilt 作用域。正在运行的 CLI 有没有跟着换，Lilt 看不到；想确认就在 CLI 里运行 /status。", action: .confirmApplied) }
@@ -729,7 +819,6 @@ final class AppModel {
     /// The user says the scope should go back to the account Lilt put there, whatever is in it now.
     func reclaimScope() {
         guard !demo, !busy, let active else { return }
-        do { try runtime.rebaseline(); scopeIssue = nil } catch { message = (error as? AppFailure)?.message ?? "无法改回。"; return }
         Task { if await apply(active.id) { status = "已改回“\(active.label)”" } }
     }
     func exportDiagnostics() {

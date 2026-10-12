@@ -102,12 +102,29 @@ enum CLIKeychain {
         return KeychainPassword.decode(result.output)
     }
     static func write(_ data: Data, service: String) throws {
-        let hex = data.map { String(format: "%02x", $0) }.joined()
-        let command = "add-generic-password -U -a \"\(try account())\" -s \"\(service)\" -X \(hex)\n"
-        // The tool reads commands one line at a time from a fixed buffer.
-        guard command.utf8.count < 3800 else { throw AppFailure("凭据太长，无法写入钥匙串。") }
+        let command = try writeCommand(data, service: service, account: account())
         let result = try run(["-i"], input: command)
         guard result.status == 0 else { throw AppFailure("写入 Claude Code 登录失败（钥匙串返回 \(result.status)）。") }
+    }
+    /// security -i has a 4096-byte input buffer. Hex doubles a perfectly valid JSON document's size;
+    /// a quoted UTF-8 argument preserves the exact bytes without that expansion. This is security's
+    /// own parser, not a shell: escape quotes and backslashes, and keep all secrets on stdin.
+    static func writeCommand(_ data: Data, service: String, account: String) throws -> String {
+        func quote(_ value: String) throws -> String {
+            guard !value.contains("\n"), !value.contains("\r"), !value.contains("\0") else {
+                throw AppFailure("钥匙串条目名称含无效字符。")
+            }
+            return "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        let prefix = try "add-generic-password -U -a \(quote(validated(account))) -s \(quote(service))"
+        let hex = data.map { String(format: "%02x", $0) }.joined()
+        let command = "\(prefix) -X \(hex)\n"
+        if command.utf8.count < 3800 { return command }
+        if let text = String(data: data, encoding: .utf8), let quoted = try? quote(text) {
+            let compact = "\(prefix) -w \(quoted)\n"
+            if compact.utf8.count < 3800 { return compact }
+        }
+        throw AppFailure("登录资料超过系统钥匙串工具的单行写入上限，未截断或丢弃任何凭据。")
     }
     static func delete(service: String, account explicit: String? = nil) throws {
         let name = try explicit.map { try validated($0) } ?? account()
@@ -174,36 +191,66 @@ struct Disk {
 /// `system` is Claude Code's default login (keychain item `Claude Code-credentials`, `~/.claude`, `~/.claude.json`),
 /// the same surfaces ORCA writes. `dedicated` is a directory of Lilt's own that only the launch command points at.
 final class RuntimeScope {
+    struct CredentialAccess {
+        var read: () throws -> Data?
+        var write: (Data) throws -> Void
+        var delete: () throws -> Void
+    }
     let target: ScopeTarget
     let directory: URL
+    private let root: URL
+    private let home: URL
+    private let credentialAccess: CredentialAccess?
     init(target: ScopeTarget) {
         self.target = target
+        root = Disk.root; home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
         directory = target == .system ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
                                        : Disk.root.appendingPathComponent("scope")
     }
+    /// Isolated transaction checks use an in-memory credential store, never a macOS keychain item.
+    init(fixtureHome: URL, credentials: CredentialAccess) {
+        target = .system; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
+        directory = fixtureHome.appendingPathComponent(".claude"); credentialAccess = credentials
+    }
     private var file: URL { directory.appendingPathComponent(".credentials.json") }
-    private var journal: URL { Disk.root.appendingPathComponent(target == .system ? "transaction-system.json" : "transaction.json") }
+    private var settingsFile: URL { directory.appendingPathComponent("settings.json") }
+    private func readSettings() throws -> Data? {
+        guard FileManager.default.fileExists(atPath: settingsFile.path) else { return nil }
+        guard try settingsFile.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+            throw AppFailure("Claude 用户配置是符号链接，未修改。")
+        }
+        return try Data(contentsOf: settingsFile)
+    }
+    func hasAPIOverride() throws -> Bool {
+        guard let data = try readSettings() else { return false }
+        do { return try AuthenticationSettings.hasAPIOverride(data) }
+        catch { throw AppFailure("Claude 用户配置格式无效，请修复 settings.json 后再切换。") }
+    }
+    private var journal: URL { root.appendingPathComponent(target == .system ? "transaction-system.json" : "transaction.json") }
     private var service: String { target == .system ? "Claude Code-credentials" : Keychain.cliService(directory: directory) }
     /// Where the CLI keeps its account record: in the directory when one is named, otherwise `~/.claude.json`.
     private var configFile: URL {
         let inside = directory.appendingPathComponent(".claude.json")
         if target == .dedicated || FileManager.default.fileExists(atPath: inside.path) { return inside }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+        return home.appendingPathComponent(".claude.json")
     }
     // The default login's item belongs to the CLI and is reached through its tool. The dedicated one keeps the
     // access it was created with, so existing setups do not start asking for keychain permission.
     private func keychainRead() throws -> Data? {
-        target == .system ? try CLIKeychain.read(service: service) : try Keychain.read(service: service, account: NSUserName())
+        if let credentialAccess { return try credentialAccess.read() }
+        return target == .system ? try CLIKeychain.read(service: service) : try Keychain.read(service: service, account: NSUserName())
     }
     private func keychainWrite(_ data: Data) throws {
+        if let credentialAccess { try credentialAccess.write(data); return }
         if target == .system { try CLIKeychain.write(data, service: service) } else { try Keychain.write(data, service: service, account: NSUserName()) }
     }
     private func keychainDelete() throws {
+        if let credentialAccess { try credentialAccess.delete(); return }
         if target == .system { try CLIKeychain.delete(service: service) } else { try Keychain.delete(service: service, account: NSUserName()) }
     }
     /// Lilt's own folders. `~/.claude` belongs to the CLI and is never created or re-permissioned here.
     private func prepare() throws {
-        try Disk.directory(Disk.root)
+        try Disk.directory(root)
         if target == .dedicated { try Disk.directory(directory) }
     }
     private struct Stamp: Codable, Equatable { var file: String?; var keychain: String?; var pending: Bool = false }
@@ -263,15 +310,23 @@ final class RuntimeScope {
         // Read and written back at once: the CLI rewrites this file often, so the window stays as short as possible.
         try Disk.write(JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .withoutEscapingSlashes]), to: config)
     }
-    func apply(_ credential: Credential) throws {
-        try credential.validate(); try check()
+    func apply(_ credential: Credential, replacingExternalState: Bool = false) throws {
+        try credential.validate(); try prepare()
+        if !replacingExternalState { try check() }
         // The lock lives with Lilt's own data: nothing of Lilt's is left inside ~/.claude.
-        let lockURL = target == .system ? Disk.root.appendingPathComponent(".lilt-lock-system") : directory.appendingPathComponent(".lilt-lock")
+        let lockURL = target == .system ? root.appendingPathComponent(".lilt-lock-system") : directory.appendingPathComponent(".lilt-lock")
         let fd = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw AppFailure("无法锁定作用域。") }
         defer { flock(fd, LOCK_UN); close(fd) }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw AppFailure("另一个 Lilt 实例正在切换。") }
-        try check()
+        // An explicit account selection authorizes replacing the current login; automatic relay never does.
+        // Keep the lock and compare-before-write checks even for an explicit replacement.
+        if !replacingExternalState { try check() }
+        let oldSettings = try readSettings()
+        if !replacingExternalState, try oldSettings.map(AuthenticationSettings.hasAPIOverride) == true {
+            throw AppFailure("检测到 API 模式，自动接力不会覆盖；请手动选择订阅账号。")
+        }
+        let newSettings = try replacingExternalState ? oldSettings.flatMap(AuthenticationSettings.subscriptionSettings) : nil
         let previous = try state()
         let oldKey = try keychainRead()
         let oldFile = try readFile()
@@ -280,15 +335,21 @@ final class RuntimeScope {
         var pending = previous; pending.pending = true
         try Disk.write(JSONEncoder().encode(pending), to: journal)
         // Verify the other writer has not changed anything during preparation.
-        guard try state() == previous else { throw AppFailure("检测到并发凭据变更，已暂停。") }
+        guard try state() == previous, try readSettings() == oldSettings else { throw AppFailure("检测到并发登录配置变更，已暂停。") }
         do {
             try keychainWrite(credential.data)
             guard digest(try readFile()) == previous.file else { throw AppFailure("检测到外部写入，已停止。") }
             if writesFile { try Disk.write(credential.data, to: file) }
+            guard try readSettings() == oldSettings else { throw AppFailure("API 配置被其他工具同时修改，请稍后重试。") }
+            if let newSettings { try Disk.write(newSettings, to: settingsFile) }
             let next = try state()
-            guard next.keychain == digest(credential.data), !writesFile || next.file == digest(credential.data) else { throw AppFailure("凭据同步不一致，已暂停。") }
+            guard next.keychain == digest(credential.data), !writesFile || next.file == digest(credential.data),
+                  try readSettings() == (newSettings ?? oldSettings) else { throw AppFailure("登录配置同步不一致，已暂停。") }
             try Disk.write(JSONEncoder().encode(next), to: journal)
         } catch {
+            if let newSettings, let oldSettings, (try? readSettings()) == newSettings {
+                try? Disk.write(oldSettings, to: settingsFile)
+            }
             // Roll back only values still matching this transaction. Never replace an external update.
             if digest(try? keychainRead()) == digest(credential.data) {
                 if let oldKey { try? keychainWrite(oldKey) } else { try? keychainDelete() }

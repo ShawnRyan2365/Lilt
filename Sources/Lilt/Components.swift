@@ -210,6 +210,15 @@ struct NoticeIsland: View {
         let _ = model.clock // re-evaluated on every monitor tick, since staleness and backoff depend on time
         if let notice = model.notice(), !(hidesNoActive && model.active == nil && !notice.warning) {
             Island(symbol: notice.symbol, tone: notice.warning ? .warning : .neutral, text: notice.text, detail: notice.detail) {
+                if model.apiModeDetected {
+                    if !model.keepsAPIMode {
+                        Button("保留 API") { model.keepAPI() }.buttonStyle(IslandButtonStyle()).disabled(model.busy)
+                    }
+                    if let active = model.active {
+                        Button("切回订阅") { Task { await model.apply(active.id) } }
+                            .buttonStyle(IslandButtonStyle()).disabled(model.busy || model.loading)
+                    }
+                }
                 if let action = notice.action {
                     Button(action.title) { model.perform(action); if action.needsWindow { onNeedsWindow?() } }
                         .buttonStyle(IslandButtonStyle()).disabled(model.busy || model.loading)
@@ -313,7 +322,7 @@ struct AccountRow: View {
     let selection: Namespace.ID
     var onRename: () -> Void
     var onDelete: () -> Void
-    private var active: Bool { account.id == model.library.activeID }
+    private var active: Bool { account.id == model.displayedActiveID }
     private var canSwitch: Bool { !active && account.enabled && !model.busy && !model.loading }
     private var capabilities: String {
         let usage = account.usageCapability == .verified ? "可读取额度" : account.usageCapability == .unavailable ? "额度权限不足" : "额度待验证"
