@@ -54,5 +54,6 @@ fi
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 swift scripts/make-icon.swift "$PWD/build"
 iconutil -c icns "$PWD/build/Lilt.iconset" -o "$APP/Contents/Resources/Lilt.icns"
+cp "$PWD/build/LiltMenu.png" "$PWD/build/LiltMenu@2x.png" "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "$APP"

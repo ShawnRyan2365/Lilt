@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/lilt-logo-light.svg">
+    <img src="assets/brand/lilt-logo.svg" alt="Lilt" width="280">
+  </picture>
+</p>
+
 # Lilt
 
 **一台 Mac 上管理多个 Claude Pro / Max 账号：看额度、一键换号，额度用完自动接力。**
@@ -103,6 +110,8 @@ open build/Lilt.app
 ```
 
 `./scripts/package.sh` 生成 Apple 芯片与 Intel 通用版本，并打成 `build/Lilt-<版本>.dmg`，需要装有 Xcode。
+
+Logo、透明 PNG、SVG 和 App Icon 预览在 [`assets/brand`](assets/brand)。设计与重新生成方法见[品牌资产说明](assets/brand/README.md)。
 
 ## 许可
 

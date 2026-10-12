@@ -26,10 +26,36 @@ struct LiltApp: App {
         }
         MenuBarExtra {
             MenuPanel(model: model)
-        } label: { Image(systemName: model.autoRelay ? "arrow.trianglehead.2.clockwise.rotate.90" : "waveform.path") }
+        } label: {
+            Group {
+                if model.autoRelay {
+                    Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
+                } else {
+                    Image(nsImage: Self.menuIcon)
+                }
+            }
+            .accessibilityLabel(model.autoRelay ? "Lilt，自动接力已开启" : "Lilt")
+        }
         .menuBarExtraStyle(.window)
         Settings { SettingsView(model: model).frame(width: 480, height: 430) }
     }
+
+    private static let menuIcon: NSImage = {
+        // Packaged builds include both resolutions; `swift run` still has a system-symbol fallback.
+        guard let url = Bundle.main.url(forResource: "LiltMenu", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else {
+            return NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "Lilt")!
+        }
+        if let retinaURL = Bundle.main.url(forResource: "LiltMenu@2x", withExtension: "png"),
+           let data = try? Data(contentsOf: retinaURL),
+           let retina = NSBitmapImageRep(data: data) {
+            retina.size = NSSize(width: 18, height: 18)
+            image.addRepresentation(retina)
+        }
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = true
+        return image
+    }()
 }
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
