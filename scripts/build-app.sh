@@ -25,13 +25,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Lilt</string>
 <key>CFBundleDisplayName</key><string>Lilt</string>
 <key>CFBundleExecutable</key><string>Lilt</string>
-<key>CFBundleIconFile</key><string>Lilt</string>
+<key>CFBundleIconFile</key><string>LiltOrbit</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
@@ -53,7 +53,9 @@ else
 fi
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 swift scripts/make-icon.swift "$PWD/build"
-iconutil -c icns "$PWD/build/Lilt.iconset" -o "$APP/Contents/Resources/Lilt.icns"
+# A new resource name and build number invalidate cached icons from the original green identity.
+rm -f "$APP/Contents/Resources/Lilt.icns"
+iconutil -c icns "$PWD/build/Lilt.iconset" -o "$APP/Contents/Resources/LiltOrbit.icns"
 cp "$PWD/build/LiltMenu.png" "$PWD/build/LiltMenu@2x.png" "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "$APP"

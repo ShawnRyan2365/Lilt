@@ -23,6 +23,6 @@ swift scripts/make-icon.swift build --brand-assets
 ./scripts/build-app.sh
 ```
 
-`make-icon.swift` 是正式资产的唯一绘图源：同一组贝塞尔路径生成 SVG、PNG、10 个标准 macOS iconset 文件，以及 18 pt 的菜单栏模板图。App 构建自动生成 `build/Lilt.app/Contents/Resources/Lilt.icns`，不依赖绘图软件或第三方包。菜单栏关闭自动接力时显示回旋标志，开启后保留原有的接力箭头状态提示。
+`make-icon.swift` 是正式资产的唯一绘图源：同一组贝塞尔路径生成 SVG、PNG、10 个标准 macOS iconset 文件，以及 18 pt 的菜单栏模板图。App 构建自动生成 `build/Lilt.app/Contents/Resources/LiltOrbit.icns`，不依赖绘图软件或第三方包。图标使用新的资源名和构建号，避免 macOS 继续命中旧绿色图标缓存。菜单栏关闭自动接力时显示回旋标志，开启后保留原有的接力箭头状态提示。
 
 形态探索使用内置图像生成工具，正式交付重新构建为四重旋转对称的原生矢量路径。字标以 macOS 随附的 Helvetica Neue 转曲。参考与探索提示词见 [design-notes.md](design-notes.md)。
