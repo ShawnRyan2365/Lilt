@@ -290,6 +290,11 @@ struct SettingsView: View {
                 }
             } footer: { Text("这是可选策略，默认关闭，会在当前账号还有额度时提前换走，从而多付一次缓存写入。") }
             Section {
+                LabeledContent("自动排序") {
+                    LiquidToggle(label: "自动排序", isOn: Binding(get: { model.autoSort }, set: { model.setAutoSort($0) }), width: 44)
+                }
+            } footer: { Text("按 7 天额度排接力顺序：先重置的在前，同一天重置的剩余多的在前。到阈值换号时，优先换到 5 小时额度没动过的账号，并一直用到阈值。和「先用快重置的周额度」二选一，关闭后恢复手动顺序。") }
+            Section {
                 Picker("快速面板快捷键", selection: shortcut) { Text("⌘⌥L").tag(UInt32(37)); Text("⌘⌥J").tag(UInt32(38)); Text("⌘⌥K").tag(UInt32(40)) }
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
             } footer: { Text("在任何应用里按下，打开或收起菜单栏面板。Lilt 无法得知其他应用是否占用了同一组合；按下没有反应时请换一个。") }

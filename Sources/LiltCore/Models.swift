@@ -89,6 +89,10 @@ public struct Preferences: Codable, Sendable {
     /// the threshold. Nil and false keep the user's order and wait for the threshold. Optional so
     /// preference files written before the choice existed still load.
     public var soonerWeekly: Bool?
+    /// Keep the relay order sorted by the 7-day window (see `RelayOrder`), and at a hand-off prefer an account whose
+    /// 5-hour window is untouched. Nil and false keep the order the user arranged. Optional so preference files
+    /// written before the choice existed still load.
+    public var autoSort: Bool?
     public init() {}
 }
 public struct Library: Codable, Sendable {
@@ -111,6 +115,9 @@ public struct RelayPolicy: Sendable {
     /// When true, a healthy active account may hand off to one whose 7-day window resets sooner.
     /// Off by default. Reaching the threshold ignores this and keeps the user's order.
     public var soonerWeekly: Bool
+    /// When true, a hand-off goes to the first ready account whose 5-hour window is untouched, and to the first ready
+    /// one only when none is. The account taken is then kept until it reaches the threshold, like any other.
+    public var preferFreshFiveHour: Bool
     /// How long before expiry a target account's access token is renewed.
     /// Claude Code refreshes on its own about five minutes ahead. Ten minutes is twice that buffer,
     /// so a token written into the scope is not already inside the CLI's refresh window.
@@ -120,9 +127,10 @@ public struct RelayPolicy: Sendable {
     /// seconds have passed. Two accounts sitting just above the threshold would otherwise swap on
     /// every sample. This is not a second threshold and not a ten-point lag.
     public static let departureCooldown: TimeInterval = 300
-    public init(threshold: Double = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false) {
+    public init(threshold: Double = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false,
+                preferFreshFiveHour: Bool = false) {
         self.threshold = min(100, max(0, threshold)); self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
-        self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly
+        self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly; self.preferFreshFiveHour = preferFreshFiveHour
     }
     /// The id to pass as `leftRecently`, or nil once the cooldown has elapsed or the clock is skewed.
     public static func coolingDown(_ account: UUID?, since leftAt: Date?, at now: Date) -> UUID? {
@@ -146,6 +154,16 @@ public struct RelayPolicy: Sendable {
         if candidate.id == leftRecently { return "刚刚离开" }
         return nil
     }
+    /// A fresh reading shows the 5-hour window unused: all of it is left.
+    public static func untouchedFiveHour(_ account: Account, at now: Date) -> Bool {
+        guard let usage = account.usage, let left = usage.validRemaining(usage.fiveHour, at: now) else { return false }
+        return left >= 100 - 0.000001
+    }
+    /// Reading candidates in order can stop at this one: it can take the baton and, when untouched 5-hour windows
+    /// are preferred, its window is one. Without that preference this is the same as having no obstacle.
+    public func settles(_ candidate: Account, at now: Date) -> Bool {
+        obstacle(for: candidate, at: now) == nil && (!preferFreshFiveHour || Self.untouchedFiveHour(candidate, at: now))
+    }
     public func decide(active: Account?, candidates: [Account], at now: Date, holdActiveReading: Bool = false) -> RelayDecision {
         guard let active, let usage = active.usage else { return .wait }
         let triggered = holdActiveReading ? usage.remainsExhausted(threshold: threshold, at: now) : usage.exhausted(threshold: threshold, at: now)
@@ -155,8 +173,9 @@ public struct RelayPolicy: Sendable {
             guard soonerWeekly else { return .wait }
             return soonerWeeklyDecision(active: active, usage: usage, candidates: candidates, at: now)
         }
-        for candidate in candidates where candidate.id != active.id {
-            if obstacle(for: candidate, at: now) == nil { return .select(candidate.id) }
+        let others = candidates.filter { $0.id != active.id }
+        if let chosen = others.first(where: { settles($0, at: now) }) ?? others.first(where: { obstacle(for: $0, at: now) == nil }) {
+            return .select(chosen.id)
         }
         return .pause("没有已确认可接力的账号；保留当前会话。")
     }
@@ -175,6 +194,40 @@ public struct RelayPolicy: Sendable {
         }
         if let chosen { return .select(chosen) }
         return .wait
+    }
+}
+/// The relay order when automatic sorting is on. Weekly quota that resets sooner is spent first, because whatever is
+/// left of it is lost at the reset; accounts that reset later stay in reserve, so a large job has more to draw on.
+/// The 5-hour window plays no part in the order. It only steers which ready account a hand-off picks.
+public enum RelayOrder {
+    /// Days until a 7-day reset, as the day figure on screen: under a day counts as 0, otherwise rounded to the
+    /// nearest day. Accounts that both read “2 天后” share a day and are then ranked by what they have left.
+    public static func day(until reset: Date, at now: Date) -> Int {
+        let seconds = reset.timeIntervalSince(now)
+        return seconds < 86400 ? 0 : Int((seconds / 86400).rounded())
+    }
+    /// Sooner reset day first; within a day more left first, then the earlier reset. A window that has not started
+    /// runs the full seven days once it is used, so it sorts as day 7. Accounts without a usable 7-day reading come
+    /// after those, including a window that has reset since it was read, which is read again rather than assumed
+    /// full. Disabled accounts go last. Ties keep the user's own order, so turning sorting off restores it unchanged.
+    public static func sorted(_ accounts: [Account], at now: Date) -> [Account] {
+        typealias Key = (group: Int, day: Int, remaining: Double, reset: Date)
+        func key(_ account: Account) -> Key {
+            guard account.enabled else { return (2, 0, 0, .distantFuture) }
+            guard let usage = account.usage, let window = usage.sevenDay, let remaining = usage.lastKnownRemaining(window, at: now) else {
+                return (1, 0, 0, .distantFuture)
+            }
+            guard let reset = window.resetsAt else { return (0, 7, remaining, .distantFuture) }
+            return (0, day(until: reset, at: now), remaining, reset)
+        }
+        let ranked = accounts.enumerated().map { (key: key($0.element), position: $0.offset, account: $0.element) }
+        return ranked.sorted { a, b in
+            if a.key.group != b.key.group { return a.key.group < b.key.group }
+            if a.key.day != b.key.day { return a.key.day < b.key.day }
+            if a.key.remaining != b.key.remaining { return a.key.remaining > b.key.remaining }
+            if a.key.reset != b.key.reset { return a.key.reset < b.key.reset }
+            return a.position < b.position
+        }.map(\.account)
     }
 }
 /// A trigger remains consumed even if applying fails. Explicit rearming requires a new observation.

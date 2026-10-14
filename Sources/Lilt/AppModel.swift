@@ -141,12 +141,16 @@ final class AppModel {
         autoRelay = library.preferences.autoRelay == true && relayBlocker == nil
         relayPause = library.preferences.autoRelay == true ? relayBlocker : library.preferences.autoRelayStopReason
     }
-    var accounts: [Account] { library.accounts }
+    /// The relay order: the user's own, or the sorted one while automatic sorting is on. `library.accounts` keeps the
+    /// user's arrangement either way, so turning sorting off brings it back.
+    var accounts: [Account] { autoSort ? RelayOrder.sorted(library.accounts, at: max(clock, .now)) : library.accounts }
     var active: Account? { accounts.first { $0.id == library.activeID } }
     var enabledCount: Int { accounts.filter(\.enabled).count }
     var threshold: Double { library.preferences.threshold }
     /// Off unless the user turns it on. Nil in an older preferences file means off.
     var soonerWeekly: Bool { library.preferences.soonerWeekly == true }
+    /// Off unless the user turns it on. Nil in an older preferences file means off.
+    var autoSort: Bool { library.preferences.autoSort == true }
     var canAdd: Bool { !demo && !busy && storageAvailable }
     var setupComplete: Bool { !accounts.isEmpty && library.preferences.scopeEnabled && active != nil }
     func save() {
@@ -167,7 +171,10 @@ final class AppModel {
         if demo, var real = savedLibrary { change(&real.preferences); savedLibrary = real; persist(real) } else { save() }
     }
     func setThreshold(_ value: Double) { updatePreferences { $0.threshold = min(20, max(0, value)) } }
-    func setSoonerWeekly(_ on: Bool) { updatePreferences { $0.soonerWeekly = on } }
+    /// The two cannot both be on. Sorting keeps an account until it reaches the threshold; the weekly preference
+    /// would hand it off while it still has room.
+    func setSoonerWeekly(_ on: Bool) { updatePreferences { $0.soonerWeekly = on; if on { $0.autoSort = false } } }
+    func setAutoSort(_ on: Bool) { updatePreferences { $0.autoSort = on; if on { $0.soonerWeekly = false } } }
     func setShortcut(_ key: UInt32) { updatePreferences { $0.shortcutKey = key } }
     /// What still stands between the user and live automatic relay, in a few words; nil when it can be turned on.
     /// The demo has no prerequisites.
@@ -247,14 +254,15 @@ final class AppModel {
         guard let index = library.accounts.firstIndex(where: { $0.id == id }) else { return }
         change(&library.accounts[index]); save()
     }
+    /// Manual moves only apply to the user's own order; while sorting is on the list is not theirs to arrange.
     func move(_ id: UUID, by offset: Int) {
-        guard !busy, let index = library.accounts.firstIndex(where: { $0.id == id }) else { return }
+        guard !busy, !autoSort, let index = library.accounts.firstIndex(where: { $0.id == id }) else { return }
         let next = index + offset; guard library.accounts.indices.contains(next) else { return }
         library.accounts.swapAt(index, next); save()
     }
     /// Drop semantics: the dragged account takes the target's place and the ones between shift by one.
     func move(_ id: UUID, to target: UUID) {
-        guard !busy, id != target, let from = library.accounts.firstIndex(where: { $0.id == id }),
+        guard !busy, !autoSort, id != target, let from = library.accounts.firstIndex(where: { $0.id == id }),
               let to = library.accounts.firstIndex(where: { $0.id == target }) else { return }
         let account = library.accounts.remove(at: from); library.accounts.insert(account, at: to); save()
     }
@@ -673,17 +681,21 @@ final class AppModel {
             threshold: threshold,
             allowUnverifiedHotSwitch: !demo,
             leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
-            soonerWeekly: early
+            soonerWeekly: early,
+            preferFreshFiveHour: autoSort
         )
         if !demo {
             if triggered {
-                // Other accounts are read only now, when a hand-off is due: in priority order, and only until one qualifies.
+                // Other accounts are read only now, when a hand-off is due: in priority order, and only until one settles it.
+                // With sorting on that is the first one ready with an untouched 5-hour window, so reading may go further.
                 // A rejected refresh token is not asked again, and the account just left is not read in order to come back.
                 for candidate in accounts where candidate.id != active.id && candidate.enabled && candidate.usageCapability != .unavailable {
                     if candidate.refreshRejected == true || candidate.id == policy.leftRecently { continue }
-                    if policy.obstacle(for: candidate, at: .now) == nil { break }
+                    if policy.settles(candidate, at: .now) { break }
+                    // Already ready on a fresh reading, only its 5-hour window has been used: asking again changes nothing.
+                    if policy.obstacle(for: candidate, at: .now) == nil { continue }
                     await refresh(candidate.id)
-                    if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.obstacle(for: fresh, at: .now) == nil { break }
+                    if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.settles(fresh, at: .now) { break }
                 }
             } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > .now {
                 // Only a stored weekly reset that is already earlier can justify a read. Unknown resets stay out,

@@ -75,10 +75,44 @@ import LiltCore
         precondition(!automaticApplied && api.keepsAPIMode)
         let manualApplied = await api.apply(spare.id)
         precondition(manualApplied && !api.apiModeDetected && !api.keepsAPIMode && api.displayedActiveID == spare.id)
+        try await autoSortChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, automatic order. No live credentials or requests.")
     }
+}
+
+/// Sorting changes only the order the model shows and relays in. The user's own arrangement survives it, and a
+/// hand-off still waits for the threshold, then takes the first ready account with an untouched 5-hour window.
+@MainActor func autoSortChecks() async throws {
+    func account(_ label: String, five: Double, week: Double, weekResetsIn days: Double) -> Account {
+        var account = Account(label: label, kind: .oauth)
+        account.usageCapability = .verified; account.hotSwitchCapability = .verified
+        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100 - five), sevenDay: UsageWindow(used: 100 - week, resetsAt: .now.addingTimeInterval(days * 86400)))
+        return account
+    }
+    var library = Library()
+    let active = account("Fixture A", five: 60, week: 50, weekResetsIn: 3)
+    let later = account("Fixture B", five: 100, week: 100, weekResetsIn: 6)
+    let soonUsed = account("Fixture C", five: 40, week: 70, weekResetsIn: 1)
+    let soonFresh = account("Fixture D", five: 100, week: 30, weekResetsIn: 1)
+    library.accounts = [active, later, soonUsed, soonFresh]; library.activeID = active.id; library.preferences.autoRelay = true
+    library.preferences.soonerWeekly = true
+    let model = AppModel(preview: library)
+    model.setAutoSort(true)
+    precondition(model.autoSort && !model.soonerWeekly, "Sorting and the early weekly hand-off are one or the other")
+    precondition(model.accounts.map(\.label) == ["Fixture C", "Fixture D", "Fixture A", "Fixture B"])
+    precondition(model.library.accounts.map(\.label) == ["Fixture A", "Fixture B", "Fixture C", "Fixture D"])
+    model.move(later.id, by: -1); model.move(later.id, to: active.id)
+    precondition(model.library.accounts.map(\.label) == ["Fixture A", "Fixture B", "Fixture C", "Fixture D"], "No manual moves while sorted")
+    // Still above the threshold: the account in use is kept, however the order looks.
+    await model.relay()
+    precondition(model.active?.id == active.id)
+    model.library.accounts[0].usage?.fiveHour = UsageWindow(used: 99.5)
+    await model.relay()
+    precondition(model.active?.id == soonFresh.id, "First ready account in order with an untouched 5-hour window")
+    model.setSoonerWeekly(true)
+    precondition(!model.autoSort && model.accounts.map(\.label) == ["Fixture A", "Fixture B", "Fixture C", "Fixture D"])
 }
 
 func keychainCommandChecks() throws {

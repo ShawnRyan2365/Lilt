@@ -94,6 +94,7 @@ final class RelayTests {
         let old = Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8)
         let decoded = try JSONDecoder().decode(Preferences.self, from: old)
         expectEqual(decoded.autoRelay, nil); expect(decoded.scopeEnabled); expect(decoded.scopeTarget == nil); expectEqual(decoded.soonerWeekly, nil)
+        expectEqual(decoded.autoSort, nil)
         let current = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"scopeTarget":"system"}"#.utf8))
         expect(current.scopeTarget == .system)
     }
@@ -270,6 +271,58 @@ final class RelayTests {
         let alsoSpent = placed("Fixture H", five: 0.2, week: 0.2, weekResetsIn: day)
         guard case .pause = on.decide(active: spent, candidates: [alsoSpent], at: now) else { fatalError("Expected pause") }
     }
+    /// Sorting goes by the day the 7-day window resets, sooner first, and within a day by what is left, more first.
+    /// The 5-hour window does not move anyone. Unknown, reset-since-read and disabled accounts trail in the user's order.
+    func testAutoSortOrdersByWeeklyResetDayThenWhatIsLeft() {
+        let hour: TimeInterval = 3600, day: TimeInterval = 86400
+        expectEqual(RelayOrder.day(until: now.addingTimeInterval(hour), at: now), 0)
+        expectEqual(RelayOrder.day(until: now.addingTimeInterval(23 * hour), at: now), 0)
+        expectEqual(RelayOrder.day(until: now.addingTimeInterval(30 * hour), at: now), 1)
+        expectEqual(RelayOrder.day(until: now.addingTimeInterval(6.9 * day), at: now), 7)
+        let weekEighty = placed("Fixture A", five: 100, week: 80, weekResetsIn: 6.9 * day)
+        let weekFull = placed("Fixture B", five: 5, week: 100, weekResetsIn: 6.8 * day)
+        let dayThirty = placed("Fixture C", five: 100, week: 30, weekResetsIn: day + hour)
+        let dayEighty = placed("Fixture D", five: 40, week: 80, weekResetsIn: day + 2 * hour)
+        let hourSoon = placed("Fixture E", five: 100, week: 10, weekResetsIn: hour)
+        var unstarted = placed("Fixture F", five: 100, week: 100, weekResetsIn: nil)
+        unstarted.usage?.sevenDay = UsageWindow(used: 0)
+        var unread = Account(label: "Fixture G", kind: .oauth)
+        unread.usage = nil
+        let resetSinceRead = placed("Fixture H", five: 100, week: 20, weekResetsIn: -hour)
+        var disabled = placed("Fixture I", five: 100, week: 100, weekResetsIn: hour)
+        disabled.enabled = false
+        let input = [disabled, unread, weekEighty, weekFull, resetSinceRead, dayThirty, unstarted, dayEighty, hourSoon]
+        let order = RelayOrder.sorted(input, at: now).map(\.label)
+        expectEqual(order, ["Fixture E", "Fixture D", "Fixture C", "Fixture B", "Fixture F", "Fixture A", "Fixture G", "Fixture H", "Fixture I"])
+        // Identical keys keep the order they came in, so sorting never shuffles accounts it cannot tell apart.
+        let twin = placed("Fixture J", five: 100, week: 80, weekResetsIn: 6.9 * day)
+        expectEqual(RelayOrder.sorted([twin, weekEighty], at: now).map(\.label), ["Fixture J", "Fixture A"])
+        expectFalse(Preferences().autoSort == true)
+    }
+    /// With the preference on, a hand-off skips ready accounts whose 5-hour window has been used for the first one
+    /// whose window is untouched, and falls back to the first ready account when there is none. Off, order alone decides.
+    /// Nothing here moves an account that is still above the threshold.
+    func testHandOffPrefersAnUntouchedFiveHourWindow() {
+        let day: TimeInterval = 86400
+        let active = placed("Fixture A", five: 0.5, week: 60, weekResetsIn: 3 * day)
+        let used = placed("Fixture B", five: 60, week: 90, weekResetsIn: day)
+        var untouched = placed("Fixture C", five: 100, week: 70, weekResetsIn: 5 * day)
+        untouched.usage?.fiveHour = UsageWindow(used: 0)
+        let spent = placed("Fixture D", five: 100, week: 0.5, weekResetsIn: day)
+        let prefer = RelayPolicy(preferFreshFiveHour: true)
+        expectEqual(RelayPolicy().decide(active: active, candidates: [used, untouched], at: now), .select(used.id))
+        expectEqual(prefer.decide(active: active, candidates: [used, untouched], at: now), .select(untouched.id))
+        expectEqual(prefer.decide(active: active, candidates: [spent, used], at: now), .select(used.id))
+        expectFalse(prefer.settles(used, at: now)); expect(prefer.settles(untouched, at: now)); expectFalse(prefer.settles(spent, at: now))
+        expect(RelayPolicy().settles(used, at: now))
+        // Ready but used is not untouched; an untouched window on an old reading does not count either.
+        var old = untouched
+        old.usage?.sampledAt = now.addingTimeInterval(-120)
+        expectFalse(RelayPolicy.untouchedFiveHour(old, at: now))
+        guard case .pause = prefer.decide(active: active, candidates: [spent, old], at: now) else { fatalError("Expected pause") }
+        let healthy = placed("Fixture E", five: 40, week: 60, weekResetsIn: 3 * day)
+        expectEqual(prefer.decide(active: healthy, candidates: [untouched], at: now), .wait)
+    }
     private func placed(_ label: String, five: Double, week: Double, weekResetsIn: TimeInterval?) -> Account {
         var account = Account(label: label, kind: .oauth)
         account.hotSwitchCapability = .verified
@@ -309,8 +362,10 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try suite.testRejectedRefreshLeavesAutomaticRelayUntilReauthorized()
         suite.testAccountJustLeftIsSkippedUntilTheCooldownEnds()
         suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
+        suite.testAutoSortOrdersByWeeklyResetDayThenWhatIsLeft()
+        suite.testHandOffPrefersAnUntouchedFiveHourWindow()
         try storageChecks()
-        print("PASS: 19 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly")
+        print("PASS: 21 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, untouched 5-hour hand-off")
     }
 }
 

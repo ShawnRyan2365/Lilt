@@ -186,6 +186,24 @@ extension AppModel {
     func spriteSlot(_ id: UUID) -> Int { spriteSlots[id] ?? Sprite.slot(for: id) }
     func mood(of account: Account) -> Mood { QuotaSummary(snapshot: account.usage, threshold: threshold, now: max(clock, .now)).mood }
 }
+/// Drag-and-drop reordering of an account row, left off entirely while the order is sorted automatically.
+struct Reorderable: ViewModifier {
+    let id: UUID
+    let enabled: Bool
+    var onDrop: (UUID) -> Void
+    func body(content: Content) -> some View {
+        if enabled {
+            content
+                .draggable(id.uuidString)
+                .dropDestination(for: String.self) { items, _ in
+                    guard let dragged = items.first.flatMap(UUID.init(uuidString:)) else { return false }
+                    onDrop(dragged); return true
+                }
+        } else {
+            content
+        }
+    }
+}
 struct FreshnessText: View {
     let date: Date
     var body: some View {
@@ -331,8 +349,9 @@ struct AccountRow: View {
     var body: some View {
         let summary = QuotaSummary(snapshot: account.usage, threshold: model.threshold, now: max(model.clock, .now))
         HStack(spacing: AccountColumns.spacing) {
+            // While sorting is on the handle stays out of sight but keeps its width, so the columns do not shift.
             Image(systemName: "line.3.horizontal").font(.system(size: 11, weight: .medium)).foregroundStyle(Tokens.faint)
-                .frame(width: 14).help("拖动调整接力顺序").accessibilityHidden(true)
+                .frame(width: 14).opacity(model.autoSort ? 0 : 1).help(model.autoSort ? "" : "拖动调整接力顺序").accessibilityHidden(true)
             HStack(spacing: AccountColumns.spacing) {
                 Sprite(slot: model.spriteSlot(account.id), size: 34, mood: summary.mood, muted: !account.enabled)
                 VStack(alignment: .leading, spacing: 3) {
@@ -370,8 +389,8 @@ struct AccountRow: View {
                 Button("刷新额度") { Task { await model.refresh(account.id) } }
                 Button("修改备注", action: onRename)
                 Button(account.enabled ? "停用" : "启用") { model.update(account.id) { $0.enabled.toggle() } }
-                Button("上移") { model.move(account.id, by: -1) }.disabled(index == 0)
-                Button("下移") { model.move(account.id, by: 1) }.disabled(index == model.accounts.count - 1)
+                Button("上移") { model.move(account.id, by: -1) }.disabled(model.autoSort || index == 0)
+                Button("下移") { model.move(account.id, by: 1) }.disabled(model.autoSort || index == model.accounts.count - 1)
                 Divider()
                 Button("重新授权 / 替换 Token") { model.requestAdd(replacing: account.id) }.disabled(!model.canAdd)
                 Button(active ? "删除（需先切换到其他账号）" : "删除…", role: .destructive, action: onDelete).disabled(active)

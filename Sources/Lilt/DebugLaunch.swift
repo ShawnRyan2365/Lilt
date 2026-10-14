@@ -27,7 +27,8 @@ enum DebugLaunch {
     /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PAGE=overview|accounts|scope|diagnostics, LILT_RELAY=1,
     /// LILT_SIMULATE=1 (demo quota reaches the threshold), LILT_SIMULATE_AFTER=<seconds> (the same, later),
     /// LILT_PENDING=1 (shows the "applied, not yet verified" notice),
-    /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>.
+    /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>,
+    /// LILT_AUTOSORT=1 (automatic relay order).
     @MainActor static func apply(to model: AppModel) {
         let environment = ProcessInfo.processInfo.environment
         if let look = environment["LILT_APPEARANCE"] { NSApp.appearance = NSAppearance(named: look == "dark" ? .darkAqua : .aqua) }
@@ -37,6 +38,7 @@ enum DebugLaunch {
         if environment["LILT_ROSTER"] == "1", model.demo { seedRoster(model) }
         if let name = environment["LILT_PAGE"], let page = AppModel.Page.allCases.first(where: { "\($0)" == name }) { model.selectedPage = page }
         if environment["LILT_RELAY"] == "1" { model.setAutoRelay(true) }
+        if environment["LILT_AUTOSORT"] == "1" { model.setAutoSort(true) }
         if environment["LILT_SIMULATE"] == "1" { Task { await model.simulateThreshold() } }
         // The demo hand-off is instant, so a screen recording started after launch needs it to wait.
         if let delay = environment["LILT_SIMULATE_AFTER"].flatMap(Double.init) {
@@ -86,7 +88,8 @@ enum DebugLaunch {
             account.usageCapability = .verified; account.hotSwitchCapability = .verified
             return account
         }
-        model.library.activeID = model.accounts.first?.id
+        // The stored order, not the shown one: with sorting on the first row depends on the readings.
+        model.library.activeID = model.library.accounts.first?.id
     }
 }
 #endif

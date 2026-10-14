@@ -135,7 +135,7 @@ struct MainView: View {
     private var track: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("接力顺序").font(Typo.caption).foregroundStyle(Tokens.muted)
+                Text(model.autoSort ? "接力顺序 · 自动排序" : "接力顺序").font(Typo.caption).foregroundStyle(Tokens.muted)
                 Spacer()
                 QuotaLegend().padding(.trailing, 8)
                 Button("管理") { model.selectedPage = .accounts }.buttonStyle(.lilt(.ghost, size: .small))
@@ -206,15 +206,19 @@ struct MainView: View {
                 AccountRow(model: model, account: account, index: index, selection: inUse,
                            onRename: { rename = account.label; renameID = account.id }, onDelete: { deleteAccount = account })
                     .staggeredAppear(index: index * 2)
-                    .draggable(account.id.uuidString)
-                    .dropDestination(for: String.self) { items, _ in
-                        guard let dragged = items.first.flatMap(UUID.init(uuidString:)) else { return false }
-                        model.move(dragged, to: account.id); return true
-                    }
+                    .modifier(Reorderable(id: account.id, enabled: !model.autoSort) { model.move($0, to: account.id) })
             }
             if !model.accounts.isEmpty {
-                Text("从上到下是接力顺序，可以拖动调整。备注只用于本机识别，本版不做账号去重。")
-                    .font(Typo.caption).foregroundStyle(Tokens.muted).padding(.horizontal, 6).padding(.top, 4)
+                HStack(alignment: .top, spacing: 12) {
+                    Text(model.autoSort
+                         ? "从上到下是接力顺序：7 天额度先重置的在前，同一天重置的剩余多的在前。换号时优先换到 5 小时额度没动过的账号，用到阈值再换。关闭后恢复你拖好的顺序。"
+                         : "从上到下是接力顺序，可以拖动调整。备注只用于本机识别，本版不做账号去重。")
+                        .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Text("自动排序").font(Typo.caption).foregroundStyle(Tokens.muted)
+                    LiquidToggle(label: "自动排序", isOn: Binding(get: { model.autoSort }, set: { model.setAutoSort($0) }), width: 40)
+                }
+                .padding(.horizontal, 6).padding(.top, 4)
             }
         }
         .animation(reduceMotion ? nil : Motion.settle, value: model.accounts.map(\.id))
