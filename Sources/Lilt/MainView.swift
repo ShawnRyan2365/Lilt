@@ -225,6 +225,9 @@ struct MainView: View {
     private var diagnostics: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(spacing: 0) {
+                fact("Lilt 版本", "\(AppBuild.version)（构建 \(AppBuild.number)）")
+                fact("构建时间", AppBuild.date)
+                fact("源码标识", AppBuild.revision)
                 fact("Claude Code", model.version.replacingOccurrences(of: " (Claude Code)", with: ""))
                 fact("系统", "macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)")
                 fact("接入方式", !model.library.preferences.scopeEnabled ? "未接管" : model.scopeTarget == .system ? "Claude Code 默认登录" : "Lilt 专属目录")

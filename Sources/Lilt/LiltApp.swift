@@ -6,7 +6,7 @@ struct LiltApp: App {
     @State private var model = AppModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     var body: some Scene {
-        Window("Lilt", id: "main") {
+        Window(AppBuild.title, id: "main") {
             RootView(model: model)
                 .task { delegate.model = model; delegate.registerShortcut() }
         }
@@ -88,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showWindow() {
         presentMainWindow?()
         NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.title == "Lilt" }) { window.makeKeyAndOrderFront(nil) }
+        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" || $0.title == AppBuild.title }) { window.makeKeyAndOrderFront(nil) }
     }
     /// MenuBarExtra offers no call to open its window, so this presses the status item's own button.
     /// That also works when the icon is pushed out of sight by a crowded menu bar.

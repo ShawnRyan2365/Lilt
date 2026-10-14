@@ -374,7 +374,11 @@ struct MenuPanel: View {
                 .help("刷新额度").accessibilityLabel("刷新额度")
                 Button { openSettings(); NSApp.activate(ignoringOtherApps: true) } label: { Image(systemName: "gearshape") }
                     .buttonStyle(.liltIcon(.ghost, diameter: 28)).help("设置").accessibilityLabel("设置")
-                Menu { Button("退出 Lilt") { NSApp.terminate(nil) } } label: {
+                Menu {
+                    Text(AppBuild.description)
+                    Divider()
+                    Button("退出 Lilt") { NSApp.terminate(nil) }
+                } label: {
                     Image(systemName: "ellipsis").font(.system(size: 12, weight: .medium)).foregroundStyle(Tokens.ink).frame(width: 28, height: 28).contentShape(Circle())
                 }
                 .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize().help("更多").accessibilityLabel("更多")

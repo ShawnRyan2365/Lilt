@@ -30,12 +30,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleShortVersionString</key><string>0.1.1</string>
+<key>CFBundleVersion</key><string>3</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+REVISION=$(git rev-parse --short HEAD)
+if ! git diff --quiet HEAD -- Sources scripts; then REVISION="$REVISION+modified"; fi
+plutil -insert LiltSourceRevision -string "$REVISION" "$APP/Contents/Info.plist"
+plutil -insert LiltBuildTime -string "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$APP/Contents/Info.plist"
 printf '"CFBundleDisplayName" = "Lilt";\n' > "$APP/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
 # Lilt green as the app accent, so system-drawn parts (focus rings, settings controls) match the rest.
 # actool ships with Xcode only; without it the app simply keeps the system accent colour.
@@ -58,4 +62,5 @@ rm -f "$APP/Contents/Resources/Lilt.icns"
 iconutil -c icns "$PWD/build/Lilt.iconset" -o "$APP/Contents/Resources/LiltOrbit.icns"
 cp "$PWD/build/LiltMenu.png" "$PWD/build/LiltMenu@2x.png" "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
+touch "$APP"
 echo "$APP"

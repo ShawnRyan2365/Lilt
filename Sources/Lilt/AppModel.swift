@@ -2,6 +2,21 @@ import SwiftUI
 import Observation
 import LiltCore
 
+/// Identify the running bundle consistently across the window, diagnostics and exports.
+enum AppBuild {
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
+    static let number = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未打包"
+    static let revision = Bundle.main.object(forInfoDictionaryKey: "LiltSourceRevision") as? String ?? "未记录"
+    static let timestamp = Bundle.main.object(forInfoDictionaryKey: "LiltBuildTime") as? String ?? "未记录"
+    static var title: String { "Lilt \(version)" }
+    static var description: String { "\(title)（构建 \(number)）" }
+    static var date: String {
+        guard let date = ISO8601DateFormatter().date(from: timestamp) else { return timestamp }
+        let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter.string(from: date)
+    }
+}
+
 /// What the authorization sheet was opened for. One value, so "add" and "replace" cannot leak into each other.
 struct AddRequest: Identifiable {
     let id = UUID()
@@ -825,7 +840,7 @@ final class AppModel {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Lilt-diagnostics.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // Fixed fields only: no nicknames, account IDs, paths, CLI output, or server error bodies.
-        let text = "Lilt 0.1.0\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
+        let text = "\(AppBuild.description)\nBuild: \(AppBuild.timestamp)\nSource: \(AppBuild.revision)\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
         do { try Data(text.utf8).write(to: url, options: .atomic); status = "已导出脱敏诊断" } catch { message = "诊断文件保存失败。" }
     }
 }
