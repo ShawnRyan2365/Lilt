@@ -41,7 +41,8 @@ macOS 菜单栏小工具。你照常在终端里用官方 `claude`，Lilt 负责
 **Lilt 和反代、网关、模型中转没有任何关系。**
 
 - **不经手模型请求。** 你在终端里用的仍是官方 `claude`，对话由它直接发给 Anthropic。Lilt 不在中间，不转发、不改写，也不记录任何对话内容。
-- **只发三种请求，全部发往官方域名，并拒绝重定向：** 读额度（`api.anthropic.com/api/oauth/usage`）、核对账号身份（`api.anthropic.com/api/oauth/profile`）、给不在用的登录续期（`platform.claude.com/v1/oauth/token`）。没有第三方服务器，也没有统计上报。
+- **和账号有关的请求只有三种，全部发往官方域名，并拒绝重定向：** 读额度（`api.anthropic.com/api/oauth/usage`）、核对账号身份（`api.anthropic.com/api/oauth/profile`）、给不在用的登录续期（`platform.claude.com/v1/oauth/token`）。
+- **另外只有检查更新会联网：** 每 6 小时向 GitHub 查一次有没有新版本（`api.github.com`，可在设置里关闭），更新时从 GitHub Releases 下载安装包。这两个请求只带 Lilt 的版本号，不含任何账号信息。没有其他第三方服务器，也没有统计上报。
 - **登录走官方流程。** 添加账号时运行官方的 `claude auth login --claudeai`，在浏览器里登录 Claude 官网，Lilt 碰不到你的密码。
 - **凭据只留在本机。** 存在只有当前用户能读的文件里，不上传到任何地方。
 - **切换账号相当于替你在 Claude Code 里重新登录一次：** 把选中账号的登录写到 Claude Code 读取登录的位置。
@@ -73,6 +74,14 @@ xattr -dr com.apple.quarantine /Applications/Lilt.app
 
 不想信任别人编好的程序，可以[自己从源码构建](#从源码构建)；自己构建的应用不会被拦。
 
+### 更新
+
+Lilt 会自己检查新版本。有新版本时，菜单栏面板和管理窗口的工具栏会出现“更新”按钮，点一下就在 App 里下载、校验并替换现在的 Lilt，然后自动重新打开，账号和设置都保留。设置里可以关掉自动检查，也可以从菜单“检查更新…”手动查。0.1.2 及更早的版本还没有这个功能，需要按上面的方法手动装一次新版本。
+
+- 安装包就是 Releases 页面上那个 `Lilt-<版本>.dmg`，同样没有 Apple 开发者签名。Lilt 会核对 GitHub 记录的 SHA-256 和文件大小，确认包里的应用是 Lilt 本身、版本号对得上、签名完整，任何一项不符就放弃，原来的版本不动。
+- 正在切换账号、续期或读取额度时，会等它做完再替换，最多等半分钟。
+- Lilt 放在没有写权限的位置（比如别的用户装的）时无法自动替换，请到发布页手动下载。
+
 ## 上手
 
 第一次打开时，概览页一次只给你一步：
@@ -98,6 +107,7 @@ xattr -dr com.apple.quarantine /Applications/Lilt.app
 - 接管后，Lilt 写入 Claude Code 自己读取登录的位置：钥匙串条目 `Claude Code-credentials`（通过系统的 `security` 工具读写）、已存在时的 `~/.claude/.credentials.json`、`~/.claude.json` 里的 `oauthAccount`。
 - 实时额度（默认开，可在“接入”页关闭）：在 `~/.claude/settings.json` 的状态栏命令前加一个小脚本，只取 Claude Code 交给状态栏的额度数据，终端里显示的内容不变。第一次改动前会把原文件备份为 `claude-settings-before-lilt.json`，关闭时放回原来的状态栏。
 - 额度查询有节制：自动接力开着时当前账号每 5 分钟查一次（剩余 ≤10% 时每 2 分钟），其他账号只在需要接力或手动刷新时才查。遇到限流时全部暂停，等官方允许再查。
+- 更新时下载的安装包放在系统临时目录，装好或放弃后删除。
 - 不修改 shell 配置、网络或代理设置。
 
 ## 从源码构建

@@ -11,6 +11,9 @@ struct RootView: View {
             if ProcessInfo.processInfo.environment["LILT_PANEL"] == "1" {
                 // The menu bar panel cannot be opened from outside; show the same view in the window instead.
                 MenuPanel(model: model).background(.regularMaterial).fixedSize()
+            } else if ProcessInfo.processInfo.environment["LILT_SETTINGS"] == "1" {
+                // The Settings scene cannot be opened from outside either. Taller than the real one, so a screenshot shows every section.
+                SettingsView(model: model).frame(width: 480, height: 980)
             } else {
                 MainView(model: model)
             }
@@ -24,11 +27,13 @@ struct RootView: View {
 
 #if DEBUG
 enum DebugLaunch {
-    /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PAGE=overview|accounts|scope|diagnostics, LILT_RELAY=1,
+    /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PANEL=1 / LILT_SETTINGS=1 (that view inside the window), LILT_PAGE=overview|accounts|scope|diagnostics, LILT_RELAY=1,
     /// LILT_SIMULATE=1 (demo quota reaches the threshold), LILT_SIMULATE_AFTER=<seconds> (the same, later),
     /// LILT_PENDING=1 (shows the "applied, not yet verified" notice),
     /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>,
-    /// LILT_AUTOSORT=1 (automatic relay order).
+    /// LILT_AUTOSORT=1 (automatic relay order), LILT_UPDATE=available|downloading|installing|failed|current (an update
+    /// state with a fictional release), LILT_UPDATE=check|install (asks GitHub, and installs what it finds).
+    /// LILT_UPDATE_FROM and LILT_UPDATE_TARGET are read by `Updater` itself.
     @MainActor static func apply(to model: AppModel) {
         let environment = ProcessInfo.processInfo.environment
         if let look = environment["LILT_APPEARANCE"] { NSApp.appearance = NSAppearance(named: look == "dark" ? .darkAqua : .aqua) }
@@ -39,6 +44,19 @@ enum DebugLaunch {
         if let name = environment["LILT_PAGE"], let page = AppModel.Page.allCases.first(where: { "\($0)" == name }) { model.selectedPage = page }
         if environment["LILT_RELAY"] == "1" { model.setAutoRelay(true) }
         if environment["LILT_AUTOSORT"] == "1" { model.setAutoSort(true) }
+        switch environment["LILT_UPDATE"] {
+        case nil: break
+        case "check": model.checkForUpdates()
+        case "install":
+            // A successful install quits this process; only a failure is left to print.
+            Task {
+                await model.updater.check(manual: true)
+                print("update check: \(model.updater.phase)")
+                await model.updater.install { model.updateBlocker }
+                print("update install: \(model.updater.phase)")
+            }
+        case let state?: model.updater.preview(state)
+        }
         if environment["LILT_SIMULATE"] == "1" { Task { await model.simulateThreshold() } }
         // The demo hand-off is instant, so a screen recording started after launch needs it to wait.
         if let delay = environment["LILT_SIMULATE_AFTER"].flatMap(Double.init) {

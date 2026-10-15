@@ -93,6 +93,9 @@ public struct Preferences: Codable, Sendable {
     /// 5-hour window is untouched. Nil and false keep the order the user arranged. Optional so preference files
     /// written before the choice existed still load.
     public var autoSort: Bool?
+    /// Ask GitHub every few hours whether a newer Lilt is out. Nil means on. Optional so preference files written
+    /// before the choice existed still load.
+    public var autoUpdateCheck: Bool?
     public init() {}
 }
 public struct Library: Codable, Sendable {

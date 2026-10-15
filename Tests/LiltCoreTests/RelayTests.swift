@@ -323,6 +323,83 @@ final class RelayTests {
         let healthy = placed("Fixture E", five: 40, week: 60, weekResetsIn: 3 * day)
         expectEqual(prefer.decide(active: healthy, candidates: [untouched], at: now), .wait)
     }
+    /// Versions compare numerically and ignore trailing zeros; tags with a suffix or anything else are not versions.
+    func testUpdateVersionsCompareNumerically() {
+        let v = { (text: String) in AppVersion(text)! }
+        expect(v("0.1.10") > v("0.1.9")); expect(v("v0.2") > v("0.1.99")); expect(v("1.0") == v("1.0.0"))
+        expectFalse(v("0.1.2") > v("0.1.2")); expectEqual(v("v0.1.2").description, "0.1.2")
+        for bad in ["", "v", "0.1.2-beta", "0.1.x", "0..1", "1.2.3.4.5", "٠.١", "1234567.0", "开发版"] { expect(AppVersion(bad) == nil) }
+        expect(AppVersion(" 0.1 ") != nil)
+    }
+    /// Only a published release newer than the running one, with an image named for its own version, served from
+    /// GitHub over HTTPS and within the size limit, is offered. Pre-releases count; drafts do not.
+    func testUpdateFeedOffersOnlyAMatchingNewerRelease() throws {
+        func release(_ tag: String, draft: Bool = false, prerelease: Bool = true, asset: String? = nil, link: String? = nil,
+                     size: Int = 2_500_000, digest: String? = "sha256:" + String(repeating: "ab", count: 32), state: String = "uploaded") -> [String: Any] {
+            let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            let name = asset ?? "Lilt-\(version).dmg"
+            var file: [String: Any] = ["name": name, "size": size, "state": state,
+                                       "browser_download_url": link ?? "https://github.com/fixture-owner/Lilt/releases/download/\(tag)/\(name)"]
+            if let digest { file["digest"] = digest }
+            return ["tag_name": tag, "draft": draft, "prerelease": prerelease, "html_url": "https://github.com/fixture-owner/Lilt/releases/tag/\(tag)",
+                    "body": "fixture notes", "assets": [file, ["name": "Source.zip", "size": 10, "browser_download_url": "https://github.com/fixture.zip"]]]
+        }
+        func newest(_ releases: [[String: Any]], after current: String = "0.1.2") throws -> UpdateRelease? {
+            try UpdateFeed.newest(in: JSONSerialization.data(withJSONObject: releases), after: AppVersion(current)!)
+        }
+        let found = try newest([release("v0.1.2"), release("v0.1.10"), release("v0.1.3")])
+        expectEqual(found?.version, AppVersion("0.1.10")); expectEqual(found?.sha256, String(repeating: "ab", count: 32))
+        expectEqual(found?.asset.lastPathComponent, "Lilt-0.1.10.dmg"); expectEqual(found?.notes, "fixture notes")
+        let nothingNewer = try newest([release("v0.1.2"), release("v0.1.1")]), sameVersion = try newest([release("v0.1.3")], after: "0.1.3")
+        expect(nothingNewer == nil); expect(sameVersion == nil)
+        let stable = try newest([release("v0.1.3", prerelease: false)])
+        expectEqual(stable?.version, AppVersion("0.1.3"))
+        // Each of these leaves the newer release out, so the older one is what remains.
+        let older = release("v0.1.3")
+        for rejected in [release("v0.2.0", draft: true), release("v0.2.0-beta"), release("v0.2.0", asset: "Lilt-0.1.9.dmg"),
+                         release("v0.2.0", asset: "Lilt-0.2.0.zip"), release("v0.2.0", link: "http://github.com/fixture/Lilt-0.2.0.dmg"),
+                         release("v0.2.0", link: "https://github.com.example.invalid/Lilt-0.2.0.dmg"), release("v0.2.0", size: 0),
+                         release("v0.2.0", size: UpdateFeed.maximumSize + 1), release("v0.2.0", digest: "md5:abc"),
+                         release("v0.2.0", digest: "sha256:xyz"), release("v0.2.0", state: "starter")] {
+            let remaining = try newest([rejected, older])
+            expectEqual(remaining?.version, AppVersion("0.1.3"))
+        }
+        // A release without a digest is still offered; the size check and the bundle checks remain.
+        let undigested = try newest([release("v0.1.3", digest: nil)])
+        expect(undigested != nil); expectEqual(undigested?.sha256, nil)
+        expectThrows(try UpdateFeed.newest(in: Data("{\"message\":\"Not Found\"}".utf8), after: AppVersion("0.1.2")!))
+        expectThrows(try UpdateFeed.newest(in: Data("not json".utf8), after: AppVersion("0.1.2")!))
+    }
+    /// Downloads and redirects stay on GitHub over HTTPS; the swap needs a real app bundle; the unpacked app must be
+    /// exactly the release; automatic checks wait their interval but survive a clock set backwards.
+    func testUpdateInstallBoundaries() {
+        for good in ["https://github.com/a/b", "https://api.github.com/repos", "https://release-assets.githubusercontent.com/x", "https://GitHub.com/a"] {
+            expect(UpdateFeed.allowsDownload(from: URL(string: good)!))
+        }
+        for bad in ["http://github.com/a", "https://evilgithub.com/a", "https://github.com.example.invalid/a", "https://githubusercontent.com.example.invalid/a",
+                    "https://user@github.com/a", "https://github.com:8443/a", "file:///tmp/Lilt.dmg", "https://example.invalid/Lilt.dmg"] {
+            expectFalse(UpdateFeed.allowsDownload(from: URL(string: bad)!))
+        }
+        expect(UpdateFeed.installBlocker(bundlePath: "/Applications/Lilt.app") == nil)
+        expect(UpdateFeed.installBlocker(bundlePath: "/Users/fixture/Applications/Lilt.app") == nil)
+        expect(UpdateFeed.installBlocker(bundlePath: "/private/var/folders/x/AppTranslocation/ABC/d/Lilt.app") != nil)
+        expect(UpdateFeed.installBlocker(bundlePath: "/Users/fixture/Lilt/.build/debug") != nil)
+        let info: [String: Any] = ["CFBundleIdentifier": "app.lilt.desktop", "CFBundleExecutable": "Lilt", "CFBundleShortVersionString": "0.1.3"]
+        expect(UpdateFeed.matches(info: info, version: AppVersion("0.1.3")!))
+        expectFalse(UpdateFeed.matches(info: info, version: AppVersion("0.1.4")!))
+        var other = info; other["CFBundleIdentifier"] = "app.example.invalid"
+        expectFalse(UpdateFeed.matches(info: other, version: AppVersion("0.1.3")!))
+        other = info; other["CFBundleExecutable"] = "Other"
+        expectFalse(UpdateFeed.matches(info: other, version: AppVersion("0.1.3")!))
+        expectFalse(UpdateFeed.matches(info: [:], version: AppVersion("0.1.3")!))
+        expectEqual(UpdateFeed.sha256(fromDigest: "sha256:" + String(repeating: "AB", count: 32)), String(repeating: "ab", count: 32))
+        expect(UpdateFeed.sha256(fromDigest: "sha256:" + String(repeating: "a", count: 63)) == nil)
+        expect(UpdateFeed.due(lastCheck: nil, now: now))
+        expectFalse(UpdateFeed.due(lastCheck: now.addingTimeInterval(-3600), now: now))
+        expect(UpdateFeed.due(lastCheck: now.addingTimeInterval(-UpdateFeed.interval), now: now))
+        expect(UpdateFeed.due(lastCheck: now.addingTimeInterval(3600), now: now))
+        expect(Preferences().autoUpdateCheck == nil)
+    }
     private func placed(_ label: String, five: Double, week: Double, weekResetsIn: TimeInterval?) -> Account {
         var account = Account(label: label, kind: .oauth)
         account.hotSwitchCapability = .verified
@@ -364,8 +441,11 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
         suite.testAutoSortOrdersByWeeklyResetDayThenWhatIsLeft()
         suite.testHandOffPrefersAnUntouchedFiveHourWindow()
+        suite.testUpdateVersionsCompareNumerically()
+        try suite.testUpdateFeedOffersOnlyAMatchingNewerRelease()
+        suite.testUpdateInstallBoundaries()
         try storageChecks()
-        print("PASS: 21 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, untouched 5-hour hand-off")
+        print("PASS: 24 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, untouched 5-hour hand-off, update versions, update feed, update boundaries")
     }
 }
 

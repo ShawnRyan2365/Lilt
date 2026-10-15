@@ -427,3 +427,128 @@ struct AccountRow: View {
         .accessibilityLabel(summary.spoken)
     }
 }
+
+// MARK: Updates
+
+/// A newer Lilt, as one line in the menu bar panel. After a check the user asked for, it also says for a few
+/// seconds how that went.
+struct UpdateIsland: View {
+    var updater: Updater
+    var onInstall: () -> Void
+    var body: some View {
+        switch updater.phase {
+        case .available(let release):
+            Island(symbol: "arrow.down.circle.fill", tone: .accent, text: "Lilt \(release.version) 可以更新", detail: "下载并校验后替换现在的版本，然后自动重新打开。账号和设置都保留。") {
+                Button("更新", action: onInstall).buttonStyle(IslandButtonStyle())
+            }
+        case .downloading(_, let fraction):
+            Island(symbol: "arrow.down.circle", text: "正在下载 \(Int(fraction * 100))%") { InkRing(fraction: fraction) }
+        case .installing:
+            Island(symbol: "shippingbox", text: "正在安装，马上重新打开") { EmptyView() }
+        case .failed(let reason, let release):
+            if release != nil || updater.reportsResult {
+                Island(symbol: "exclamationmark.triangle.fill", tone: .warning, text: release.map { "Lilt \($0.version) 没有装上" } ?? "检查更新失败", detail: reason) {
+                    if release != nil { Button("重试", action: onInstall).buttonStyle(IslandButtonStyle()) }
+                }
+            }
+        case .checking:
+            Island(symbol: "arrow.triangle.2.circlepath", text: "正在检查更新") { EmptyView() }
+        case .current:
+            if updater.reportsResult { Island(symbol: "checkmark.circle.fill", tone: .success, text: "已是最新版本") { EmptyView() } }
+        case .idle:
+            EmptyView()
+        }
+    }
+}
+
+/// Download progress drawn in the island's own ink, which a system progress view does not follow.
+private struct InkRing: View {
+    var fraction: Double
+    var body: some View {
+        ZStack {
+            Circle().stroke(Tokens.onInk.opacity(0.22), lineWidth: 2)
+            Circle().trim(from: 0, to: fraction).stroke(Tokens.onInk, style: StrokeStyle(lineWidth: 2, lineCap: .round)).rotationEffect(.degrees(-90))
+        }
+        .frame(width: 16, height: 16).padding(.trailing, 8)
+        .animation(.linear(duration: 0.2), value: fraction)
+        .accessibilityHidden(true)
+    }
+}
+
+/// The window's toolbar offers the update only while there is one, as Codex does, so it costs no space otherwise.
+struct UpdateToolbarButton: View {
+    @Bindable var model: AppModel
+    var body: some View {
+        switch model.updater.phase {
+        case .available(let release):
+            // The plain toolbar style: a prominent glass button washes out whenever the window is not key.
+            Button { model.installUpdate() } label: {
+                Label { Text("更新") } icon: { Image(systemName: "arrow.down.circle.fill").foregroundStyle(Tokens.accentTint) }
+                    .labelStyle(.titleAndIcon)
+            }
+                .help("Lilt \(release.version.description) 可以更新：下载并校验后替换现在的版本，然后自动重新打开")
+        case .downloading(_, let fraction):
+            ProgressView(value: fraction).progressViewStyle(.circular).controlSize(.small)
+                .help("正在下载 Lilt 新版本，\(Int(fraction * 100))%").accessibilityLabel("正在下载更新")
+        case .installing:
+            ProgressView().controlSize(.small).help("正在安装，马上重新打开").accessibilityLabel("正在安装更新")
+        case .failed(let reason, _):
+            Button { model.installUpdate() } label: { Label("重试更新", systemImage: "exclamationmark.arrow.circlepath").labelStyle(.titleAndIcon) }
+                .help(reason)
+        case .idle, .checking, .current:
+            EmptyView()
+        }
+    }
+}
+
+/// The settings row for updates: where things stand on the left, the one next step on the right.
+struct UpdateRow: View {
+    @Bindable var model: AppModel
+    private var updater: Updater { model.updater }
+    private var title: String {
+        switch updater.phase {
+        case .available(let release): "发现 Lilt \(release.version)"
+        case .downloading(let release, _): "正在下载 \(release.version)"
+        case .installing(let release): "正在安装 \(release.version)"
+        case .failed(_, let release): release == nil ? "检查更新失败" : "更新没有完成"
+        case .idle, .checking, .current: "检查更新"
+        }
+    }
+    private var detail: String? {
+        switch updater.phase {
+        case .failed(let reason, _): return reason
+        case .installing: return "装好后自动重新打开"
+        case .current: return updater.lastCheck.map { "已是最新 · \($0.formatted(date: .omitted, time: .shortened)) 检查" } ?? "已是最新"
+        default: return updater.current == nil ? "开发版本不检查更新" : nil
+        }
+    }
+    var body: some View {
+        LabeledContent {
+            HStack(spacing: 8) {
+                switch updater.phase {
+                case .checking, .installing:
+                    ProgressView().controlSize(.small)
+                case .downloading(_, let fraction):
+                    ProgressView(value: fraction).frame(width: 110)
+                    Text("\(Int(fraction * 100))%").monospacedDigit().foregroundStyle(.secondary)
+                case .available(let release):
+                    Link("更新说明", destination: release.page).font(Typo.caption)
+                    Button("更新并重新打开") { model.installUpdate() }.buttonStyle(.lilt(.primary, size: .small))
+                case .failed(_, let release?):
+                    Link("手动下载", destination: release.page).font(Typo.caption)
+                    Button("重试") { model.installUpdate() }.buttonStyle(.lilt(.secondary, size: .small))
+                case .idle, .current, .failed(_, nil):
+                    Button("立即检查") { model.checkForUpdates() }.buttonStyle(.lilt(.secondary, size: .small)).disabled(updater.current == nil)
+                }
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let detail {
+                    let failed = if case .failed = updater.phase { true } else { false }
+                    Text(detail).font(.caption).foregroundStyle(failed ? Tone.warning.text : AnyShapeStyle(.secondary)).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+}

@@ -52,6 +52,10 @@ struct MainView: View {
                     ForEach(AppModel.Page.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).labelsHidden()
             }
+            if model.updater.release != nil {
+                ToolbarItem { UpdateToolbarButton(model: model) }
+                ToolbarSpacer(.fixed)
+            }
             ToolbarItem { SettingsLink { Label("设置", systemImage: "gearshape") }.help("设置") }
             ToolbarItem {
                 Button { model.requestAdd() } label: { Label("添加账号", systemImage: "plus") }

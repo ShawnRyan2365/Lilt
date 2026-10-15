@@ -21,6 +21,7 @@ struct LiltApp: App {
                 Button("显示快速面板") { delegate.togglePanel() }
                     .keyboardShortcut(KeyEquivalent(AppDelegate.character(for: model.library.preferences.shortcutKey)), modifiers: [.command, .option])
                 Button("显示管理窗口") { delegate.showWindow() }
+                Button("检查更新…") { model.checkForUpdates() }.disabled(model.updater.current == nil || model.updater.working)
             }
             CommandGroup(replacing: .help) {}
         }
@@ -37,7 +38,7 @@ struct LiltApp: App {
             .accessibilityLabel(model.autoRelay ? "Lilt，自动接力已开启" : "Lilt")
         }
         .menuBarExtraStyle(.window)
-        Settings { SettingsView(model: model).frame(width: 480, height: 430) }
+        Settings { SettingsView(model: model).frame(width: 480, height: 540) }
     }
 
     private static let menuIcon: NSImage = {

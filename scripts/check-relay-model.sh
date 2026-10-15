@@ -6,7 +6,7 @@ BIN_DIR="$(swift build --show-bin-path)"
 swiftc -parse-as-library -I "$BIN_DIR/Modules" \
   "$BIN_DIR"/LiltCore.build/*.swift.o \
   Sources/Lilt/AppModel.swift Sources/Lilt/SecureStorage.swift \
-  Sources/Lilt/Services.swift Sources/Lilt/StatusLineBridge.swift \
+  Sources/Lilt/Services.swift Sources/Lilt/StatusLineBridge.swift Sources/Lilt/Updater.swift \
   Sources/Lilt/Components.swift Sources/Lilt/Design/*.swift \
   Tests/LiltModelTests/RelayModelChecks.swift -o "$BIN_DIR/LiltModelChecks"
 "$BIN_DIR/LiltModelChecks"

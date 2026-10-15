@@ -299,8 +299,17 @@ struct SettingsView: View {
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
             } footer: { Text("在任何应用里按下，打开或收起菜单栏面板。Lilt 无法得知其他应用是否占用了同一组合；按下没有反应时请换一个。") }
             Section {
-                LabeledContent("版本", value: "0.1 · 研究预览版")
-            } footer: { Text("运行中的 CLI 是否即时换号、刷新竞争、多会话及跨账号缓存尚待验证。") }
+                LabeledContent("版本", value: "\(AppBuild.version) · 研究预览版")
+                LabeledContent("自动检查更新") {
+                    LiquidToggle(label: "自动检查更新", isOn: Binding(get: { model.autoUpdateCheck }, set: { model.setAutoUpdateCheck($0) }), width: 44)
+                }
+                UpdateRow(model: model)
+            } footer: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("每 6 小时向 GitHub 查一次新版本，请求里没有账号信息。更新时下载安装包，校验后替换现在的 Lilt 并重新打开，账号和设置都保留。")
+                    Text("运行中的 CLI 是否即时换号、刷新竞争、多会话及跨账号缓存尚待验证。")
+                }
+            }
         }.formStyle(.grouped).tint(Tokens.accentTint)
     }
 }
@@ -347,6 +356,7 @@ struct MenuPanel: View {
                 }
             }
             NoticeIsland(model: model, onNeedsWindow: openMain)
+            UpdateIsland(updater: model.updater, onInstall: model.installUpdate)
             if !model.accounts.isEmpty {
                 ScrollView(.horizontal) {
                     // The panel cannot show the alert or page a refused switch leads to, so it opens the window instead.
@@ -381,6 +391,7 @@ struct MenuPanel: View {
                     .buttonStyle(.liltIcon(.ghost, diameter: 28)).help("设置").accessibilityLabel("设置")
                 Menu {
                     Text(AppBuild.description)
+                    Button("检查更新…") { model.checkForUpdates() }.disabled(model.updater.current == nil || model.updater.working)
                     Divider()
                     Button("退出 Lilt") { NSApp.terminate(nil) }
                 } label: {
@@ -394,6 +405,8 @@ struct MenuPanel: View {
         .trackingPointer(pointer)
         .animation(reduceMotion ? Motion.fade : Motion.settle, value: model.library.activeID)
         .animation(reduceMotion ? Motion.fade : Motion.settle, value: model.notice())
+        .animation(reduceMotion ? Motion.fade : Motion.settle, value: model.updater.phase)
+        .animation(reduceMotion ? Motion.fade : Motion.settle, value: model.updater.reportsResult)
     }
     private func openMain() { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
 }

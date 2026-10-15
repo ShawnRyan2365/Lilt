@@ -106,6 +106,7 @@ final class AppModel {
     private var departedAt: Date?
     private var monitor: Task<Void, Never>?
     private var usageClient = UsageClient()
+    let updater = Updater()
     enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", scope = "接入", diagnostics = "诊断"
         var symbol: String { switch self { case .overview: "square.grid.2x2"; case .accounts: "person.2"; case .scope: "terminal"; case .diagnostics: "waveform.path.ecg" } }
     }
@@ -126,6 +127,7 @@ final class AppModel {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
                 guard let self else { return }
+                self.updater.checkIfDue(enabled: self.autoUpdateCheck)
                 await self.tick()
             }
         }
@@ -176,6 +178,34 @@ final class AppModel {
     func setSoonerWeekly(_ on: Bool) { updatePreferences { $0.soonerWeekly = on; if on { $0.autoSort = false } } }
     func setAutoSort(_ on: Bool) { updatePreferences { $0.autoSort = on; if on { $0.soonerWeekly = false } } }
     func setShortcut(_ key: UInt32) { updatePreferences { $0.shortcutKey = key } }
+    /// On unless the user turns it off. Nil in an older preferences file means on.
+    var autoUpdateCheck: Bool { library.preferences.autoUpdateCheck != false }
+    func setAutoUpdateCheck(_ on: Bool) { updatePreferences { $0.autoUpdateCheck = on } }
+    /// Work that quitting for an update must not cut off. A token renewal runs under both flags, and stopping halfway
+    /// through one could lose the only copy of a newly issued refresh token.
+    var updateBlocker: String? {
+        if loggingIn { return "正在添加账号，完成后再更新" }
+        if busy { return "正在切换账号，完成后再更新" }
+        if loading { return "正在读取额度，稍后再更新" }
+        return nil
+    }
+    func checkForUpdates() {
+        Task {
+            await updater.check(manual: true)
+            switch updater.phase {
+            case .current: status = "已是最新版本"
+            case .available(let release): status = "发现新版本 \(release.version)"
+            case .failed(let reason, _): status = reason
+            default: break
+            }
+        }
+    }
+    func installUpdate() {
+        Task {
+            await updater.install { [weak self] in self?.updateBlocker }
+            if case .failed(let reason, _) = updater.phase { status = "更新没有完成：\(reason)" }
+        }
+    }
     /// What still stands between the user and live automatic relay, in a few words; nil when it can be turned on.
     /// The demo has no prerequisites.
     var relayBlocker: String? {
