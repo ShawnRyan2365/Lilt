@@ -360,7 +360,7 @@ struct MenuPanel: View {
             if !model.accounts.isEmpty {
                 ScrollView(.horizontal) {
                     // The panel cannot show the alert or page a refused switch leads to, so it opens the window instead.
-                    RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, orbSize: 30, disabled: model.busy || model.loading,
+                    RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, orbSize: 30, disabled: model.busy,
                                 onSelect: { id in Task { if !(await model.apply(id)) { openMain() } } })
                         .padding(.horizontal, 2).padding(.top, 4)
                 }

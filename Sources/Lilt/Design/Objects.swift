@@ -334,8 +334,11 @@ private struct IslandButtonBody: View {
         configuration.label
             .font(.system(size: 12, weight: .medium)).lineLimit(1)
             .padding(.horizontal, 11).frame(minHeight: 28)
-            .foregroundStyle(Tokens.onInk.opacity(isEnabled ? 1 : 0.5))
-            .background(Tokens.onInk.opacity(hovered || configuration.isPressed ? 0.26 : 0.16), in: Capsule())
+            // A translucent grey pill read as switched off even when it worked; a solid one is clearly there to press,
+            // and the grey is left for when it really has to wait.
+            .foregroundStyle(isEnabled ? AnyShapeStyle(Tokens.ink) : AnyShapeStyle(Tokens.onInk.opacity(0.45)))
+            .background(isEnabled ? AnyShapeStyle(Tokens.onInk.opacity(hovered || configuration.isPressed ? 0.84 : 1))
+                                  : AnyShapeStyle(Tokens.onInk.opacity(0.12)), in: Capsule())
             .contentShape(Capsule()).contentShape(.focusEffect, Capsule())
             .scaleEffect(configuration.isPressed && !reduceMotion ? Motion.pressScaleSmall : 1)
             .animation(reduceMotion ? nil : Motion.snap, value: configuration.isPressed)

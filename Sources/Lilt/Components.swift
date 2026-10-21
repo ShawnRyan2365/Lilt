@@ -234,12 +234,12 @@ struct NoticeIsland: View {
                     }
                     if let active = model.active {
                         Button("切回订阅") { Task { await model.apply(active.id) } }
-                            .buttonStyle(IslandButtonStyle()).disabled(model.busy || model.loading)
+                            .buttonStyle(IslandButtonStyle()).disabled(model.busy)
                     }
                 }
                 if let action = notice.action {
                     Button(action.title) { model.perform(action); if action.needsWindow { onNeedsWindow?() } }
-                        .buttonStyle(IslandButtonStyle()).disabled(model.busy || model.loading)
+                        .buttonStyle(IslandButtonStyle()).disabled(model.blocks(action))
                 }
             }
             .transition(.liltReveal(reduceMotion: reduceMotion))
@@ -341,7 +341,8 @@ struct AccountRow: View {
     var onRename: () -> Void
     var onDelete: () -> Void
     private var active: Bool { account.id == model.displayedActiveID }
-    private var canSwitch: Bool { !active && account.enabled && !model.busy && !model.loading }
+    // A quota read in the background does not block a switch: `apply` waits for it to finish.
+    private var canSwitch: Bool { !active && account.enabled && !model.busy }
     private var capabilities: String {
         let usage = account.usageCapability == .verified ? "可读取额度" : account.usageCapability == .unavailable ? "额度权限不足" : "额度待验证"
         return [account.kind.title, usage, model.demo ? "演示能力" : "热切换待验证"].joined(separator: " · ")
@@ -399,7 +400,7 @@ struct AccountRow: View {
                     .frame(width: AccountColumns.menu, height: 30).contentShape(Circle())
             }
             .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-            .disabled(model.busy || model.loading).help("更多").accessibilityLabel("\(account.label) 的更多操作")
+            .disabled(model.busy).help("更多").accessibilityLabel("\(account.label) 的更多操作")
         }
         .padding(.leading, 12).padding(.trailing, AccountColumns.trailing).padding(.vertical, 12)
         .object(radius: 18)

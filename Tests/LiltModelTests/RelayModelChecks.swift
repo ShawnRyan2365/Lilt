@@ -30,8 +30,9 @@ import LiltCore
         precondition(model.autoRelay && model.active?.id == spare.id, "Recovery must resume without toggling relay")
         precondition(model.relayPause == nil)
 
-        // Missing, stale and partial data keep relay armed, but never justify a switch.
-        for usage: UsageSnapshot? in [nil, snapshot(20, age: 90), UsageSnapshot(fiveHour: UsageWindow(used: 20))] {
+        // Missing, stale and partial data keep relay armed, but never justify a switch. Another account's reading
+        // counts for ten minutes (`RelayPolicy.candidateLifetime`), so stale means older than that.
+        for usage: UsageSnapshot? in [nil, snapshot(20, age: 601), UsageSnapshot(fiveHour: UsageWindow(used: 20))] {
             var fixture = source; fixture.accounts[1].usage = usage
             let waiting = AppModel(preview: fixture)
             await waiting.relay()
@@ -75,11 +76,12 @@ import LiltCore
         precondition(!automaticApplied && api.keepsAPIMode)
         let manualApplied = await api.apply(spare.id)
         precondition(manualApplied && !api.apiModeDetected && !api.keepsAPIMode && api.displayedActiveID == spare.id)
+        try await pauseChecks()
         try await autoSortChecks()
         try await scopeWatchChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, automatic order, scope reads that fail for a moment. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, automatic order, scope reads that fail for a moment. No live credentials or requests.")
     }
 }
 
@@ -162,6 +164,49 @@ import LiltCore
     try SecureFiles.write(Data(#"{"oauthAccount":{"accountUuid":"fixture-account-c"}}"#.utf8), to: config)
     settled = await model.reconcileScope(); precondition(!settled)
     precondition(!model.autoRelay && model.scopeIssue != nil && model.library.preferences.autoRelayStopReason != nil)
+}
+
+/// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up
+/// to two minutes later; many accounts sharing one reason are summed up in one phrase. Background reads leave the
+/// notice's dismiss button and the account buttons usable.
+@MainActor func pauseChecks() async throws {
+    var library = Library()
+    func spent(_ label: String, resetsIn seconds: TimeInterval) -> Account {
+        var account = Account(label: label, kind: .oauth)
+        account.usageCapability = .verified; account.hotSwitchCapability = .verified
+        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: .now.addingTimeInterval(seconds)), sevenDay: UsageWindow(used: 20, resetsAt: .now.addingTimeInterval(86400)))
+        return account
+    }
+    let active = spent("Fixture A", resetsIn: 3600)
+    let others = (1...5).map { spent("Fixture \($0)", resetsIn: $0 == 3 ? 30 : 7200) }
+    library.accounts = [active] + others; library.activeID = active.id; library.preferences.autoRelay = true
+    var retryTime = Date.now
+    let model = AppModel(preview: library, retryClock: { retryTime })
+    await model.relay()
+    precondition(model.autoRelay && model.active?.id == active.id)
+    precondition(model.relayPause?.hasPrefix("5 个账号额度不足或不完整。") == true, "One phrase for one shared reason")
+    precondition(model.relayPause?.contains("最早 1 分钟后有账号恢复") == true)
+    // Fixture 3 gets its quota back in 30 seconds; the next try is due right after, well inside two minutes.
+    let back = others[2].id
+    model.update(back) { $0.usage = UsageSnapshot(fiveHour: UsageWindow(used: 0), sevenDay: UsageWindow(used: 20, resetsAt: .now.addingTimeInterval(86400))) }
+    retryTime = retryTime.addingTimeInterval(20)
+    await model.relay()
+    precondition(model.active?.id == active.id, "Not before the reset")
+    retryTime = retryTime.addingTimeInterval(20)
+    await model.relay()
+    precondition(model.active?.id == back, "Right after the reset")
+
+    model.appliedPending = true
+    model.loading = true
+    precondition(!model.blocks(.confirmApplied) && !model.blocks(.openScope), "Dismissing a note never waits for a read")
+    precondition(model.blocks(.refresh(back)) && !model.blocks(.reauthorize(back)))
+    model.busy = true
+    precondition(model.blocks(.reauthorize(back)) && !model.blocks(.confirmApplied))
+    model.busy = false
+    // A switch by hand waits for the read in progress instead of being refused.
+    Task { try? await Task.sleep(for: .milliseconds(400)); model.loading = false }
+    let switched = await model.apply(active.id)
+    precondition(switched && model.active?.id == active.id && !model.loading)
 }
 
 /// Sorting changes only the order the model shows and relays in. The user's own arrangement survives it, and a

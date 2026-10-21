@@ -109,6 +109,11 @@ final class AppModel {
     /// Who automatic relay just left, and when. `RelayPolicy.coolingDown` decides whether that still blocks them.
     private var departedID: UUID?
     private var departedAt: Date?
+    /// Recent readings of the account in use, oldest first, for `UsagePace`. Emptied when another account takes over.
+    private var paceReadings: [UsageSnapshot] = []
+    private var paceAccount: UUID?
+    private var scopeCheckedAt = Date.distantPast
+    private var preparedAt = Date.distantPast
     private var monitor: Task<Void, Never>?
     private var usageClient = UsageClient()
     let updater = Updater()
@@ -130,7 +135,13 @@ final class AppModel {
         Task { version = await CLILogin.version() }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(15))
+                // A pass every 15 seconds, or within 3 of a session reporting quota while the account in use is close
+                // to the threshold: a busy session can spend a few points in 15 seconds.
+                for _ in 0..<5 {
+                    try? await Task.sleep(for: .seconds(3))
+                    guard let self else { return }
+                    if self.liveReadingWaiting { break }
+                }
                 guard let self else { return }
                 self.updater.checkIfDue(enabled: self.autoUpdateCheck)
                 await self.tick()
@@ -508,6 +519,7 @@ final class AppModel {
             let snapshot = try await usageClient.fetch(credential)
             guard accounts.contains(where: { $0.id == id }), isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil }
+            if id == library.activeID { notePace(snapshot, for: id) }
             backoffs[id, default: Backoff()].succeed(); failures[id] = nil; status = "额度已更新"
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
             if identity(for: id) == nil, credential.refreshable, let record = await IdentityClient().fetch(credential), isCurrent(credential, for: id) {
@@ -542,6 +554,12 @@ final class AppModel {
     }
     @discardableResult
     func apply(_ id: UUID, automatically: Bool = false) async -> Bool {
+        // A quota read running in the background is no reason to refuse the user's own switch, so the account buttons
+        // stay usable meanwhile; each read ends within its request timeout.
+        if !automatically {
+            let deadline = Date.now.addingTimeInterval(30)
+            while loading, !busy, Date.now < deadline { try? await Task.sleep(for: .milliseconds(200)) }
+        }
         guard !busy, !loading, storageAvailable, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
         if automatically, apiModeDetected || keepsAPIMode { return false }
         if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先接管 Claude Code 默认登录。"; return false }
@@ -670,6 +688,15 @@ final class AppModel {
               let known = active.usage, live.sampledAt > known.sampledAt, live.sharesWindows(with: known, at: now) else { return }
         update(active.id) { $0.usage = live; $0.usageCapability = .verified; $0.issue = nil }
         failures[active.id] = nil
+        notePace(live, for: active.id)
+        // A session reporting this account's quota after the switch is using the new login, so the note that Lilt cannot
+        // see whether sessions followed has nothing left to say. Sessions still on the previous account are not counted.
+        appliedPending = false
+    }
+    private func notePace(_ reading: UsageSnapshot, for id: UUID) {
+        if paceAccount != id { paceAccount = id; paceReadings = [] }
+        paceReadings.removeAll { $0.sampledAt >= reading.sampledAt || reading.sampledAt.timeIntervalSince($0.sampledAt) > UsagePace.span }
+        paceReadings.append(reading)
     }
     /// When the last status line reading arrived, for the 接入 page.
     var liveUsageSampledAt: Date? { StatusLineBridge.latest()?.sampledAt }
@@ -730,10 +757,15 @@ final class AppModel {
         // minutes. An endpoint reading is only acted on while it is still the just-queried minute.
         let lifetime: TimeInterval = (!demo && snapshot.source == UsageParser.statusLineSource) ? 300 : 60
         let triggered = snapshot.exhausted(threshold: threshold, at: .now, lifetime: lifetime)
+        // At the pace the account is being spent it would pass the threshold before the next readings and the hand-off
+        // are through, and a session that runs into the limit stops mid-task. Starting now keeps it running.
+        let ahead = !demo && !triggered && paceAccount == active.id
+            && UsagePace.nearing(snapshot, after: paceReadings, threshold: threshold, at: .now, lifetime: lifetime)
+        let due = triggered || ahead
         // The weekly preference may move before the threshold, but only off a fresh reading of the account in use.
-        // Once the threshold is reached that preference stays out of the decision.
-        let early = library.preferences.soonerWeekly == true && !triggered && snapshot.isFresh(at: .now)
-        guard triggered || early else {
+        // Once a hand-off is due that preference stays out of the decision.
+        let early = library.preferences.soonerWeekly == true && !due && snapshot.isFresh(at: .now)
+        guard due || early else {
             if snapshot.available(threshold: threshold, at: .now) { relayPause = nil; relayRetryAt = nil }
             return
         }
@@ -744,31 +776,25 @@ final class AppModel {
             return
         }
         if let relayRetryAt, relayRetryAt > retryClock() { return }
-        let policy = RelayPolicy(
-            threshold: threshold,
-            allowUnverifiedHotSwitch: !demo,
-            leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
-            soonerWeekly: early,
-            preferFreshFiveHour: autoSort
-        )
+        let policy = relayPolicy(soonerWeekly: early)
         if !demo {
-            if triggered {
-                // Other accounts are read only now, when a hand-off is due: in priority order, and only until one settles it.
-                // With sorting on that is the first one ready with an untouched 5-hour window, so reading may go further.
-                // A rejected refresh token is not asked again, and the account just left is not read in order to come back.
-                for candidate in accounts where candidate.id != active.id && candidate.enabled && candidate.usageCapability != .unavailable {
-                    if candidate.refreshRejected == true || candidate.id == policy.leftRecently { continue }
-                    if policy.settles(candidate, at: .now) { break }
-                    // Already ready on a fresh reading, only its 5-hour window has been used: asking again changes nothing.
-                    if policy.obstacle(for: candidate, at: .now) == nil { continue }
+            if due {
+                // Other accounts are read only when what is known of them cannot settle the hand-off, in priority order
+                // and only until one can take over. Readings from the last ten minutes count, and an account with a
+                // window used up is not asked again before that window resets, so a hand-off usually reads nobody.
+                // Looking further for an untouched 5-hour window is left to the reading done ahead (`prepareHandOff`):
+                // the hand-off itself does not wait for it.
+                for candidate in relayCandidates(policy, besides: active.id) {
+                    if policy.obstacle(for: candidate, at: .now) == nil { break }
+                    guard policy.worthReading(candidate, at: .now), readable(candidate.id) else { continue }
                     await refresh(candidate.id)
-                    if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.settles(fresh, at: .now) { break }
+                    if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.obstacle(for: fresh, at: .now) == nil { break }
+                    if let until = usagePausedUntil, until > .now { break }
                 }
             } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > .now {
                 // Only a stored weekly reset that is already earlier can justify a read. Unknown resets stay out,
                 // and a recent check is not repeated on the 15-second monitor.
-                for candidate in accounts where candidate.id != active.id && candidate.enabled && candidate.usageCapability != .unavailable {
-                    if candidate.refreshRejected == true || candidate.id == policy.leftRecently { continue }
+                for candidate in relayCandidates(policy, besides: active.id) {
                     guard let reset = candidate.usage?.sevenDay?.resetsAt, reset > .now, reset < activeReset else { continue }
                     if policy.obstacle(for: candidate, at: .now) == nil { continue }
                     // Five minutes matches the ordinary relay watch, so opting in does not poll on every monitor tick.
@@ -785,7 +811,7 @@ final class AppModel {
                 return
             }
         }
-        switch policy.decide(active: self.active, candidates: accounts, at: .now, holdActiveReading: !demo && triggered) {
+        switch policy.decide(active: self.active, candidates: accounts, at: .now, holdActiveReading: !demo && triggered, ahead: ahead) {
         case .select(let id):
             // Claim only once a candidate is actually chosen. Claiming before the other accounts were
             // read used up the event whenever that reading took longer than the freshness window:
@@ -802,11 +828,77 @@ final class AppModel {
         case .pause(let reason):
             // An early look that finds nobody must not stop relay: the account in use still has room.
             guard triggered else { break }
-            let reasons = accounts.filter { $0.id != active.id }
-                .compactMap { account in policy.obstacle(for: account, at: .now).map { "\(account.label)：\($0)" } }
-            let detail = reasons.isEmpty ? reason : reasons.joined(separator: "；")
-            waitForRelay(because: "\(detail) 保持开启，稍后自动重查。", until: retryClock().addingTimeInterval(120))
+            let others = accounts.filter { $0.id != active.id }
+            let blocked = others.compactMap { account in policy.obstacle(for: account, at: .now).map { (account.label, $0) } }
+            // With many accounts, one line per account is a wall of text that mostly repeats one reason.
+            let detail: String
+            if blocked.isEmpty { detail = reason }
+            else if blocked.count <= 3 { detail = blocked.map { "\($0.0)：\($0.1)" }.joined(separator: "；") }
+            else {
+                detail = Dictionary(grouping: blocked, by: \.1).sorted { ($0.value.count, $1.key) > ($1.value.count, $0.key) }
+                    .map { "\($0.value.count) 个账号\($0.key)" }.joined(separator: "，")
+            }
+            // Try again when the first of them gets its quota back, rather than up to two minutes after it.
+            let reset = policy.nextReset(of: others, at: .now)
+            let wait = reset.map { min(120, max(5, $0.timeIntervalSinceNow + 5)) } ?? 120
+            let next = reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时自动换上。" } ?? "保持开启，稍后自动重查。"
+            let sentence = detail.hasSuffix("。") ? detail : detail + "。"
+            waitForRelay(because: sentence + next, until: retryClock().addingTimeInterval(wait))
         case .wait: break
+        }
+    }
+    /// Who may take over from the account in use, in relay order. A rejected refresh token stays out until the user
+    /// authorizes again, and the account just left is not read in order to come back to it.
+    private func relayCandidates(_ policy: RelayPolicy, besides activeID: UUID) -> [Account] {
+        accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true && $0.id != policy.leftRecently }
+    }
+    private func relayPolicy(soonerWeekly: Bool = false) -> RelayPolicy {
+        RelayPolicy(threshold: threshold, allowUnverifiedHotSwitch: !demo,
+                    leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
+                    soonerWeekly: soonerWeekly, preferFreshFiveHour: autoSort)
+    }
+    /// The account is not in a backoff; asking now would only be refused.
+    private func readable(_ id: UUID) -> Bool { (backoffs[id]?.nextAttempt ?? .distantPast) <= .now }
+    /// The account in use is within `RelayPolicy.preparationMargin` points of the threshold on its last reading.
+    var nearThreshold: Bool {
+        guard let usage = active?.usage else { return false }
+        let remaining = [usage.fiveHour, usage.sevenDay].compactMap { usage.lastKnownRemaining($0, at: .now) }.min()
+        return remaining.map { $0 <= threshold + RelayPolicy.preparationMargin } ?? false
+    }
+    /// A session has reported quota that the monitor has not taken in yet, and the account in use is close enough to
+    /// the threshold that waiting for the next ordinary pass could carry it past.
+    private var liveReadingWaiting: Bool {
+        guard autoRelay, !demo, !busy, !loading, managesDefaultLogin, liveUsageEnabled, scopeIssue == nil, scopeUnreadable == nil,
+              nearThreshold, let sampled = StatusLineBridge.latest()?.sampledAt else { return false }
+        return sampled != liveStamp
+    }
+    /// While the account in use is close to the threshold, read ahead the accounts that would take over, one at a time,
+    /// so the hand-off finds the next one ready instead of reading them all at that moment. Reading stops at the first
+    /// account that settles a hand-off, which with sorting on is one with an untouched 5-hour window, and that one is
+    /// read again before its reading stops counting. Passes come every few seconds near the threshold, so reads are
+    /// spaced: one per 15 seconds until some account is ready, then one a minute while only the preference for an
+    /// untouched window is left to satisfy.
+    private func prepareHandOff() async {
+        guard autoRelay, !demo, !busy, !loading, nearThreshold, let active, (usagePausedUntil ?? .distantPast) <= .now,
+              (relayRetryAt ?? .distantPast) <= retryClock() else { return }
+        let policy = relayPolicy()
+        let candidates = relayCandidates(policy, besides: active.id)
+        let someoneReady = candidates.contains { policy.obstacle(for: $0, at: .now) == nil }
+        guard Date.now.timeIntervalSince(preparedAt) >= (someoneReady ? 60 : 15) else { return }
+        for candidate in candidates {
+            if policy.settles(candidate, at: .now) {
+                if let usage = candidate.usage, Date.now.timeIntervalSince(usage.sampledAt) > RelayPolicy.candidateLifetime - 120, readable(candidate.id) {
+                    preparedAt = .now; await refresh(candidate.id)
+                }
+                return
+            }
+            guard policy.worthReading(candidate, at: .now), readable(candidate.id) else { continue }
+            // With someone ready, only the preference for an untouched window is left, and only an account whose last
+            // reading showed one, or whose window has reset since, can still have one.
+            if someoneReady, policy.preferFreshFiveHour, let usage = candidate.usage,
+               (usage.lastKnownRemaining(usage.fiveHour, at: .now) ?? 100) < 100 - 0.000001 { continue }
+            preparedAt = .now; await refresh(candidate.id)
+            return
         }
     }
     /// Someone is likely reading or spending quota right now: a terminal or editor is frontmost, or Lilt itself is on screen.
@@ -819,23 +911,27 @@ final class AppModel {
         clock = .now
         guard !busy, !loading else { return }
         if demo { touchDemoSamples(); await relay(); return }
-        guard await reconcileScope() else { return }
+        // A pass woken early by a status line reading skips the scope check when one passed moments ago. Reading the
+        // keychain holds up the main thread for a moment, and an automatic hand-off checks the scope again before writing.
+        if Date.now.timeIntervalSince(scopeCheckedAt) >= 10 {
+            guard await reconcileScope() else { return }
+            scopeCheckedAt = .now
+        }
         checkStatusLine()
         ingestLiveUsage()
         guard let active else { return }
         // Readings from a working session arrive with every response; the endpoint is only asked when none has come
         // for five minutes (ORCA waits the same).
         if let usage = active.usage, usage.source == UsageParser.statusLineSource, Date.now.timeIntervalSince(usage.sampledAt) < 300 {
-            await relay(); return
+            await relay(); await prepareHandOff(); return
         }
-        let remaining = [active.usage?.fiveHour, active.usage?.sevenDay].compactMap { active.usage?.lastKnownRemaining($0, at: .now) }.min()
-        let low = remaining.map { $0 <= 10 } ?? false
         // ORCA asks every 15 minutes, and only while its window is in front. With relay on Lilt has to keep watching
-        // in the background, but no faster than the endpoint puts up with: every 2 minutes when the account is nearly
-        // out, every 5 while relay is on or a terminal is in front, every 15 otherwise.
-        let interval: Double = autoRelay ? (low ? 120 : 300) : (watching ? 300 : 900)
+        // in the background, but no faster than the endpoint puts up with: every 2 minutes when the account is close
+        // to the threshold, every 5 while relay is on or a terminal is in front, every 15 otherwise.
+        let interval: Double = autoRelay ? (nearThreshold ? 120 : 300) : (watching ? 300 : 900)
         if Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= interval { await refresh(active.id) }
         await relay()
+        await prepareHandOff()
     }
     func notice(at now: Date = .now) -> Notice? {
         if !storageAvailable { return Notice(symbol: "externaldrive.badge.exclamationmark", text: "本地数据不可用，已停止写入", detail: "检查 ~/Library/Application Support/Lilt 的权限后重新打开 Lilt。", warning: true) }
@@ -886,6 +982,16 @@ final class AppModel {
     static func unreadableQuotaDetail(_ kind: AuthKind) -> String {
         kind == .setupToken ? "长效 Token 只能发模型请求，官方额度接口不认它。改用浏览器登录后才能看额度、参与自动接力；模型请求本身不受影响。"
                             : "官方额度接口拒绝了这个凭据。重新用浏览器登录后再试。"
+    }
+    /// Whether the notice's button has to wait for work in progress. Dismissing a note or opening a page never does:
+    /// the monitor reads quota in the background every few minutes, more often near the threshold, and those reads
+    /// left the button greyed out while the notice stayed on screen.
+    func blocks(_ action: Notice.Action) -> Bool {
+        switch action {
+        case .confirmApplied, .openScope: false
+        case .reauthorize, .adoptScope: busy
+        case .refresh, .refreshAll: busy || loading
+        }
     }
     func perform(_ action: Notice.Action) {
         switch action {

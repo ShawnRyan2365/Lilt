@@ -41,8 +41,8 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         guard sampledAt <= now else { return false }
         return [fiveHour, sevenDay].contains { lastKnownRemaining($0, at: now).map { $0 <= threshold + 0.000001 } ?? false }
     }
-    public func available(threshold: Double, at now: Date) -> Bool {
-        [fiveHour, sevenDay].allSatisfy { validRemaining($0, at: now).map { $0 > threshold + 0.000001 } ?? false }
+    public func available(threshold: Double, at now: Date, lifetime: TimeInterval = 60) -> Bool {
+        [fiveHour, sevenDay].allSatisfy { validRemaining($0, at: now, lifetime: lifetime).map { $0 > threshold + 0.000001 } ?? false }
     }
 }
 public struct Account: Identifiable, Codable, Equatable, Sendable {
@@ -130,6 +130,15 @@ public struct RelayPolicy: Sendable {
     /// seconds have passed. Two accounts sitting just above the threshold would otherwise swap on
     /// every sample. This is not a second threshold and not a ten-point lag.
     public static let departureCooldown: TimeInterval = 300
+    /// How long a reading of an account that is not in use still counts at a hand-off. Nobody spends an idle account's
+    /// quota, so its reading only goes out of date when a window resets, which `validRemaining` catches at that moment,
+    /// or when the account is used somewhere else; ten minutes bounds that. Requiring a reading from the last minute
+    /// meant reading every account again at the moment of the hand-off. With many accounts that took longer than the
+    /// minute itself, and the burst of requests could earn a 429 that stalled the hand-off further.
+    public static let candidateLifetime: TimeInterval = 600
+    /// How many points above the threshold the account in use is close enough that the accounts which would take over
+    /// are read ahead, one per pass, so the hand-off finds the next one ready.
+    public static let preparationMargin: Double = 15
     public init(threshold: Double = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false,
                 preferFreshFiveHour: Bool = false) {
         self.threshold = min(100, max(0, threshold)); self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
@@ -151,15 +160,37 @@ public struct RelayPolicy: Sendable {
         if candidate.hotSwitchCapability == .unavailable || (candidate.hotSwitchCapability == .unknown && !allowUnverifiedHotSwitch) { return "热切换未验证" }
         if candidate.usageCapability == .unavailable { return "读不到额度" }
         guard let usage = candidate.usage else { return "额度未知" }
-        guard usage.isFresh(at: now) else { return "读数不是刚查的" }
-        if !usage.available(threshold: threshold, at: now) { return "额度不足或不完整" }
+        guard usage.isFresh(at: now, lifetime: Self.candidateLifetime) else { return "读数超过 10 分钟" }
+        if !usage.available(threshold: threshold, at: now, lifetime: Self.candidateLifetime) { return "额度不足或不完整" }
         // Only an account that would otherwise qualify says it just left. Anyone else keeps their own reason.
         if candidate.id == leftRecently { return "刚刚离开" }
         return nil
     }
-    /// A fresh reading shows the 5-hour window unused: all of it is left.
+    /// Whether asking for this account's quota again could change its answer. A recent reading that already qualifies
+    /// does not need it, and neither does one with a window at or under the threshold: quota only comes back when that
+    /// window resets, and the reading stops counting at that moment. Accounts that can never take over are not asked.
+    public func worthReading(_ candidate: Account, at now: Date) -> Bool {
+        guard candidate.enabled, candidate.refreshRejected != true, candidate.usageCapability != .unavailable,
+              candidate.hotSwitchCapability != .unavailable else { return false }
+        guard let usage = candidate.usage, usage.isFresh(at: now, lifetime: Self.candidateLifetime) else { return true }
+        if usage.remainsExhausted(threshold: threshold, at: now) { return false }
+        return !usage.available(threshold: threshold, at: now, lifetime: Self.candidateLifetime)
+    }
+    /// The first moment one of these accounts may have room again: the reset of whichever of its windows are at or under
+    /// the threshold, whichever account gets there first. Nil when none of them is waiting for a known reset.
+    public func nextReset(of candidates: [Account], at now: Date) -> Date? {
+        candidates.filter { $0.enabled && $0.refreshRejected != true && $0.usageCapability != .unavailable }.compactMap { account -> Date? in
+            guard let usage = account.usage else { return nil }
+            // An account is out until every window that keeps it out has reset.
+            return [usage.fiveHour, usage.sevenDay].compactMap { window -> Date? in
+                guard let window, let reset = window.resetsAt, reset > now, let left = window.remaining, left <= threshold + 0.000001 else { return nil }
+                return reset
+            }.max()
+        }.min()
+    }
+    /// A recent reading shows the 5-hour window unused: all of it is left.
     public static func untouchedFiveHour(_ account: Account, at now: Date) -> Bool {
-        guard let usage = account.usage, let left = usage.validRemaining(usage.fiveHour, at: now) else { return false }
+        guard let usage = account.usage, let left = usage.validRemaining(usage.fiveHour, at: now, lifetime: candidateLifetime) else { return false }
         return left >= 100 - 0.000001
     }
     /// Reading candidates in order can stop at this one: it can take the baton and, when untouched 5-hour windows
@@ -167,9 +198,11 @@ public struct RelayPolicy: Sendable {
     public func settles(_ candidate: Account, at now: Date) -> Bool {
         obstacle(for: candidate, at: now) == nil && (!preferFreshFiveHour || Self.untouchedFiveHour(candidate, at: now))
     }
-    public func decide(active: Account?, candidates: [Account], at now: Date, holdActiveReading: Bool = false) -> RelayDecision {
+    /// `ahead` says the account in use will reach the threshold within `UsagePace.lead` at the pace it is being spent;
+    /// the hand-off then starts as if it had.
+    public func decide(active: Account?, candidates: [Account], at now: Date, holdActiveReading: Bool = false, ahead: Bool = false) -> RelayDecision {
         guard let active, let usage = active.usage else { return .wait }
-        let triggered = holdActiveReading ? usage.remainsExhausted(threshold: threshold, at: now) : usage.exhausted(threshold: threshold, at: now)
+        let triggered = ahead || (holdActiveReading ? usage.remainsExhausted(threshold: threshold, at: now) : usage.exhausted(threshold: threshold, at: now))
         // Below the threshold nothing moves, unless the user opted into spending a weekly window that resets sooner.
         // At the threshold the user's order stands: this preference must not pull a worse account forward.
         if !triggered {

@@ -157,7 +157,7 @@ struct MainView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).object()
     }
     private var runnerTrack: some View {
-        RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, disabled: model.busy || model.loading,
+        RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, disabled: model.busy,
                     onSelect: { id in Task { await model.apply(id) } },
                     onAdd: model.canAdd ? { model.requestAdd() } : nil) { runner in
             accountMenu(runner.id)

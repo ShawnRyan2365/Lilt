@@ -45,7 +45,7 @@ final class RelayTests {
         var active = Account(label: "Fixture A", kind: .oauth); active.usage = snapshot(1, 70)
         var unproven = Account(label: "Fixture B", kind: .oauth); unproven.usage = snapshot(60, 60)
         var tokenOnly = Account(label: "Fixture C", kind: .setupToken); tokenOnly.usageCapability = .unavailable
-        var stale = Account(label: "Fixture D", kind: .oauth); stale.usage = snapshot(90, 90, age: 61)
+        var stale = Account(label: "Fixture D", kind: .oauth); stale.usage = snapshot(90, 90, age: 601)
         var refused = Account(label: "Fixture E", kind: .oauth); refused.usage = snapshot(90, 90); refused.hotSwitchCapability = .unavailable
         let live = RelayPolicy(allowUnverifiedHotSwitch: true)
         // The strict rule still refuses an unproven account; the live rule takes it.
@@ -54,7 +54,7 @@ final class RelayTests {
         // Unreadable, stale and known-broken accounts are never chosen, and each says why.
         guard case .pause = live.decide(active: active, candidates: [tokenOnly, stale, refused], at: now) else { fatalError("Expected pause") }
         expectEqual(live.obstacle(for: tokenOnly, at: now), "读不到额度")
-        expectEqual(live.obstacle(for: stale, at: now), "读数不是刚查的")
+        expectEqual(live.obstacle(for: stale, at: now), "读数超过 10 分钟")
         expectEqual(live.obstacle(for: refused, at: now), "热切换未验证")
         expectEqual(live.obstacle(for: unproven, at: now), nil)
         // Nothing happens while the account in use is above the threshold.
@@ -320,13 +320,92 @@ final class RelayTests {
         expectEqual(prefer.decide(active: active, candidates: [spent, used], at: now), .select(used.id))
         expectFalse(prefer.settles(used, at: now)); expect(prefer.settles(untouched, at: now)); expectFalse(prefer.settles(spent, at: now))
         expect(RelayPolicy().settles(used, at: now))
-        // Ready but used is not untouched; an untouched window on an old reading does not count either.
+        // Ready but used is not untouched; an untouched window on a reading past the candidate lifetime does not count either.
         var old = untouched
-        old.usage?.sampledAt = now.addingTimeInterval(-120)
+        old.usage?.sampledAt = now.addingTimeInterval(-601)
         expectFalse(RelayPolicy.untouchedFiveHour(old, at: now))
         guard case .pause = prefer.decide(active: active, candidates: [spent, old], at: now) else { fatalError("Expected pause") }
         let healthy = placed("Fixture E", five: 40, week: 60, weekResetsIn: 3 * day)
         expectEqual(prefer.decide(active: healthy, candidates: [untouched], at: now), .wait)
+    }
+    /// An idle account's reading counts for ten minutes at a hand-off, so the hand-off does not have to read every
+    /// account again. The one in use still needs a reading from the last minute (or the status line's five) to trigger.
+    func testCandidateReadingsCountForTenMinutes() {
+        var active = Account(label: "Fixture A", kind: .oauth); active.usage = snapshot(1, 70)
+        var recent = Account(label: "Fixture B", kind: .oauth); recent.usage = snapshot(60, 60, age: 540)
+        let live = RelayPolicy(threshold: 1, allowUnverifiedHotSwitch: true)
+        expectEqual(live.obstacle(for: recent, at: now), nil)
+        expectEqual(live.decide(active: active, candidates: [recent], at: now), .select(recent.id))
+        recent.usage = snapshot(60, 60, age: 601)
+        guard case .pause = live.decide(active: active, candidates: [recent], at: now) else { fatalError("Expected pause") }
+        // The ten minutes are for the other accounts only.
+        active.usage = snapshot(1, 70, age: 61)
+        expectEqual(live.decide(active: active, candidates: [recent], at: now), .wait)
+        // A window that has reset since the reading is not assumed to be full, however recent the reading.
+        recent.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(-1)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-30))
+        expectEqual(live.obstacle(for: recent, at: now), "额度不足或不完整")
+    }
+    /// Reading an account again is worth it only when it could change the answer, and the next try after a pause is
+    /// timed to the first account that gets its quota back.
+    func testHandOffReadsOnlyWhatCouldChange() {
+        let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
+        var account = Account(label: "Fixture A", kind: .oauth)
+        expect(live.worthReading(account, at: now)) // never read
+        account.usage = snapshot(60, 60, age: 601)
+        expect(live.worthReading(account, at: now)) // past the candidate lifetime
+        account.usage = snapshot(60, 60, age: 30)
+        expectFalse(live.worthReading(account, at: now)) // already qualifies
+        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(1800)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-30))
+        expectFalse(live.worthReading(account, at: now)) // used up until its reset; asking again cannot help
+        account.usage?.sampledAt = now.addingTimeInterval(-601)
+        expect(live.worthReading(account, at: now)) // an old reading is still unknown, used up or not
+        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(-60)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-300))
+        expect(live.worthReading(account, at: now)) // reset since the reading
+        var rejected = account; rejected.refreshRejected = true
+        var off = account; off.enabled = false
+        var unreadable = account; unreadable.usageCapability = .unavailable
+        expectFalse(live.worthReading(rejected, at: now)); expectFalse(live.worthReading(off, at: now)); expectFalse(live.worthReading(unreadable, at: now))
+
+        var soon = Account(label: "Fixture B", kind: .oauth)
+        soon.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(600)), sevenDay: UsageWindow(used: 20, resetsAt: now.addingTimeInterval(86400)), sampledAt: now)
+        var both = Account(label: "Fixture C", kind: .oauth)
+        both.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(300)), sevenDay: UsageWindow(used: 99, resetsAt: now.addingTimeInterval(7200)), sampledAt: now)
+        var spare = Account(label: "Fixture D", kind: .oauth); spare.usage = snapshot(50, 50)
+        // Fixture C is out until its weekly window resets as well, so Fixture B gets its quota back first.
+        expectEqual(live.nextReset(of: [both, soon, spare], at: now), now.addingTimeInterval(600))
+        soon.enabled = false
+        expectEqual(live.nextReset(of: [both, soon, spare], at: now), now.addingTimeInterval(7200))
+        expectEqual(live.nextReset(of: [spare], at: now), nil)
+    }
+    /// A hand-off starts ahead of the threshold when the pace of spending would carry the account past it within a
+    /// minute, never more than ten points early, and only on readings of the same window far enough apart.
+    func testPaceStartsTheHandOffAhead() {
+        func reading(_ remaining: Double, ago: TimeInterval, resetsIn: TimeInterval = 3600) -> UsageSnapshot {
+            UsageSnapshot(fiveHour: UsageWindow(used: 100 - remaining, resetsAt: now.addingTimeInterval(resetsIn)),
+                          sevenDay: UsageWindow(used: 30, resetsAt: now.addingTimeInterval(86400)), sampledAt: now.addingTimeInterval(-ago), source: UsageParser.statusLineSource)
+        }
+        let latest = reading(8, ago: 0)
+        // Four points in the last minute: four more in the next one reaches 5%.
+        expect(UsagePace.nearing(latest, after: [reading(12, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        // One point in ten minutes is no reason to leave early.
+        expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 590)], threshold: 5, at: now, lifetime: 300))
+        // Readings seconds apart do not measure a pace, and neither does one from before the window reset.
+        expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 10)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [reading(40, ago: 60, resetsIn: 3600 - 18000)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [], threshold: 5, at: now, lifetime: 300))
+        // However fast, at most ten points early.
+        expectFalse(UsagePace.nearing(reading(16, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        expect(UsagePace.nearing(reading(15, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        // The oldest reading within ten minutes sets the pace, so one quick step among slow ones does not.
+        expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 590), reading(9, ago: 40)], threshold: 5, at: now, lifetime: 300))
+        // A reading too old to act on is not acted on early either.
+        expectFalse(UsagePace.nearing(reading(8, ago: 301), after: [reading(12, ago: 361)], threshold: 5, at: now, lifetime: 300))
+        // The policy takes the hand-off as due.
+        var active = Account(label: "Fixture A", kind: .oauth); active.usage = latest
+        var ready = Account(label: "Fixture B", kind: .oauth); ready.usage = snapshot(50, 50)
+        let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
+        expectEqual(live.decide(active: active, candidates: [ready], at: now), .wait)
+        expectEqual(live.decide(active: active, candidates: [ready], at: now, ahead: true), .select(ready.id))
     }
     /// Versions compare numerically and ignore trailing zeros; tags with a suffix or anything else are not versions.
     func testUpdateVersionsCompareNumerically() {
@@ -446,11 +525,14 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
         suite.testAutoSortOrdersByWeeklyResetDayThenWhatIsLeft()
         suite.testHandOffPrefersAnUntouchedFiveHourWindow()
+        suite.testCandidateReadingsCountForTenMinutes()
+        suite.testHandOffReadsOnlyWhatCouldChange()
+        suite.testPaceStartsTheHandOffAhead()
         suite.testUpdateVersionsCompareNumerically()
         try suite.testUpdateFeedOffersOnlyAMatchingNewerRelease()
         suite.testUpdateInstallBoundaries()
         try storageChecks()
-        print("PASS: 24 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, untouched 5-hour hand-off, update versions, update feed, update boundaries")
+        print("PASS: 27 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, untouched 5-hour hand-off, ten-minute candidate readings, reads that could change the answer, pace ahead of the threshold, update versions, update feed, update boundaries")
     }
 }
 

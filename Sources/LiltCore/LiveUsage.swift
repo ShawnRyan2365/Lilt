@@ -37,3 +37,41 @@ public extension UsageSnapshot {
         return compared
     }
 }
+
+/// How fast the account in use is being spent, so a hand-off can start before the threshold instead of after it.
+/// Readings arrive some seconds apart and a hand-off takes a few more; a busy account, several sessions at once, can
+/// spend several points in that time and run into its limit, which stops the session mid-task.
+public enum UsagePace {
+    /// How far ahead the pace is projected: the time readings take to arrive plus the time a hand-off takes.
+    public static let lead: TimeInterval = 60
+    /// The pace is measured over at least this long, so one reading rounded up a point does not count as a burst.
+    public static let minimumSpan: TimeInterval = 30
+    /// Readings older than this say little about the pace now.
+    public static let span: TimeInterval = 600
+    /// However fast the pace, a hand-off never starts more than this many points above the threshold.
+    public static let maxMargin: Double = 10
+
+    /// True when a window of `latest`, at the pace seen since the oldest of `earlier` within `span`, would reach
+    /// `threshold` within `lead`. Only readings of the same window count: one from before a reset says nothing about now.
+    public static func nearing(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], threshold: Double, at now: Date, lifetime: TimeInterval) -> Bool {
+        for (window, pick) in [(latest.fiveHour, \UsageSnapshot.fiveHour), (latest.sevenDay, \UsageSnapshot.sevenDay)] {
+            guard let remaining = latest.validRemaining(window, at: now, lifetime: lifetime) else { continue }
+            let base = earlier.filter {
+                let gap = latest.sampledAt.timeIntervalSince($0.sampledAt)
+                return gap >= minimumSpan && gap <= span && sameWindow($0[keyPath: pick], window)
+            }.min { $0.sampledAt < $1.sampledAt }
+            guard let base, let before = base[keyPath: pick]?.remaining else { continue }
+            let rate = (before - remaining) / latest.sampledAt.timeIntervalSince(base.sampledAt)
+            guard rate > 0 else { continue }
+            if remaining - min(maxMargin, rate * lead) <= threshold + 0.000001 { return true }
+        }
+        return false
+    }
+    /// An earlier reading with no reset time was taken before the window started, so it is the same window's start.
+    private static func sameWindow(_ earlier: UsageWindow?, _ latest: UsageWindow?) -> Bool {
+        guard let earlier, let latest else { return false }
+        guard let a = earlier.resetsAt else { return true }
+        guard let b = latest.resetsAt else { return false }
+        return abs(a.timeIntervalSince(b)) <= 600
+    }
+}
