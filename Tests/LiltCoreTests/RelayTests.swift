@@ -176,6 +176,11 @@ final class RelayTests {
     func testDuplicateEventClaimedOnce() {
         var latch = RelayLatch(); let id = UUID(); let s = snapshot(1, 1)
         expect(latch.claim(account: id, snapshot: s)); expectFalse(latch.claim(account: id, snapshot: s))
+        // A hand-off that never started gives the reading back; other readings are untouched.
+        let other = snapshot(1, 1, age: 5)
+        expect(latch.claim(account: id, snapshot: other))
+        latch.release(account: id, snapshot: s)
+        expect(latch.claim(account: id, snapshot: s)); expectFalse(latch.claim(account: id, snapshot: other))
     }
     func testRetryAfterAndAuthentication() {
         var backoff = Backoff(); backoff.fail(.rateLimited(120), at: now)

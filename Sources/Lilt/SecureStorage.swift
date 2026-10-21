@@ -8,6 +8,13 @@ struct AppFailure: LocalizedError {
     var errorDescription: String? { message }
     init(_ message: String) { self.message = message }
 }
+/// The scope could not be read just now: the keychain did not answer (it can stall around sleep and wake) or a file
+/// could not be opened. That says nothing about who is logged in, so it must never be taken for an outside change.
+struct ScopeUnreadable: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+    init(_ error: Error) { message = (error as? AppFailure)?.message ?? "读取失败，稍后重试。" }
+}
 struct Credential {
     var data: Data
     var object: [String: Any] { (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:] }
@@ -88,9 +95,10 @@ enum CLIKeychain {
         do { try process.run() } catch { throw AppFailure("无法访问钥匙串。") }
         if let input { try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8)) }
         try? stdin.fileHandleForWriting.close()
-        // A keychain waiting for the user to allow access would otherwise hold Lilt up indefinitely.
-        let deadline = Date.now.addingTimeInterval(wait)
-        while process.isRunning && Date.now < deadline { usleep(10_000) }
+        // A keychain waiting for the user to allow access would otherwise hold Lilt up indefinitely. The wait is measured
+        // on a clock that stops while the Mac sleeps: a read the system froze halfway through has not hung.
+        let deadline = DispatchTime.now() + wait
+        while process.isRunning && DispatchTime.now() < deadline { usleep(10_000) }
         if process.isRunning { process.terminate(); throw AppFailure("钥匙串没有响应，可能在等你允许访问。") }
         return (process.terminationStatus, output.fileHandleForReading.readDataToEndOfFile())
     }
@@ -219,7 +227,7 @@ final class RuntimeScope {
         guard try settingsFile.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
             throw AppFailure("Claude 用户配置是符号链接，未修改。")
         }
-        return try Data(contentsOf: settingsFile)
+        do { return try Data(contentsOf: settingsFile) } catch { throw ScopeUnreadable(AppFailure("Claude 用户配置暂时读不出来。")) }
     }
     func hasAPIOverride() throws -> Bool {
         guard let data = try readSettings() else { return false }
@@ -237,8 +245,10 @@ final class RuntimeScope {
     // The default login's item belongs to the CLI and is reached through its tool. The dedicated one keeps the
     // access it was created with, so existing setups do not start asking for keychain permission.
     private func keychainRead() throws -> Data? {
-        if let credentialAccess { return try credentialAccess.read() }
-        return target == .system ? try CLIKeychain.read(service: service) : try Keychain.read(service: service, account: NSUserName())
+        do {
+            if let credentialAccess { return try credentialAccess.read() }
+            return target == .system ? try CLIKeychain.read(service: service) : try Keychain.read(service: service, account: NSUserName())
+        } catch { throw ScopeUnreadable(error) }
     }
     private func keychainWrite(_ data: Data) throws {
         if let credentialAccess { try credentialAccess.write(data); return }
@@ -258,7 +268,7 @@ final class RuntimeScope {
     private func readFile() throws -> Data? {
         guard FileManager.default.fileExists(atPath: file.path) else { return nil }
         guard try file.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { throw AppFailure("作用域出现符号链接，已暂停。") }
-        return try Data(contentsOf: file)
+        do { return try Data(contentsOf: file) } catch { throw ScopeUnreadable(AppFailure("登录文件暂时读不出来。")) }
     }
     private func state() throws -> Stamp { try Stamp(file: digest(readFile()), keychain: digest(keychainRead())) }
     private func expected() throws -> Stamp? {
@@ -333,9 +343,16 @@ final class RuntimeScope {
         // On macOS the CLI reads the keychain; the fallback file is kept in step only where one already exists.
         let writesFile = target == .dedicated || oldFile != nil
         var pending = previous; pending.pending = true
+        let priorJournal = try? Data(contentsOf: journal)
         try Disk.write(JSONEncoder().encode(pending), to: journal)
-        // Verify the other writer has not changed anything during preparation.
-        guard try state() == previous, try readSettings() == oldSettings else { throw AppFailure("检测到并发登录配置变更，已暂停。") }
+        // Verify the other writer has not changed anything during preparation. Nothing has been written yet, so a refusal
+        // here puts the journal back as it was: there is no unfinished switch to inspect, only a change to look at.
+        do {
+            guard try state() == previous, try readSettings() == oldSettings else { throw AppFailure("检测到并发登录配置变更，已暂停。") }
+        } catch {
+            if let priorJournal { try? Disk.write(priorJournal, to: journal) } else { try? FileManager.default.removeItem(at: journal) }
+            throw error
+        }
         do {
             try keychainWrite(credential.data)
             guard digest(try readFile()) == previous.file else { throw AppFailure("检测到外部写入，已停止。") }

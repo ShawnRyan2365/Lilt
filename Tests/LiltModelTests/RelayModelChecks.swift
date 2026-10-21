@@ -76,10 +76,92 @@ import LiltCore
         let manualApplied = await api.apply(spare.id)
         precondition(manualApplied && !api.apiModeDetected && !api.keepsAPIMode && api.displayedActiveID == spare.id)
         try await autoSortChecks()
+        try await scopeWatchChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, automatic order. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, automatic order, scope reads that fail for a moment. No live credentials or requests.")
     }
+}
+
+/// How the live model watches the scope. A read that fails (the keychain stalls around sleep and wake) or a settings
+/// file caught mid-write must leave relay on; only a scope that provably holds another account stops it.
+/// Lilt's own files go under the fixture home the script sets; the scope is an in-memory credential store.
+@MainActor func scopeWatchChecks() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    precondition(home.path.contains("/work/"), "Run through scripts/check-relay-model.sh, which points the home directory at work/")
+    try SecureFiles.directory(home.appendingPathComponent(".claude"))
+    func document(_ access: String, refresh: String?) -> Data {
+        var login: [String: Any] = ["accessToken": access]
+        if let refresh { login["refreshToken"] = refresh }
+        return try! JSONSerialization.data(withJSONObject: ["claudeAiOauth": login])
+    }
+    func fresh(_ used: Double) -> UsageSnapshot { UsageSnapshot(fiveHour: UsageWindow(used: used), sevenDay: UsageWindow(used: 20)) }
+    var active = Account(label: "Fixture A", kind: .oauth); active.usage = fresh(30); active.usageCapability = .verified
+    var spare = Account(label: "Fixture B", kind: .oauth); spare.usage = fresh(10); spare.usageCapability = .verified
+    var library = Library()
+    library.accounts = [active, spare]; library.activeID = active.id
+    library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system
+    library.preferences.autoRelay = true; library.preferences.liveUsage = false
+    // Neither login can be renewed by Lilt or checked with the profile endpoint here: no expiry, and the identities
+    // settle every question locally, so no request is ever sent.
+    let mine = document("fixture-access-a", refresh: "fixture-refresh-a")
+    let theirs = document("fixture-access-b", refresh: "fixture-refresh-b")
+    try AccountVault.write(mine, account: active.id.uuidString)
+    try AccountVault.write(theirs, account: spare.id.uuidString)
+    try AccountVault.write(Data(#"{"accountUuid":"fixture-account-a"}"#.utf8), account: Keychain.identityAccount(active.id))
+    try AccountVault.write(Data(#"{"accountUuid":"fixture-account-b"}"#.utf8), account: Keychain.identityAccount(spare.id))
+    let config = home.appendingPathComponent(".claude.json")
+    try SecureFiles.write(Data(#"{"oauthAccount":{"accountUuid":"fixture-account-a"}}"#.utf8), to: config)
+
+    var held: Data? = mine
+    var failing: [Bool] = [] // one entry per keychain read, true = that read fails; empty = reads succeed
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        if !failing.isEmpty, failing.removeFirst() { throw AppFailure("钥匙串没有响应，可能在等你允许访问。") }
+        return held
+    }, write: { held = $0 }, delete: { held = nil }))
+    try scope.rebaseline()
+    let model = AppModel(fixture: library, runtime: scope)
+    precondition(model.autoRelay)
+    var settled: Bool
+
+    // The keychain does not answer: nothing is known, nothing changes, relay stays on.
+    failing = [true]
+    settled = await model.reconcileScope(); precondition(!settled)
+    precondition(model.autoRelay && model.scopeIssue == nil && model.library.preferences.autoRelayStopReason == nil)
+    precondition(model.notice() == nil, "A moment's failure is not worth a word")
+    precondition(model.notice(at: .now.addingTimeInterval(121))?.text == "暂时读不到默认登录", "One that lasts is")
+    settled = await model.reconcileScope(); precondition(settled && model.scopeUnreadable == nil)
+
+    // The CLI renewed the login, and the read that would take it in fails: wait, then take it in on the next pass.
+    let renewed = document("fixture-access-a2", refresh: "fixture-refresh-a2")
+    held = renewed
+    failing = [false, true]
+    settled = await model.reconcileScope(); precondition(!settled)
+    precondition(model.autoRelay && model.scopeIssue == nil)
+    settled = await model.reconcileScope(); precondition(settled && model.autoRelay)
+    let kept = try AccountVault.read(account: active.id.uuidString)
+    precondition(kept == renewed, "The renewal is kept for the account")
+
+    // A settings file caught mid-write by another tool reads as malformed. That waits too.
+    let settings = home.appendingPathComponent(".claude/settings.json")
+    try SecureFiles.write(Data(#"{"env":{"#.utf8), to: settings)
+    settled = await model.reconcileScope(); precondition(!settled)
+    precondition(model.autoRelay && model.library.preferences.autoRelayStopReason == nil)
+    try SecureFiles.write(Data("{}".utf8), to: settings)
+    settled = await model.reconcileScope(); precondition(settled)
+
+    // An automatic hand-off whose scope read fails right before writing leaves everything as it was, relay on.
+    failing = [false, true]
+    settled = await model.apply(spare.id, automatically: true); precondition(!settled)
+    precondition(model.autoRelay && model.active?.id == active.id && held == renewed && !scope.transactionPending)
+    settled = await model.apply(spare.id, automatically: true); precondition(settled && model.active?.id == spare.id)
+    precondition(held == theirs)
+
+    // Another Claude account in the scope still stops relay and asks the user.
+    held = document("fixture-access-c", refresh: nil)
+    try SecureFiles.write(Data(#"{"oauthAccount":{"accountUuid":"fixture-account-c"}}"#.utf8), to: config)
+    settled = await model.reconcileScope(); precondition(!settled)
+    precondition(!model.autoRelay && model.scopeIssue != nil && model.library.preferences.autoRelayStopReason != nil)
 }
 
 /// Sorting changes only the order the model shows and relays in. The user's own arrangement survives it, and a
@@ -189,6 +271,17 @@ func runtimeChecks() throws {
     expectFailure { try scope.apply(subscription) }
     try scope.apply(subscription, replacingExternalState: true)
     try scope.check()
+    // Another writer that gets in after preparation but before anything is written: refused, and no unfinished switch
+    // is left behind, because nothing was written.
+    var reads = 0
+    let racing = Data(#"{"claudeAiOauth":{"accessToken":"fixture-racing"}}"#.utf8)
+    let raced = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        reads += 1
+        return reads > 4 ? racing : held // reads 1–4 prepare the switch; read 5 verifies before writing
+    }, write: { held = $0 }, delete: { held = nil }))
+    let before = held
+    expectFailure { try raced.apply(Credential(data: external)) }
+    precondition(reads == 5 && held == before && !raced.transactionPending)
     let malformed = Data("not-json".utf8)
     try SecureFiles.write(malformed, to: settings)
     held = external

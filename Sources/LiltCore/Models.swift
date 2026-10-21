@@ -233,13 +233,17 @@ public enum RelayOrder {
         }.map(\.account)
     }
 }
-/// A trigger remains consumed even if applying fails. Explicit rearming requires a new observation.
+/// A trigger remains consumed once a hand-off has started, even if it fails. Only a hand-off that never touched the
+/// scope gives its trigger back, so the same reading can try again on the next pass.
 public struct RelayLatch: Sendable {
     private var consumed: Set<String> = []
     public init() {}
+    private static func key(_ account: UUID, _ snapshot: UsageSnapshot) -> String { "\(account):\(snapshot.sampledAt.timeIntervalSince1970)" }
     public mutating func claim(account: UUID, snapshot: UsageSnapshot) -> Bool {
-        let key = "\(account):\(snapshot.sampledAt.timeIntervalSince1970)"
-        return consumed.insert(key).inserted
+        consumed.insert(Self.key(account, snapshot)).inserted
+    }
+    public mutating func release(account: UUID, snapshot: UsageSnapshot) {
+        consumed.remove(Self.key(account, snapshot))
     }
 }
 public enum UsageFailure: Error, Equatable, Sendable {

@@ -69,6 +69,10 @@ final class AppModel {
     /// Advanced by the monitor so time-dependent views (staleness, backoff) re-evaluate without their own timers.
     private(set) var clock = Date.now
     private(set) var scopeIssue: String?
+    /// Why the scope could not be read on the last pass, and since when. Nothing is known to be wrong meanwhile, so
+    /// relay stays on and nothing is written until a pass reads it again.
+    private(set) var scopeUnreadable: String?
+    private var scopeUnreadableSince: Date?
     private(set) var relayPause: String?
     private(set) var apiModeDetected = false
     var keepsAPIMode: Bool { library.preferences.keepAPIMode == true }
@@ -78,7 +82,8 @@ final class AppModel {
     /// Where the selected account's login goes. Files from before there was a choice always meant Lilt's own directory;
     /// anything set up now takes over Claude Code's default login.
     var scopeTarget: ScopeTarget { library.preferences.scopeTarget ?? (library.preferences.scopeEnabled ? .dedicated : .system) }
-    var runtime: RuntimeScope { RuntimeScope(target: scopeTarget) }
+    var runtime: RuntimeScope { fixtureRuntime ?? RuntimeScope(target: scopeTarget) }
+    private var fixtureRuntime: RuntimeScope?
     /// Lilt is putting logins into Claude Code's default login, so a plain `claude` in any terminal uses them.
     var managesDefaultLogin: Bool { library.preferences.scopeEnabled && scopeTarget == .system }
     /// What the place Lilt writes to is called on screen.
@@ -137,6 +142,14 @@ final class AppModel {
         self.retryClock = retryClock
         demo = true
         self.library = library
+        restoreRelayPreference()
+    }
+    /// A live model whose scope is an in-memory fixture, for regression checks of how the scope is watched. Lilt's own
+    /// files still go under `Disk.root`, so the caller must point the home directory at a fixture first.
+    init(fixture library: Library, runtime: RuntimeScope) {
+        retryClock = { .now }
+        self.library = library
+        fixtureRuntime = runtime
         restoreRelayPreference()
     }
     private func restoreRelayPreference() {
@@ -247,13 +260,15 @@ final class AppModel {
         return "\(autoRelay ? "等待" : "已停止")：\(relayPause)"
     }
     /// The monitor only observes API settings. It never clears them without a manual account selection.
+    /// True when Lilt must not write this pass: API mode, or a settings file that could not be read. Another tool
+    /// writing the file in place can be caught halfway, so that waits for the next pass rather than stopping relay.
     @discardableResult private func checkAPIMode() -> Bool {
         do { observeAPIMode(try runtime.hasAPIOverride()); return apiModeDetected }
-        catch {
-            scopeIssue = (error as? AppFailure)?.message ?? "无法读取 Claude 登录配置。"
-            stopRelay(because: scopeIssue!)
-            return true
-        }
+        catch { noteUnreadable(error); return true }
+    }
+    private func noteUnreadable(_ error: Error) {
+        if scopeUnreadableSince == nil { scopeUnreadableSince = .now; status = "暂时读不到\(scopeName)，稍后重试" }
+        scopeUnreadable = (error as? LocalizedError)?.errorDescription ?? "读取失败，稍后重试。"
     }
     func observeAPIMode(_ detected: Bool) {
         guard detected != apiModeDetected else { return }
@@ -416,29 +431,37 @@ final class AppModel {
     }
     /// Compare the scope with what Lilt last wrote there. A renewal by the official CLI is taken in silently when it is
     /// provably the same login; anything else stops automatic work and waits for the user. True when the scope is in order.
+    /// Only what was actually read can stop relay. A read that failed (the keychain stalls around sleep and wake) is
+    /// tried again on the next pass; earlier versions took it for an outside change and switched relay off.
     @discardableResult
-    private func reconcileScope() async -> Bool {
+    func reconcileScope() async -> Bool {
         guard !demo, library.preferences.scopeEnabled, let active else { return true }
         if checkAPIMode() || keepsAPIMode { return false }
-        do { try runtime.check(); scopeIssue = nil; return true }
+        do { try runtime.check() }
+        catch let failure as ScopeUnreadable { noteUnreadable(failure); return false }
         catch {
             switch await readBack(into: active) {
-            case .adopt, .unchanged: scopeIssue = nil; return true
-            case nil: return false // could not tell this time (no network); look again on the next pass
+            case .adopt, .unchanged: break
+            case nil: return false // could not tell this time (no network, or the scope did not read); look again on the next pass
             case .unverifiable, .foreign:
                 stopRelay(because: "无法确认当前登录仍属于所选账号，请到“接入”检查并决定采纳还是改回。")
                 scopeIssue = (error as? AppFailure)?.message ?? "登录检查失败。"; status = "\(scopeName)被别处改了，管理已暂停"
                 return false
             }
         }
+        scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil
+        return true
     }
     /// What the scope holds relative to `account`'s stored login, taking it in when it is the same login renewed.
     /// The CLI's own note of who is logged in is checked first, as ORCA does; when that cannot settle it, the official
     /// profile endpoint is asked. Nil when the question could not be answered at all.
     private func readBack(into account: Account) async -> OAuthDocument.ReadBack? {
-        guard !runtime.transactionPending,
-              let stored = (try? storedSecret(account.id.uuidString)) ?? nil,
-              let found = (try? runtime.currentCredential()) ?? nil, (try? found.validate()) != nil else { return .unverifiable }
+        guard !runtime.transactionPending, let stored = (try? storedSecret(account.id.uuidString)) ?? nil else { return .unverifiable }
+        let held: Credential?
+        do { held = try runtime.currentCredential() }
+        catch let failure as ScopeUnreadable { noteUnreadable(failure); return nil }
+        catch { return .unverifiable }
+        guard let found = held, (try? found.validate()) != nil else { return .unverifiable }
         let mine = OAuthDocument.Identity(oauthAccount: identity(for: account.id))
         var verdict = OAuthDocument.readBack(stored: stored, runtime: found.data, storedIdentity: mine,
                                              runtimeIdentity: .init(oauthAccount: runtime.readIdentity()))
@@ -456,6 +479,9 @@ final class AppModel {
                 failures[account.id] = nil; backoffs[account.id] = nil; status = "已同步官方 CLI 续期的凭据"
             }
             return verdict
+        } catch let failure as ScopeUnreadable {
+            // What was taken in is already saved; the next pass finds it unchanged and records the baseline then.
+            noteUnreadable(failure); return nil
         } catch { return .unverifiable }
     }
     static func wait(until date: Date, from now: Date = .now) -> String {
@@ -523,13 +549,24 @@ final class AppModel {
         defer { busy = false }
         do {
             if !demo {
-                // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
-                if (try? runtime.hasAPIOverride()) == false, (try? runtime.check()) == nil,
-                   let leaving = active, leaving.id != id { _ = await readBack(into: leaving) }
                 let credential: Credential
                 // A network hiccup is no reason to refuse: the CLI can renew an expired login itself.
                 do { credential = try await renewedCredential(for: id) } catch UsageFailure.network { credential = try self.credential(for: id) }
-                try runtime.apply(credential, replacingExternalState: !automatically)
+                if automatically {
+                    // The CLI may have renewed the login in use while the other accounts were being read. Take that in
+                    // right before writing. What cannot be settled now is left as it is for the next pass, which stops
+                    // relay only when the scope provably holds something else.
+                    guard await reconcileScope() else { return false }
+                } else if (try? runtime.hasAPIOverride()) == false, (try? runtime.check()) == nil, let leaving = active, leaving.id != id {
+                    // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
+                    _ = await readBack(into: leaving)
+                }
+                do { try runtime.apply(credential, replacingExternalState: !automatically) }
+                catch _ where automatically && !runtime.transactionPending {
+                    // Nothing was written: the scope changed or did not read in the moment since it was checked.
+                    // The next pass looks again, and relay stays on.
+                    status = "接力稍后重试"; return false
+                }
                 try? runtime.writeIdentity(identity(for: id))
             }
             library.activeID = id; appliedPending = !demo; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
@@ -758,6 +795,9 @@ final class AppModel {
             if await apply(id, automatically: true) {
                 departedID = active.id; departedAt = .now
                 if !demo { lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)" }
+            } else if autoRelay, demo || !runtime.transactionPending {
+                // The hand-off never started, so this reading may try again on the next pass rather than wait for a new one.
+                latch.release(account: active.id, snapshot: snapshot)
             }
         case .pause(let reason):
             // An early look that finds nobody must not stop relay: the account in use still has room.
@@ -808,6 +848,10 @@ final class AppModel {
             guard let active else { return Notice(symbol: "exclamationmark.triangle", text: "\(scopeName)管理已暂停", detail: scopeIssue, warning: true, action: .openScope) }
             let cause = scopeTarget == .system ? "可能是 ORCA、/login 或别的工具换了账号。" : ""
             return Notice(symbol: "exclamationmark.triangle", text: "\(scopeName)被别处改了", detail: "\(cause)Lilt 没法确认它还是“\(active.label)”。在终端运行 claude 后用 /status 看是谁，再决定采纳还是改回。", warning: true, action: .adoptScope)
+        }
+        // A read can fail for a moment around sleep and wake; only one that lasts is worth a word.
+        if library.preferences.scopeEnabled, let scopeUnreadable, let since = scopeUnreadableSince, now.timeIntervalSince(since) >= 120 {
+            return Notice(symbol: "hourglass", text: "暂时读不到\(scopeName)", detail: "\(scopeUnreadable)Lilt 会继续重试\(autoRelay ? "，自动接力保持开启" : "")。", warning: true)
         }
         guard let active else {
             return accounts.isEmpty ? nil : Notice(symbol: "person.crop.circle.badge.questionmark", text: "尚未切换到任何账号", detail: "在账号列表里选择一个，点“切换”。")
