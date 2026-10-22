@@ -787,9 +787,11 @@ final class AppModel {
         // older than the switch, or its windows reset at other times than this account's.
         guard live.sampledAt > lastSwitchAt, now.timeIntervalSince(live.sampledAt) < 600,
               let known = active.usage, live.sampledAt > known.sampledAt, live.sharesWindows(with: known, at: now) else { return }
-        update(active.id) { $0.usage = live; $0.usageCapability = .verified; $0.issue = nil }
+        // An idle session reports what it saw at its own last request; a lower figure than Lilt has is older, not news.
+        let reading = live.keepingHigher(than: known)
+        update(active.id) { $0.usage = reading; $0.usageCapability = .verified; $0.issue = nil }
         if failures[active.id] != nil { failures[active.id] = nil }
-        notePace(live, for: active.id)
+        notePace(reading, for: active.id)
         // A session reporting this account's quota after the switch is using the new login, so the note that Lilt cannot
         // see whether sessions followed has nothing left to say. Sessions still on the previous account are not counted.
         if appliedPending { appliedPending = false }

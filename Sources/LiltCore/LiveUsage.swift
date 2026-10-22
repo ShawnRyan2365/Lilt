@@ -36,6 +36,23 @@ public extension UsageSnapshot {
         }
         return compared
     }
+    /// This reading, with any window that `earlier` already saw further used kept at the earlier figure. Quota spent in
+    /// a window does not come back before the window resets, so a lower figure for the same window is a session telling
+    /// what it saw at its own last request. Idle sessions hand their status line over whenever they redraw, and with
+    /// several sessions open such figures arrive between fresh ones all the time (on 2026-10-23: 73, then 57, then 74).
+    /// Taken as they came, they made the account look emptier than it was and broke the pace that starts a hand-off early.
+    func keepingHigher(than earlier: UsageSnapshot, tolerance: TimeInterval = 600) -> UsageSnapshot {
+        func merged(_ mine: UsageWindow?, _ theirs: UsageWindow?) -> UsageWindow? {
+            guard var mine, let theirs, let a = mine.resetsAt, let b = theirs.resetsAt,
+                  abs(a.timeIntervalSince(b)) <= tolerance, theirs.used > mine.used else { return mine }
+            mine.used = theirs.used
+            return mine
+        }
+        var result = self
+        result.fiveHour = merged(fiveHour, earlier.fiveHour)
+        result.sevenDay = merged(sevenDay, earlier.sevenDay)
+        return result
+    }
 }
 
 /// How fast the account in use is being spent, so a hand-off can start before the threshold instead of after it.

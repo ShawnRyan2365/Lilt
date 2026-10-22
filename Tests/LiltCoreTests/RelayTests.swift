@@ -172,6 +172,16 @@ final class RelayTests {
         // Nothing left to compare: not accepted.
         let blind = UsageSnapshot(fiveHour: UsageWindow(used: 20), sevenDay: nil, sampledAt: now)
         expectFalse(live.sharesWindows(with: blind, at: now))
+        // A session idle since its last request reports a lower figure for the same window than Lilt already has: the
+        // higher one is kept, with the newer reading's time and reset. A higher figure is news and stands as it is.
+        let seen = UsageSnapshot(fiveHour: UsageWindow(used: 73, resetsAt: now.addingTimeInterval(3540)), sevenDay: UsageWindow(used: 30, resetsAt: now.addingTimeInterval(300000)), sampledAt: now.addingTimeInterval(-3))
+        let kept = live.keepingHigher(than: seen)
+        expectEqual(kept.fiveHour?.used, 73); expectEqual(kept.sevenDay?.used, live.sevenDay?.used)
+        expectEqual(kept.sampledAt, live.sampledAt); expectEqual(kept.fiveHour?.resetsAt, live.fiveHour?.resetsAt)
+        expectEqual(live.keepingHigher(than: known).fiveHour?.used, 23.5)
+        // A window that has reset is a new one, and without reset times there is nothing to tell the windows apart by.
+        expectEqual(live.keepingHigher(than: rolled).fiveHour?.used, 23.5)
+        expectEqual(live.keepingHigher(than: blind).fiveHour?.used, 23.5)
     }
     func testDuplicateEventClaimedOnce() {
         var latch = RelayLatch(); let id = UUID(); let s = snapshot(1, 1)
