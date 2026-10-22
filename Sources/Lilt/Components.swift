@@ -53,6 +53,7 @@ enum QuotaWindowKind: CaseIterable, Sendable {
     var length: TimeInterval { self == .fiveHour ? 5 * 3600 : 7 * 86400 }
     var series: Paint { self == .fiveHour ? Tokens.fiveHour : Tokens.sevenDay }
     func window(in snapshot: UsageSnapshot?) -> UsageWindow? { self == .fiveHour ? snapshot?.fiveHour : snapshot?.sevenDay }
+    func threshold(in thresholds: Thresholds) -> Double { self == .fiveHour ? thresholds.fiveHour : thresholds.sevenDay }
 }
 struct UsageMeter: View {
     let kind: QuotaWindowKind
@@ -98,11 +99,11 @@ struct WindowGlance: Equatable {
     /// started, and one past its reset is back at the start; otherwise an unknown reset time leaves it nil.
     var elapsed: Double?
 
-    init(kind: QuotaWindowKind, snapshot: UsageSnapshot, threshold: Double, now: Date) {
+    init(kind: QuotaWindowKind, snapshot: UsageSnapshot, thresholds: Thresholds, now: Date) {
         self.kind = kind
         let window = kind.window(in: snapshot)
         remaining = snapshot.lastKnownRemaining(window, at: now)
-        level = QuotaLevel(remaining: remaining, threshold: threshold)
+        level = QuotaLevel(remaining: remaining, threshold: kind.threshold(in: thresholds))
         resetsAt = window?.resetsAt
         if let reset = window?.resetsAt {
             elapsed = reset <= now ? 0 : min(1, max(0, 1 - reset.timeIntervalSince(now) / kind.length))
@@ -128,19 +129,21 @@ struct WindowGlance: Equatable {
 struct QuotaSummary {
     /// Both windows, 5-hour first. Empty when nothing has been read.
     var windows: [WindowGlance] = []
-    /// The state of the window with the least left: it runs out first, and it is the one the relay rule acts on.
+    /// The most pressing state of the two windows, each against its own threshold: at the threshold before low.
     var state: UsageState?
     var spoken: String
     /// The same state as an expression for the account's sprite.
     var mood: Mood = .idle
     var stale: Bool { state?.isOld == true }
 
-    init(snapshot: UsageSnapshot?, threshold: Double, now: Date) {
+    init(snapshot: UsageSnapshot?, thresholds: Thresholds, now: Date) {
         guard let snapshot else { spoken = "尚未获取额度"; return }
-        windows = QuotaWindowKind.allCases.map { WindowGlance(kind: $0, snapshot: snapshot, threshold: threshold, now: now) }
+        windows = QuotaWindowKind.allCases.map { WindowGlance(kind: $0, snapshot: snapshot, thresholds: thresholds, now: now) }
         spoken = windows.map(\.spoken).joined(separator: "，")
-        guard let tight = windows.compactMap(\.remaining).min() else { return }
-        state = UsageState(shown: tight, sampledAt: snapshot.sampledAt, threshold: threshold, now: now)
+        let states = windows.compactMap { glance in
+            glance.remaining.flatMap { UsageState(shown: $0, sampledAt: snapshot.sampledAt, threshold: glance.kind.threshold(in: thresholds), now: now) }
+        }
+        state = states.first(where: \.isOld) ?? states.first { $0 == .reached } ?? states.first { $0 == .low }
         mood = state == .reached ? .asleep : state == .low ? .drowsy : .idle
         if let state { spoken += "，" + state.text }
     }
@@ -166,7 +169,7 @@ extension AppModel {
         let now = max(clock, .now)
         let slots = spriteSlots
         return accounts.map { account in
-            let summary = QuotaSummary(snapshot: account.usage, threshold: threshold, now: now)
+            let summary = QuotaSummary(snapshot: account.usage, thresholds: thresholds, now: now)
             let blocked = !account.enabled ? "已停用" : account.usage == nil && account.usageCapability == .unavailable ? "读不到" : nil
             let stale = summary.stale ? summary.state?.text : nil
             func reading(_ kind: QuotaWindowKind) -> RingReading {
@@ -184,7 +187,7 @@ extension AppModel {
     /// Each account's sprite silhouette.
     var spriteSlots: [UUID: Int] { Sprite.slots(for: accounts.map(\.id)) }
     func spriteSlot(_ id: UUID) -> Int { spriteSlots[id] ?? Sprite.slot(for: id) }
-    func mood(of account: Account) -> Mood { QuotaSummary(snapshot: account.usage, threshold: threshold, now: max(clock, .now)).mood }
+    func mood(of account: Account) -> Mood { QuotaSummary(snapshot: account.usage, thresholds: thresholds, now: max(clock, .now)).mood }
 }
 /// Drag-and-drop reordering of an account row, left off entirely while the order is sorted automatically.
 struct Reorderable: ViewModifier {
@@ -348,7 +351,7 @@ struct AccountRow: View {
         return [account.kind.title, usage, model.demo ? "演示能力" : "热切换待验证"].joined(separator: " · ")
     }
     var body: some View {
-        let summary = QuotaSummary(snapshot: account.usage, threshold: model.threshold, now: max(model.clock, .now))
+        let summary = QuotaSummary(snapshot: account.usage, thresholds: model.thresholds, now: max(model.clock, .now))
         HStack(spacing: AccountColumns.spacing) {
             // While sorting is on the handle stays out of sight but keeps its width, so the columns do not shift.
             Image(systemName: "line.3.horizontal").font(.system(size: 11, weight: .medium)).foregroundStyle(Tokens.faint)
@@ -418,7 +421,7 @@ struct AccountRow: View {
                     .frame(width: AccountColumns.cell)
             } else {
                 ForEach(summary.windows, id: \.name) { window in
-                    QuotaCell(remaining: window.remaining, caption: window.caption, threshold: model.threshold, series: window.kind.series, dimmed: dimmed)
+                    QuotaCell(remaining: window.remaining, caption: window.caption, threshold: window.kind.threshold(in: model.thresholds), series: window.kind.series, dimmed: dimmed)
                         .frame(width: AccountColumns.cell)
                         .help(window.spoken)
                 }

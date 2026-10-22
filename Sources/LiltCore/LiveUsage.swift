@@ -72,8 +72,8 @@ public enum UsagePace {
     /// the oldest of `earlier` within `span`, and the one since the most recent reading at least `minimumSpan` older.
     /// The long one alone lags a burst: several sessions starting at once on an account that sat idle for minutes.
     /// Only readings of the same window count: one from before a reset says nothing about now.
-    public static func nearing(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], threshold: Double, at now: Date, lifetime: TimeInterval) -> Bool {
-        for (window, pick) in [(latest.fiveHour, \UsageSnapshot.fiveHour), (latest.sevenDay, \UsageSnapshot.sevenDay)] {
+    public static func nearing(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], threshold: Thresholds, at now: Date, lifetime: TimeInterval) -> Bool {
+        for (window, pick, limit) in [(latest.fiveHour, \UsageSnapshot.fiveHour, threshold.fiveHour), (latest.sevenDay, \UsageSnapshot.sevenDay, threshold.sevenDay)] {
             guard let remaining = latest.validRemaining(window, at: now, lifetime: lifetime) else { continue }
             let bases = earlier.filter {
                 let gap = latest.sampledAt.timeIntervalSince($0.sampledAt)
@@ -84,7 +84,7 @@ public enum UsagePace {
                 return (before - remaining) / latest.sampledAt.timeIntervalSince(base.sampledAt)
             }.max()
             guard let rate, rate > 0 else { continue }
-            if remaining - min(maxMargin, rate * lead) <= threshold + 0.000001 { return true }
+            if remaining - min(maxMargin, rate * lead) <= limit + 0.000001 { return true }
         }
         return false
     }

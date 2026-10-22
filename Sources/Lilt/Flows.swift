@@ -268,22 +268,17 @@ struct ScopeView: View {
 }
 struct SettingsView: View {
     @Bindable var model: AppModel
-    private var threshold: Binding<Double> { Binding(get: { model.threshold }, set: { model.setThreshold($0) }) }
+    private var fiveHourThreshold: Binding<Double> { Binding(get: { model.thresholds.fiveHour }, set: { model.setFiveHourThreshold($0) }) }
+    private var sevenDayThreshold: Binding<Double> { Binding(get: { model.thresholds.sevenDay }, set: { model.setSevenDayThreshold($0) }) }
     private var shortcut: Binding<UInt32> {
         Binding(get: { model.library.preferences.shortcutKey }, set: { model.setShortcut($0); AppDelegate.shared?.registerShortcut() })
     }
     var body: some View {
         Form {
             Section {
-                LabeledContent("接力阈值") {
-                    HStack(spacing: 6) {
-                        TextField("接力阈值", value: threshold, format: .number.precision(.fractionLength(0...1)))
-                            .labelsHidden().multilineTextAlignment(.trailing).frame(width: 56)
-                        Text("%").foregroundStyle(.secondary)
-                        Stepper("接力阈值", value: threshold, in: 0...20, step: 0.5).labelsHidden()
-                    }
-                }
-            } footer: { Text("默认 1%，可设 0–20%。任一有效窗口的剩余额度达到阈值即触发；未知额度不作为可用候选。") }
+                thresholdRow("5 小时阈值", fiveHourThreshold)
+                thresholdRow("7 天阈值", sevenDayThreshold)
+            } footer: { Text("默认都是 1%，可设 0–20%。任一窗口的剩余额度到了它的阈值就换号；用得快时，按消耗速度最多再提前 10 个百分点。未知额度不作为可用候选。") }
             Section {
                 LabeledContent("先用快重置的周额度") {
                     LiquidToggle(label: "先用快重置的周额度", isOn: Binding(get: { model.soonerWeekly }, set: { model.setSoonerWeekly($0) }), width: 44)
@@ -311,6 +306,16 @@ struct SettingsView: View {
                 }
             }
         }.formStyle(.grouped).tint(Tokens.accentTint)
+    }
+    private func thresholdRow(_ title: String, _ value: Binding<Double>) -> some View {
+        LabeledContent(title) {
+            HStack(spacing: 6) {
+                TextField(title, value: value, format: .number.precision(.fractionLength(0...1)))
+                    .labelsHidden().multilineTextAlignment(.trailing).frame(width: 56)
+                Text("%").foregroundStyle(.secondary)
+                Stepper(title, value: value, in: 0...20, step: 0.5).labelsHidden()
+            }
+        }
     }
 }
 /// The menu bar panel: the same three things as the window, at a glance — who, how much, who next.
@@ -343,8 +348,8 @@ struct MenuPanel: View {
             if let active = model.active {
                 HStack(alignment: .top, spacing: 20) {
                     let unreadable = active.usageCapability == .unavailable
-                    UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable, compact: true)
-                    UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable, compact: true)
+                    UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.thresholds.fiveHour, unreadable: unreadable, compact: true)
+                    UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.thresholds.sevenDay, unreadable: unreadable, compact: true)
                 }
             } else if model.accounts.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
@@ -374,7 +379,7 @@ struct MenuPanel: View {
                         Text(explanation).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3).help(explanation)
                     }
                 }
-                .help("剩余 ≤\(model.threshold.formatted())% 时换下一个")
+                .help(model.handOffRule)
                 Spacer()
                 LiquidToggle(label: "自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }), width: 44)
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")

@@ -406,6 +406,42 @@ final class RelayTests {
         expectEqual(live.nextRead(known, leaving: active, asked: [], readable: { $0 != truth[2].id }, at: now)?.label, "Fixture E")
         expectEqual(live.nextRead(fresh, leaving: active, asked: [], readable: { _ in false }, at: now), nil)
     }
+    /// Each window has its own threshold. Files written before keep one figure for both, and a literal still sets both.
+    func testEachWindowHasItsOwnThreshold() throws {
+        expectEqual(Thresholds(5), Thresholds(fiveHour: 5, sevenDay: 5)); expectEqual(Thresholds(fiveHour: -1, sevenDay: 120), Thresholds(fiveHour: 0, sevenDay: 100))
+        let old = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":5,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8))
+        expectEqual(old.thresholds, Thresholds(5))
+        var apart = old; apart.threshold = 15; apart.weeklyThreshold = 5
+        expectEqual(try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(apart)).thresholds, Thresholds(fiveHour: 15, sevenDay: 5))
+        let t = Thresholds(fiveHour: 15, sevenDay: 5)
+        expect(snapshot(14, 50).exhausted(threshold: t, at: now)); expect(snapshot(60, 4).exhausted(threshold: t, at: now))
+        expectFalse(snapshot(16, 6).exhausted(threshold: t, at: now)); expect(snapshot(16, 6).available(threshold: t, at: now))
+        // A hand-off measures each window against its own figure: 14% left on the 5-hour window is out at 15%, while 6%
+        // left on the weekly one is still above 5%.
+        let live = RelayPolicy(threshold: t, allowUnverifiedHotSwitch: true)
+        var active = Account(label: "Fixture A", kind: .oauth); active.usage = snapshot(15, 40)
+        var thin = Account(label: "Fixture B", kind: .oauth); thin.usage = snapshot(14, 90)
+        var weekly = Account(label: "Fixture C", kind: .oauth); weekly.usage = snapshot(100, 6)
+        expectEqual(live.decide(active: active, candidates: [thin, weekly], at: now), .select(weekly.id))
+        expectEqual(live.obstacle(for: thin, at: now), "额度不足或不完整")
+        // Ahead of the threshold, the account taken must be further above its thresholds than the one left: 20% on the
+        // 5-hour window is 5 points above 15%, so an account whose weekly window is 1 point above 5% does not qualify.
+        active.usage = snapshot(20, 40)
+        guard case .pause = live.decide(active: active, candidates: [weekly], at: now, ahead: true) else { fatalError("Expected pause") }
+        weekly.usage = snapshot(100, 30)
+        expectEqual(live.decide(active: active, candidates: [weekly], at: now, ahead: true), .select(weekly.id))
+        // The early hand-off counts toward each window's own threshold: four points a minute from 20% reaches 15%.
+        let reading = { (left: Double, ago: TimeInterval) in
+            UsageSnapshot(fiveHour: UsageWindow(used: 100 - left, resetsAt: self.now.addingTimeInterval(3600)), sevenDay: UsageWindow(used: 60, resetsAt: self.now.addingTimeInterval(86400)), sampledAt: self.now.addingTimeInterval(-ago))
+        }
+        expect(UsagePace.nearing(reading(19, 0), after: [reading(23, 60)], threshold: t, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(reading(19, 0), after: [reading(23, 60)], threshold: 5, at: now, lifetime: 300))
+        // Retry after a pause waits for the window that is at its own threshold.
+        var waiting = Account(label: "Fixture D", kind: .oauth)
+        waiting.usage = UsageSnapshot(fiveHour: UsageWindow(used: 86, resetsAt: now.addingTimeInterval(900)), sevenDay: UsageWindow(used: 50, resetsAt: now.addingTimeInterval(86400)), sampledAt: now)
+        expectEqual(live.nextReset(of: [waiting], at: now), now.addingTimeInterval(900))
+        expectEqual(RelayPolicy(threshold: 5).nextReset(of: [waiting], at: now), nil)
+    }
     /// After a pause the next try is timed to the first account that gets its quota back.
     func testRetryWaitsForTheFirstReset() {
         let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
@@ -574,12 +610,13 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testHandOffConfirmsTheAccountItTakes()
         suite.testHandOffReadsTheTargetAndMovesOnWhenItWasSpent()
         suite.testRetryWaitsForTheFirstReset()
+        try suite.testEachWindowHasItsOwnThreshold()
         suite.testPaceStartsTheHandOffAhead()
         suite.testUpdateVersionsCompareNumerically()
         try suite.testUpdateFeedOffersOnlyAMatchingNewerRelease()
         suite.testUpdateInstallBoundaries()
         try storageChecks()
-        print("PASS: 28 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, pace ahead of the threshold, update versions, update feed, update boundaries")
+        print("PASS: 29 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries")
     }
 }
 

@@ -76,12 +76,19 @@ import LiltCore
         precondition(!automaticApplied && api.keepsAPIMode)
         let manualApplied = await api.apply(spare.id)
         precondition(manualApplied && !api.apiModeDetected && !api.keepsAPIMode && api.displayedActiveID == spare.id)
+        // Settings changes one window's threshold at a time; the other keeps the figure it had.
+        let tuned = AppModel(preview: source)
+        precondition(tuned.thresholds == Thresholds(1))
+        tuned.setFiveHourThreshold(15)
+        precondition(tuned.thresholds == Thresholds(fiveHour: 15, sevenDay: 1) && tuned.handOffRule.contains("5 小时剩余 ≤15%"))
+        tuned.setSevenDayThreshold(3); tuned.setFiveHourThreshold(40)
+        precondition(tuned.thresholds == Thresholds(fiveHour: 20, sevenDay: 3), "Both stay within 0–20%")
         try await pauseChecks()
         try await autoSortChecks()
         try await scopeWatchChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope reads that fail for a moment, the signal file for running CLIs. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope reads that fail for a moment, the signal file for running CLIs, a threshold per window. No live credentials or requests.")
     }
 }
 

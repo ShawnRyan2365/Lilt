@@ -188,7 +188,13 @@ final class AppModel {
     /// Looked up in the stored list: the order does not matter here, and sorting on every lookup was most of its cost.
     var active: Account? { library.accounts.first { $0.id == library.activeID } }
     var enabledCount: Int { accounts.filter(\.enabled).count }
-    var threshold: Double { library.preferences.threshold }
+    var thresholds: Thresholds { library.preferences.thresholds }
+    /// When relay hands off, in the words the overview and the panel use.
+    var handOffRule: String {
+        let t = thresholds
+        if t.fiveHour == t.sevenDay { return "剩余 ≤\(t.fiveHour.formatted())% 时换下一个" }
+        return "5 小时剩余 ≤\(t.fiveHour.formatted())% 或 7 天剩余 ≤\(t.sevenDay.formatted())% 时换下一个"
+    }
     /// Off unless the user turns it on. Nil in an older preferences file means off.
     var soonerWeekly: Bool { library.preferences.soonerWeekly == true }
     /// Off unless the user turns it on. Nil in an older preferences file means off.
@@ -235,7 +241,11 @@ final class AppModel {
         change(&library.preferences)
         if demo, var real = savedLibrary { change(&real.preferences); savedLibrary = real; persist(real) } else { save() }
     }
-    func setThreshold(_ value: Double) { updatePreferences { $0.threshold = min(20, max(0, value)) } }
+    // Setting one keeps the other where it was: until now files without a weekly figure used the 5-hour one for both.
+    func setFiveHourThreshold(_ value: Double) {
+        updatePreferences { $0.weeklyThreshold = $0.weeklyThreshold ?? $0.threshold; $0.threshold = min(20, max(0, value)) }
+    }
+    func setSevenDayThreshold(_ value: Double) { updatePreferences { $0.weeklyThreshold = min(20, max(0, value)) } }
     /// The two cannot both be on. Sorting keeps an account until it reaches the threshold; the weekly preference
     /// would hand it off while it still has room.
     func setSoonerWeekly(_ on: Bool) { updatePreferences { $0.soonerWeekly = on; if on { $0.autoSort = false } } }
@@ -845,7 +855,7 @@ final class AppModel {
     func simulateThreshold() async {
         guard demo, let id = active?.id else { return }
         touchDemoSamples()
-        let used = 100 - threshold // read before `update` takes exclusive access to the library
+        let used = 100 - thresholds.fiveHour // read before `update` takes exclusive access to the library
         update(id) {
             let old = $0.usage
             $0.usage = UsageSnapshot(fiveHour: UsageWindow(used: used, resetsAt: old?.fiveHour?.resetsAt), sevenDay: UsageWindow(used: old?.sevenDay?.used ?? 45, resetsAt: old?.sevenDay?.resetsAt), source: "本地演示数据")
@@ -860,17 +870,17 @@ final class AppModel {
         // for five minutes. The hand-off has to be allowed to start from that reading for the whole five
         // minutes. An endpoint reading is only acted on while it is still the just-queried minute.
         let lifetime: TimeInterval = (!demo && snapshot.source == UsageParser.statusLineSource) ? 300 : 60
-        let triggered = snapshot.exhausted(threshold: threshold, at: .now, lifetime: lifetime)
+        let triggered = snapshot.exhausted(threshold: thresholds, at: .now, lifetime: lifetime)
         // At the pace the account is being spent it would pass the threshold before the next readings and the hand-off
         // are through, and a session that runs into the limit stops mid-task. Starting now keeps it running.
         let ahead = !demo && !triggered && paceAccount == active.id
-            && UsagePace.nearing(snapshot, after: paceReadings, threshold: threshold, at: .now, lifetime: lifetime)
+            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime)
         let due = triggered || ahead
         // The weekly preference may move before the threshold, but only off a fresh reading of the account in use.
         // Once a hand-off is due that preference stays out of the decision.
         let early = library.preferences.soonerWeekly == true && !due && snapshot.isFresh(at: .now)
         guard due || early else {
-            if snapshot.available(threshold: threshold, at: .now), relayPause != nil || relayRetryAt != nil { relayPause = nil; relayRetryAt = nil }
+            if snapshot.available(threshold: thresholds, at: .now), relayPause != nil || relayRetryAt != nil { relayPause = nil; relayRetryAt = nil }
             return
         }
         // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
@@ -956,17 +966,19 @@ final class AppModel {
         accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true && $0.id != policy.leftRecently }
     }
     private func relayPolicy(soonerWeekly: Bool = false) -> RelayPolicy {
-        RelayPolicy(threshold: threshold, allowUnverifiedHotSwitch: !demo,
+        RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: !demo,
                     leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
                     soonerWeekly: soonerWeekly)
     }
     /// The account is not in a backoff; asking now would only be refused.
     private func readable(_ id: UUID) -> Bool { (backoffs[id]?.nextAttempt ?? .distantPast) <= .now }
-    /// The account in use is within `RelayPolicy.preparationMargin` points of the threshold on its last reading.
+    /// A window of the account in use is within `RelayPolicy.preparationMargin` points of its threshold on its last reading.
     var nearThreshold: Bool {
         guard let usage = active?.usage else { return false }
-        let remaining = [usage.fiveHour, usage.sevenDay].compactMap { usage.lastKnownRemaining($0, at: .now) }.min()
-        return remaining.map { $0 <= threshold + RelayPolicy.preparationMargin } ?? false
+        let t = thresholds
+        return [(usage.fiveHour, t.fiveHour), (usage.sevenDay, t.sevenDay)].contains { window, limit in
+            usage.lastKnownRemaining(window, at: .now).map { $0 <= limit + RelayPolicy.preparationMargin } ?? false
+        }
     }
     /// A session has reported quota that the monitor has not taken in yet, and the account in use is close enough to
     /// the threshold that waiting for the next ordinary pass could carry it past.

@@ -11,6 +11,20 @@ public struct UsageWindow: Codable, Equatable, Sendable {
     public init(used: Double, resetsAt: Date? = nil) { self.used = used; self.resetsAt = resetsAt }
     public var remaining: Double? { used.isFinite && used >= 0 && used <= 100 ? max(0, 100 - used) : nil }
 }
+/// How much may be left of each window before relay hands off: a window with this much or less left counts as used up.
+/// The two are set apart because they run out differently. The 5-hour window refills within hours, and leaving an
+/// account early only costs what was left of it until then; the 7-day window refills once a week. An integer or
+/// decimal literal sets both, as one threshold did before they were apart.
+public struct Thresholds: Equatable, Sendable, ExpressibleByFloatLiteral, ExpressibleByIntegerLiteral {
+    public var fiveHour: Double
+    public var sevenDay: Double
+    public init(fiveHour: Double, sevenDay: Double) {
+        self.fiveHour = min(100, max(0, fiveHour)); self.sevenDay = min(100, max(0, sevenDay))
+    }
+    public init(_ both: Double) { self.init(fiveHour: both, sevenDay: both) }
+    public init(floatLiteral value: Double) { self.init(value) }
+    public init(integerLiteral value: Int) { self.init(Double(value)) }
+}
 public struct UsageSnapshot: Codable, Equatable, Sendable {
     public var fiveHour: UsageWindow?
     public var sevenDay: UsageWindow?
@@ -32,17 +46,21 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         guard sampledAt <= now, let window, window.resetsAt.map({ $0 > now }) ?? true else { return nil }
         return window.remaining
     }
-    public func exhausted(threshold: Double, at now: Date, lifetime: TimeInterval = 60) -> Bool {
-        [fiveHour, sevenDay].contains { validRemaining($0, at: now, lifetime: lifetime).map { $0 <= threshold + 0.000001 } ?? false }
+    /// Each window paired with its own threshold.
+    private func windows(_ threshold: Thresholds) -> [(window: UsageWindow?, threshold: Double)] {
+        [(fiveHour, threshold.fiveHour), (sevenDay, threshold.sevenDay)]
+    }
+    public func exhausted(threshold: Thresholds, at now: Date, lifetime: TimeInterval = 60) -> Bool {
+        windows(threshold).contains { validRemaining($0.window, at: now, lifetime: lifetime).map { [t = $0.threshold] in $0 <= t + 0.000001 } ?? false }
     }
     /// The reading still puts a window at or under the threshold, after it has already qualified and Lilt has
     /// spent time reading the other accounts. Age no longer matters; a window that has since reset does not count.
-    public func remainsExhausted(threshold: Double, at now: Date) -> Bool {
+    public func remainsExhausted(threshold: Thresholds, at now: Date) -> Bool {
         guard sampledAt <= now else { return false }
-        return [fiveHour, sevenDay].contains { lastKnownRemaining($0, at: now).map { $0 <= threshold + 0.000001 } ?? false }
+        return windows(threshold).contains { lastKnownRemaining($0.window, at: now).map { [t = $0.threshold] in $0 <= t + 0.000001 } ?? false }
     }
-    public func available(threshold: Double, at now: Date, lifetime: TimeInterval = 60) -> Bool {
-        [fiveHour, sevenDay].allSatisfy { validRemaining($0, at: now, lifetime: lifetime).map { $0 > threshold + 0.000001 } ?? false }
+    public func available(threshold: Thresholds, at now: Date, lifetime: TimeInterval = 60) -> Bool {
+        windows(threshold).allSatisfy { validRemaining($0.window, at: now, lifetime: lifetime).map { [t = $0.threshold] in $0 > t + 0.000001 } ?? false }
     }
 }
 public struct Account: Identifiable, Codable, Equatable, Sendable {
@@ -70,7 +88,12 @@ public enum ScopeTarget: String, Codable, Sendable {
     case dedicated
 }
 public struct Preferences: Codable, Sendable {
+    /// The 5-hour window's threshold, and the 7-day window's as well until `weeklyThreshold` is set: files from before
+    /// the two were apart have only this one.
     public var threshold: Double = 1
+    /// The 7-day window's threshold. Nil means the same as `threshold`.
+    public var weeklyThreshold: Double?
+    public var thresholds: Thresholds { Thresholds(fiveHour: threshold, sevenDay: weeklyThreshold ?? threshold) }
     public var scopeEnabled = false
     public var qualifiedVersion: String?
     public var shortcutKey: UInt32 = 37 // L
@@ -107,7 +130,7 @@ public enum RelayDecision: Equatable, Sendable {
     case wait, select(UUID), pause(String)
 }
 public struct RelayPolicy: Sendable {
-    public var threshold: Double
+    public var threshold: Thresholds
     /// Live accounts have no way yet to prove that a running CLI picks up swapped credentials. When true,
     /// "not proven" is accepted and only "known not to work" is refused; the demo keeps the strict rule.
     public var allowUnverifiedHotSwitch: Bool
@@ -140,8 +163,8 @@ public struct RelayPolicy: Sendable {
     /// How many points above the threshold the account in use is close enough that the accounts which would take over
     /// are read ahead, so the hand-off finds the next one ready.
     public static let preparationMargin: Double = 15
-    public init(threshold: Double = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false) {
-        self.threshold = min(100, max(0, threshold)); self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
+    public init(threshold: Thresholds = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false) {
+        self.threshold = threshold; self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
         self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly
     }
     /// The id to pass as `leftRecently`, or nil once the cooldown has elapsed or the clock is skewed.
@@ -182,12 +205,14 @@ public struct RelayPolicy: Sendable {
         if let reset = window.resetsAt, reset <= now { return 100 }
         return window.remaining
     }
-    /// The room an account taking over from `active` must bring: more than the threshold, and more than `active` still
-    /// has. A hand-off started ahead of the threshold must not go to an account closer to it than the one being left.
+    /// How many points above its threshold the tighter window of an account taking over from `active` must be: above it
+    /// at all, and further than `active` still is. A hand-off started ahead of the threshold must not go to an account
+    /// closer to it than the one being left.
     private func floor(leaving active: Account?, at now: Date) -> Double {
-        guard let usage = active?.usage,
-              let left = [usage.fiveHour, usage.sevenDay].compactMap({ usage.lastKnownRemaining($0, at: now) }).min() else { return threshold }
-        return max(threshold, left)
+        guard let usage = active?.usage else { return 0 }
+        let left = [(usage.fiveHour, threshold.fiveHour), (usage.sevenDay, threshold.sevenDay)]
+            .compactMap { window, limit in usage.lastKnownRemaining(window, at: now).map { $0 - limit } }.min()
+        return max(0, left ?? 0)
     }
     /// The accounts a hand-off from `active` would go to, best first. Hand-offs used to take the first account in relay
     /// order above the threshold. On 2026-10-22 that meant accounts with 10–14% left: each was used up within a minute,
@@ -195,7 +220,7 @@ public struct RelayPolicy: Sendable {
     /// comes first, judged by each account's last reading however old, since an idle account's quota only changes when
     /// a window resets. Within `roomTier` points the relay order decides. Accounts without a usable reading follow, in
     /// relay order. Left out are accounts that cannot take over whatever their quota, the one just left, and those whose
-    /// reading leaves no more room than the threshold or than `active` itself has.
+    /// reading leaves a window no further above its threshold than `active` is.
     public func handOffOrder(_ candidates: [Account], leaving active: Account?, at now: Date) -> [Account] {
         let floor = floor(leaving: active, at: now)
         var known: [(tier: Int, position: Int, account: Account)] = [], unknown: [Account] = []
@@ -203,7 +228,7 @@ public struct RelayPolicy: Sendable {
         where candidate.id != active?.id && candidate.id != leftRecently && barrier(for: candidate, at: now) == nil {
             guard let usage = candidate.usage, let five = Self.expected(usage.fiveHour, of: usage, at: now),
                   let week = Self.expected(usage.sevenDay, of: usage, at: now) else { unknown.append(candidate); continue }
-            guard min(five, week) > floor + 0.000001 else { continue }
+            guard min(five - threshold.fiveHour, week - threshold.sevenDay) > floor + 0.000001 else { continue }
             known.append((Int((100 - five) / Self.roomTier), position, candidate))
         }
         return known.sorted { ($0.tier, $0.position) < ($1.tier, $1.position) }.map(\.account) + unknown
@@ -223,8 +248,8 @@ public struct RelayPolicy: Sendable {
         candidates.filter { $0.enabled && $0.refreshRejected != true && $0.usageCapability != .unavailable }.compactMap { account -> Date? in
             guard let usage = account.usage else { return nil }
             // An account is out until every window that keeps it out has reset.
-            return [usage.fiveHour, usage.sevenDay].compactMap { window -> Date? in
-                guard let window, let reset = window.resetsAt, reset > now, let left = window.remaining, left <= threshold + 0.000001 else { return nil }
+            return [(usage.fiveHour, threshold.fiveHour), (usage.sevenDay, threshold.sevenDay)].compactMap { window, limit -> Date? in
+                guard let window, let reset = window.resetsAt, reset > now, let left = window.remaining, left <= limit + 0.000001 else { return nil }
                 return reset
             }.max()
         }.min()

@@ -132,8 +132,8 @@ struct MainView: View {
     }
     @ViewBuilder private func meters(_ active: Account) -> some View {
         let unreadable = active.usageCapability == .unavailable
-        UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable)
-        UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.threshold, unreadable: unreadable)
+        UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.thresholds.fiveHour, unreadable: unreadable)
+        UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.thresholds.sevenDay, unreadable: unreadable)
     }
     /// Who runs next. Left to right is relay order; pressing an orb passes the baton.
     private var track: some View {
@@ -185,7 +185,7 @@ struct MainView: View {
                 LiquidToggle(label: "自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }))
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")
             }
-            Text(model.relayExplanation ?? blocker ?? "剩余 ≤\(model.threshold.formatted())% 时换下一个")
+            Text(model.relayExplanation ?? blocker ?? model.handOffRule)
                 .font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)
             if model.demo || model.lastEvent != "尚无接力记录" {
                 Spacer(minLength: 6)
