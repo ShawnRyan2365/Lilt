@@ -881,16 +881,15 @@ final class AppModel {
         let policy = relayPolicy(soonerWeekly: early)
         if !demo {
             if due {
-                // Other accounts are read only when what is known of them cannot settle the hand-off, in priority order
-                // and only until one can take over. Readings from the last ten minutes count, and an account with a
-                // window used up is not asked again before that window resets, so a hand-off usually reads nobody.
-                // Looking further for an untouched 5-hour window is left to the reading done ahead (`prepareHandOff`):
-                // the hand-off itself does not wait for it.
-                for candidate in relayCandidates(policy, besides: active.id) {
-                    if policy.obstacle(for: candidate, at: .now) == nil { break }
-                    guard policy.worthReading(candidate, at: .now), readable(candidate.id) else { continue }
-                    await refresh(candidate.id)
-                    if let fresh = accounts.first(where: { $0.id == candidate.id }), policy.obstacle(for: fresh, at: .now) == nil { break }
+                // The baton goes to the emptiest account, and that account is read right before unless it was read in
+                // the last two minutes (`RelayPolicy.confirmLifetime`). When the reading shows less room than Lilt knew
+                // of, the order changes and the account now in front is read instead, up to `handOffReads` of them.
+                // An account whose read fails is passed over for this hand-off.
+                var asked = Set<UUID>()
+                while asked.count < RelayPolicy.handOffReads,
+                      let next = policy.nextRead(relayCandidates(policy, besides: active.id), leaving: self.active, asked: asked, readable: readable, at: .now) {
+                    asked.insert(next.id)
+                    await refresh(next.id)
                     if let until = usagePausedUntil, until > .now { break }
                 }
             } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > .now {
@@ -957,7 +956,7 @@ final class AppModel {
     private func relayPolicy(soonerWeekly: Bool = false) -> RelayPolicy {
         RelayPolicy(threshold: threshold, allowUnverifiedHotSwitch: !demo,
                     leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
-                    soonerWeekly: soonerWeekly, preferFreshFiveHour: autoSort)
+                    soonerWeekly: soonerWeekly)
     }
     /// The account is not in a backoff; asking now would only be refused.
     private func readable(_ id: UUID) -> Bool { (backoffs[id]?.nextAttempt ?? .distantPast) <= .now }
@@ -976,34 +975,17 @@ final class AppModel {
         guard let sampled = await Task.detached(priority: .userInitiated, operation: { StatusLineBridge.latest()?.sampledAt }).value else { return false }
         return sampled != liveStamp
     }
-    /// While the account in use is close to the threshold, read ahead the accounts that would take over, one at a time,
-    /// so the hand-off finds the next one ready instead of reading them all at that moment. Reading stops at the first
-    /// account that settles a hand-off, which with sorting on is one with an untouched 5-hour window, and that one is
-    /// read again before its reading stops counting. Passes come every few seconds near the threshold, so reads are
-    /// spaced: one per 15 seconds until some account is ready, then one a minute while only the preference for an
-    /// untouched window is left to satisfy.
+    /// While the account in use is close to the threshold, read ahead the account a hand-off would go to first, so that
+    /// what Lilt knows of it is at most five minutes old and the hand-off rarely finds it changed. When the read shows
+    /// less room, the next pass reads whichever account is in front then. Passes come every few seconds near the
+    /// threshold, so reads are at least 15 seconds apart.
     private func prepareHandOff() async {
         guard autoRelay, !demo, !busy, !loading, nearThreshold, let active, (usagePausedUntil ?? .distantPast) <= .now,
-              (relayRetryAt ?? .distantPast) <= retryClock() else { return }
+              (relayRetryAt ?? .distantPast) <= retryClock(), Date.now.timeIntervalSince(preparedAt) >= 15 else { return }
         let policy = relayPolicy()
-        let candidates = relayCandidates(policy, besides: active.id)
-        let someoneReady = candidates.contains { policy.obstacle(for: $0, at: .now) == nil }
-        guard Date.now.timeIntervalSince(preparedAt) >= (someoneReady ? 60 : 15) else { return }
-        for candidate in candidates {
-            if policy.settles(candidate, at: .now) {
-                if let usage = candidate.usage, Date.now.timeIntervalSince(usage.sampledAt) > RelayPolicy.candidateLifetime - 120, readable(candidate.id) {
-                    preparedAt = .now; await refresh(candidate.id)
-                }
-                return
-            }
-            guard policy.worthReading(candidate, at: .now), readable(candidate.id) else { continue }
-            // With someone ready, only the preference for an untouched window is left, and only an account whose last
-            // reading showed one, or whose window has reset since, can still have one.
-            if someoneReady, policy.preferFreshFiveHour, let usage = candidate.usage,
-               (usage.lastKnownRemaining(usage.fiveHour, at: .now) ?? 100) < 100 - 0.000001 { continue }
-            preparedAt = .now; await refresh(candidate.id)
-            return
-        }
+        guard let next = policy.handOffOrder(relayCandidates(policy, besides: active.id), leaving: active, at: .now).first(where: { readable($0.id) }),
+              Date.now.timeIntervalSince(next.usage?.sampledAt ?? .distantPast) >= 300 else { return }
+        preparedAt = .now; await refresh(next.id)
     }
     /// Someone is likely reading or spending quota right now: a terminal or editor is frontmost, or Lilt itself is on screen.
     private var watching: Bool {

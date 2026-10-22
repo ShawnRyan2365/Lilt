@@ -30,9 +30,9 @@ import LiltCore
         precondition(model.autoRelay && model.active?.id == spare.id, "Recovery must resume without toggling relay")
         precondition(model.relayPause == nil)
 
-        // Missing, stale and partial data keep relay armed, but never justify a switch. Another account's reading
-        // counts for ten minutes (`RelayPolicy.candidateLifetime`), so stale means older than that.
-        for usage: UsageSnapshot? in [nil, snapshot(20, age: 601), UsageSnapshot(fiveHour: UsageWindow(used: 20))] {
+        // Missing, stale and partial data keep relay armed, but never justify a switch. The account taken must have
+        // been read in the last two minutes (`RelayPolicy.confirmLifetime`), so stale means older than that.
+        for usage: UsageSnapshot? in [nil, snapshot(20, age: 121), UsageSnapshot(fiveHour: UsageWindow(used: 20))] {
             var fixture = source; fixture.accounts[1].usage = usage
             let waiting = AppModel(preview: fixture)
             await waiting.relay()
@@ -224,7 +224,7 @@ import LiltCore
 }
 
 /// Sorting changes only the order the model shows and relays in. The user's own arrangement survives it, and a
-/// hand-off still waits for the threshold, then takes the first ready account with an untouched 5-hour window.
+/// hand-off still waits for the threshold, then takes the emptiest 5-hour window, the order deciding between equals.
 @MainActor func autoSortChecks() async throws {
     func account(_ label: String, five: Double, week: Double, weekResetsIn days: Double) -> Account {
         var account = Account(label: label, kind: .oauth)
@@ -251,7 +251,7 @@ import LiltCore
     precondition(model.active?.id == active.id)
     model.library.accounts[0].usage?.fiveHour = UsageWindow(used: 99.5)
     await model.relay()
-    precondition(model.active?.id == soonFresh.id, "First ready account in order with an untouched 5-hour window")
+    precondition(model.active?.id == soonFresh.id, "The emptiest 5-hour window, and the relay order between equally empty ones")
     model.setSoonerWeekly(true)
     precondition(!model.autoSort && model.accounts.map(\.label) == ["Fixture A", "Fixture B", "Fixture C", "Fixture D"])
 }

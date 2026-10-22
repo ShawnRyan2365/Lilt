@@ -54,7 +54,7 @@ final class RelayTests {
         // Unreadable, stale and known-broken accounts are never chosen, and each says why.
         guard case .pause = live.decide(active: active, candidates: [tokenOnly, stale, refused], at: now) else { fatalError("Expected pause") }
         expectEqual(live.obstacle(for: tokenOnly, at: now), "读不到额度")
-        expectEqual(live.obstacle(for: stale, at: now), "读数超过 10 分钟")
+        expectEqual(live.obstacle(for: stale, at: now), "额度未确认")
         expectEqual(live.obstacle(for: refused, at: now), "热切换未验证")
         expectEqual(live.obstacle(for: unproven, at: now), nil)
         // Nothing happens while the account in use is above the threshold.
@@ -304,68 +304,101 @@ final class RelayTests {
         expectEqual(RelayOrder.sorted([twin, weekEighty], at: now).map(\.label), ["Fixture J", "Fixture A"])
         expectFalse(Preferences().autoSort == true)
     }
-    /// With the preference on, a hand-off skips ready accounts whose 5-hour window has been used for the first one
-    /// whose window is untouched, and falls back to the first ready account when there is none. Off, order alone decides.
-    /// Nothing here moves an account that is still above the threshold.
-    func testHandOffPrefersAnUntouchedFiveHourWindow() {
+    /// The hand-offs of 2026-10-22 in miniature. The account in use leaves ahead of the threshold with 13% left, and the
+    /// relay order puts accounts with 10% and 14% left first. The baton goes to the emptiest account, the relay order
+    /// deciding only between accounts within ten points of each other, and never to one closer to the limit than the
+    /// account being left.
+    func testHandOffGoesToTheEmptiestAccount() {
         let day: TimeInterval = 86400
-        let active = placed("Fixture A", five: 0.5, week: 60, weekResetsIn: 3 * day)
-        let used = placed("Fixture B", five: 60, week: 90, weekResetsIn: day)
-        var untouched = placed("Fixture C", five: 100, week: 70, weekResetsIn: 5 * day)
+        let active = placed("Fixture A", five: 13, week: 40, weekResetsIn: 3 * day)
+        let nearlyFull = placed("Fixture B", five: 10, week: 89, weekResetsIn: day)
+        let thin = placed("Fixture C", five: 14, week: 60, weekResetsIn: day)
+        let used = placed("Fixture D", five: 93, week: 25, weekResetsIn: 2 * day)
+        var untouched = placed("Fixture E", five: 100, week: 70, weekResetsIn: 5 * day)
         untouched.usage?.fiveHour = UsageWindow(used: 0)
-        let spent = placed("Fixture D", five: 100, week: 0.5, weekResetsIn: day)
-        let prefer = RelayPolicy(preferFreshFiveHour: true)
-        expectEqual(RelayPolicy().decide(active: active, candidates: [used, untouched], at: now), .select(used.id))
-        expectEqual(prefer.decide(active: active, candidates: [used, untouched], at: now), .select(untouched.id))
-        expectEqual(prefer.decide(active: active, candidates: [spent, used], at: now), .select(used.id))
-        expectFalse(prefer.settles(used, at: now)); expect(prefer.settles(untouched, at: now)); expectFalse(prefer.settles(spent, at: now))
-        expect(RelayPolicy().settles(used, at: now))
-        // Ready but used is not untouched; an untouched window on a reading past the candidate lifetime does not count either.
-        var old = untouched
-        old.usage?.sampledAt = now.addingTimeInterval(-601)
-        expectFalse(RelayPolicy.untouchedFiveHour(old, at: now))
-        guard case .pause = prefer.decide(active: active, candidates: [spent, old], at: now) else { fatalError("Expected pause") }
-        let healthy = placed("Fixture E", five: 40, week: 60, weekResetsIn: 3 * day)
-        expectEqual(prefer.decide(active: healthy, candidates: [untouched], at: now), .wait)
-    }
-    /// An idle account's reading counts for ten minutes at a hand-off, so the hand-off does not have to read every
-    /// account again. The one in use still needs a reading from the last minute (or the status line's five) to trigger.
-    func testCandidateReadingsCountForTenMinutes() {
-        var active = Account(label: "Fixture A", kind: .oauth); active.usage = snapshot(1, 70)
-        var recent = Account(label: "Fixture B", kind: .oauth); recent.usage = snapshot(60, 60, age: 540)
-        let live = RelayPolicy(threshold: 1, allowUnverifiedHotSwitch: true)
-        expectEqual(live.obstacle(for: recent, at: now), nil)
-        expectEqual(live.decide(active: active, candidates: [recent], at: now), .select(recent.id))
-        recent.usage = snapshot(60, 60, age: 601)
-        guard case .pause = live.decide(active: active, candidates: [recent], at: now) else { fatalError("Expected pause") }
-        // The ten minutes are for the other accounts only.
-        active.usage = snapshot(1, 70, age: 61)
-        expectEqual(live.decide(active: active, candidates: [recent], at: now), .wait)
-        // A window that has reset since the reading is not assumed to be full, however recent the reading.
-        recent.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(-1)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-30))
-        expectEqual(live.obstacle(for: recent, at: now), "额度不足或不完整")
-    }
-    /// Reading an account again is worth it only when it could change the answer, and the next try after a pause is
-    /// timed to the first account that gets its quota back.
-    func testHandOffReadsOnlyWhatCouldChange() {
         let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
-        var account = Account(label: "Fixture A", kind: .oauth)
-        expect(live.worthReading(account, at: now)) // never read
-        account.usage = snapshot(60, 60, age: 601)
-        expect(live.worthReading(account, at: now)) // past the candidate lifetime
-        account.usage = snapshot(60, 60, age: 30)
-        expectFalse(live.worthReading(account, at: now)) // already qualifies
-        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(1800)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-30))
-        expectFalse(live.worthReading(account, at: now)) // used up until its reset; asking again cannot help
-        account.usage?.sampledAt = now.addingTimeInterval(-601)
-        expect(live.worthReading(account, at: now)) // an old reading is still unknown, used up or not
-        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(-60)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-300))
-        expect(live.worthReading(account, at: now)) // reset since the reading
-        var rejected = account; rejected.refreshRejected = true
-        var off = account; off.enabled = false
-        var unreadable = account; unreadable.usageCapability = .unavailable
-        expectFalse(live.worthReading(rejected, at: now)); expectFalse(live.worthReading(off, at: now)); expectFalse(live.worthReading(unreadable, at: now))
-
+        let order = [nearlyFull, thin, used, untouched]
+        expectEqual(live.handOffOrder(order, leaving: active, at: now).map(\.label), ["Fixture D", "Fixture E", "Fixture C"])
+        expectEqual(live.decide(active: active, candidates: order, at: now, ahead: true), .select(used.id))
+        // Ahead of the threshold, an account with less room than the one in use is no way out.
+        guard case .pause = live.decide(active: active, candidates: [nearlyFull], at: now, ahead: true) else { fatalError("Expected pause") }
+        // At the threshold anything above it will do, emptiest first; more than ten points apart, room beats order.
+        let spent = placed("Fixture A", five: 4, week: 40, weekResetsIn: 3 * day)
+        expectEqual(live.decide(active: spent, candidates: [nearlyFull, thin], at: now), .select(thin.id))
+        expectEqual(live.decide(active: spent, candidates: [nearlyFull], at: now), .select(nearlyFull.id))
+        expectEqual(live.handOffOrder([thin, untouched], leaving: spent, at: now).map(\.label), ["Fixture E", "Fixture C"])
+        // A weekly window as low as the account in use keeps an account out too, whatever its 5-hour window.
+        let weekSpent = placed("Fixture F", five: 100, week: 4, weekResetsIn: day)
+        expectEqual(live.handOffOrder([weekSpent, thin], leaving: spent, at: now).map(\.label), ["Fixture C"])
+        // Still above the threshold and not ahead of it: nothing moves.
+        let healthy = placed("Fixture G", five: 40, week: 60, weekResetsIn: 3 * day)
+        expectEqual(live.decide(active: healthy, candidates: [untouched], at: now), .wait)
+    }
+    /// What Lilt last read of an idle account sets the order a hand-off reads accounts in, however old the reading. The
+    /// account taken must have been read in the last two minutes. A window that has reset since the reading counts as
+    /// full for the order only, and an account still used up until its reset is left out, so it is not read before then.
+    func testHandOffConfirmsTheAccountItTakes() {
+        expectEqual(RelayPolicy.confirmLifetime, 120)
+        let active = placed("Fixture A", five: 3, week: 40, weekResetsIn: 86400)
+        var old = placed("Fixture B", five: 100, week: 80, weekResetsIn: 86400); old.usage?.sampledAt = now.addingTimeInterval(-3600)
+        var recent = placed("Fixture C", five: 60, week: 80, weekResetsIn: 86400); recent.usage?.sampledAt = now.addingTimeInterval(-119)
+        let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
+        expectEqual(live.handOffOrder([recent, old], leaving: active, at: now).map(\.label), ["Fixture B", "Fixture C"])
+        expectEqual(live.obstacle(for: old, at: now), "额度未确认")
+        // Until Fixture B is read, the hand-off can only go to the account read recently.
+        expectEqual(live.decide(active: active, candidates: [recent, old], at: now), .select(recent.id))
+        old.usage?.sampledAt = now
+        expectEqual(live.decide(active: active, candidates: [recent, old], at: now), .select(old.id))
+        recent.usage?.sampledAt = now.addingTimeInterval(-121)
+        guard case .pause = live.decide(active: active, candidates: [recent], at: now) else { fatalError("Expected pause") }
+        var spent = Account(label: "Fixture D", kind: .oauth); spent.hotSwitchCapability = .verified
+        spent.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(1800)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-3600))
+        expectEqual(live.handOffOrder([spent], leaving: active, at: now).count, 0)
+        expectEqual(live.obstacle(for: spent, at: now), "额度不足或不完整")
+        spent.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(-60)), sevenDay: UsageWindow(used: 10), sampledAt: now.addingTimeInterval(-30))
+        expectEqual(live.handOffOrder([recent, spent], leaving: active, at: now).map(\.label), ["Fixture D", "Fixture C"])
+        expectEqual(live.obstacle(for: spent, at: now), "额度不足或不完整")
+        // Never read: after every account with a reading, in relay order. Accounts that can never take over are left out.
+        var unread = Account(label: "Fixture E", kind: .oauth); unread.hotSwitchCapability = .verified
+        var rejected = old; rejected.refreshRejected = true
+        var off = old; off.enabled = false
+        var unreadable = old; unreadable.usageCapability = .unavailable
+        expectEqual(live.handOffOrder([unread, rejected, off, unreadable, recent], leaving: active, at: now).map(\.label), ["Fixture C", "Fixture E"])
+        expectEqual(live.obstacle(for: unread, at: now), "额度未知")
+    }
+    /// The hand-off reads the account in front, and when the reading shows that someone spent it meanwhile, moves on to
+    /// the next. Readings Lilt had of B and C were minutes old and promised plenty; in truth B had 10% left and C 14%,
+    /// as on 2026-10-22. The old rule took B on its ten-minute-old reading. Now B and C are read and passed over,
+    /// D is read and taken, and E, last read an hour ago, is never asked.
+    func testHandOffReadsTheTargetAndMovesOnWhenItWasSpent() {
+        let day: TimeInterval = 86400
+        let active = placed("Fixture A", five: 13, week: 40, weekResetsIn: 3 * day)
+        func stale(_ account: Account, age: TimeInterval) -> Account { var copy = account; copy.usage?.sampledAt = now.addingTimeInterval(-age); return copy }
+        let truth = [placed("Fixture B", five: 10, week: 89, weekResetsIn: day), placed("Fixture C", five: 14, week: 60, weekResetsIn: day),
+                     placed("Fixture D", five: 96, week: 25, weekResetsIn: 2 * day), placed("Fixture E", five: 93, week: 70, weekResetsIn: 5 * day)]
+        var known = [stale(placed("Fixture B", five: 100, week: 90, weekResetsIn: day), age: 540), stale(placed("Fixture C", five: 98, week: 61, weekResetsIn: day), age: 300),
+                     stale(truth[2], age: 3600), stale(truth[3], age: 3600)]
+        for index in known.indices { known[index].id = truth[index].id }
+        let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
+        var asked = Set<UUID>()
+        while asked.count < RelayPolicy.handOffReads, let next = live.nextRead(known, leaving: active, asked: asked, readable: { _ in true }, at: now) {
+            asked.insert(next.id)
+            let index = known.firstIndex { $0.id == next.id }!
+            known[index] = truth[index]
+        }
+        expectEqual(known.filter { asked.contains($0.id) }.map(\.label), ["Fixture B", "Fixture C", "Fixture D"])
+        expectEqual(live.decide(active: active, candidates: known, at: now, ahead: true), .select(truth[2].id))
+        // An account whose read failed is not asked again in the same hand-off, and one that cannot be asked is skipped.
+        expectEqual(live.nextRead(known, leaving: active, asked: [truth[2].id], readable: { _ in true }, at: now), nil)
+        let fresh = known
+        known[2].usage?.sampledAt = now.addingTimeInterval(-3600)
+        expectEqual(live.nextRead(known, leaving: active, asked: [truth[2].id], readable: { _ in true }, at: now)?.label, "Fixture E")
+        expectEqual(live.nextRead(known, leaving: active, asked: [], readable: { $0 != truth[2].id }, at: now)?.label, "Fixture E")
+        expectEqual(live.nextRead(fresh, leaving: active, asked: [], readable: { _ in false }, at: now), nil)
+    }
+    /// After a pause the next try is timed to the first account that gets its quota back.
+    func testRetryWaitsForTheFirstReset() {
+        let live = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
         var soon = Account(label: "Fixture B", kind: .oauth)
         soon.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(600)), sevenDay: UsageWindow(used: 20, resetsAt: now.addingTimeInterval(86400)), sampledAt: now)
         var both = Account(label: "Fixture C", kind: .oauth)
@@ -527,15 +560,16 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testAccountJustLeftIsSkippedUntilTheCooldownEnds()
         suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
         suite.testAutoSortOrdersByWeeklyResetDayThenWhatIsLeft()
-        suite.testHandOffPrefersAnUntouchedFiveHourWindow()
-        suite.testCandidateReadingsCountForTenMinutes()
-        suite.testHandOffReadsOnlyWhatCouldChange()
+        suite.testHandOffGoesToTheEmptiestAccount()
+        suite.testHandOffConfirmsTheAccountItTakes()
+        suite.testHandOffReadsTheTargetAndMovesOnWhenItWasSpent()
+        suite.testRetryWaitsForTheFirstReset()
         suite.testPaceStartsTheHandOffAhead()
         suite.testUpdateVersionsCompareNumerically()
         try suite.testUpdateFeedOffersOnlyAMatchingNewerRelease()
         suite.testUpdateInstallBoundaries()
         try storageChecks()
-        print("PASS: 27 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, untouched 5-hour hand-off, ten-minute candidate readings, reads that could change the answer, pace ahead of the threshold, update versions, update feed, update boundaries")
+        print("PASS: 28 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, pace ahead of the threshold, update versions, update feed, update boundaries")
     }
 }
 
