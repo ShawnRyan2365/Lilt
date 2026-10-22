@@ -215,8 +215,8 @@ struct MainView: View {
             if !model.accounts.isEmpty {
                 HStack(alignment: .top, spacing: 12) {
                     Text(model.autoSort
-                         ? "从上到下是接力顺序：7 天额度先重置的在前，同一天重置的剩余多的在前。换号时优先换到 5 小时额度没动过的账号，用到阈值再换。关闭后恢复你拖好的顺序。"
-                         : "从上到下是接力顺序，可以拖动调整。备注只用于本机识别，本版不做账号去重。")
+                         ? "从上到下是接力顺序：7 天额度先重置的在前，同一天重置的剩余多的在前。换号时先挑 5 小时额度最空的账号，一样空的按这个顺序，用到阈值再换。关闭后恢复你拖好的顺序。"
+                         : "从上到下是接力顺序，可以拖动调整；换号时先挑 5 小时额度最空的账号，一样空的按这个顺序。备注只用于本机识别，本版不做账号去重。")
                         .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
                     Text("自动排序").font(Typo.caption).foregroundStyle(Tokens.muted)
