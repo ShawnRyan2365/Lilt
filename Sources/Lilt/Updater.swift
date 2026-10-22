@@ -269,11 +269,14 @@ final class Updater {
     /// Opens the new copy once this one has quit: a copy opened earlier would find this one still running and close itself.
     /// The paths travel as arguments, never inside the script text.
     private static func relaunch(_ app: URL) throws {
-        var options: [String] = []
+        // The update from 0.1.5 to 0.1.6 swapped the bundle and then left Lilt closed. Afterwards it could not be told
+        // whether `open` found this copy still on record and only brought it forward, or the new copy closed itself
+        // (see `AppDelegate.otherInstance`). `-n` covers the first: it always starts a new copy.
+        var options = ["-n"]
         #if DEBUG
         // A trial install inside a fake home opens the new copy in that same home, never the real one.
         if let home = ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"], !home.isEmpty {
-            options = ["--env", "CFFIXED_USER_HOME=\(home)"]
+            options += ["--env", "CFFIXED_USER_HOME=\(home)"]
         }
         #endif
         let process = Process()

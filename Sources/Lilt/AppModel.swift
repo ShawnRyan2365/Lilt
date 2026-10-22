@@ -529,7 +529,8 @@ final class AppModel {
                 return false
             }
         }
-        scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil
+        // Assigned only when something changes: every assignment redraws whatever reads it, even an equal value.
+        if scopeIssue != nil || scopeUnreadable != nil || scopeUnreadableSince != nil { scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil }
         return true
     }
     /// What the scope holds relative to `account`'s stored login, taking it in when it is the same login renewed.
@@ -603,7 +604,9 @@ final class AppModel {
             guard accounts.contains(where: { $0.id == id }), await isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil }
             if id == library.activeID { notePace(snapshot, for: id) }
-            backoffs[id, default: Backoff()].succeed(); failures[id] = nil; status = "额度已更新"
+            if let backoff = backoffs[id], backoff.failures > 0 || backoff.nextAttempt != .distantPast { backoffs[id]?.succeed() }
+            if failures[id] != nil { failures[id] = nil }
+            if status != "额度已更新" { status = "额度已更新" }
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
             if credential.refreshable, !AccountVault.hasFile(account: Keychain.identityAccount(id)),
                let record = await IdentityClient().fetch(credential), await isCurrent(credential, for: id) {
@@ -776,7 +779,7 @@ final class AppModel {
     /// The latest reading a Claude Code session handed its status line, if it is about the account in use.
     private func ingestLiveUsage() async {
         guard !demo, managesDefaultLogin, liveUsageEnabled, let live = await IOQueue.perform({ StatusLineBridge.latest() }) else { return }
-        liveUsageSampledAt = live.sampledAt
+        if liveUsageSampledAt != live.sampledAt { liveUsageSampledAt = live.sampledAt }
         guard let active, live.sampledAt != liveStamp else { return }
         liveStamp = live.sampledAt
         let now = Date.now
@@ -785,11 +788,11 @@ final class AppModel {
         guard live.sampledAt > lastSwitchAt, now.timeIntervalSince(live.sampledAt) < 600,
               let known = active.usage, live.sampledAt > known.sampledAt, live.sharesWindows(with: known, at: now) else { return }
         update(active.id) { $0.usage = live; $0.usageCapability = .verified; $0.issue = nil }
-        failures[active.id] = nil
+        if failures[active.id] != nil { failures[active.id] = nil }
         notePace(live, for: active.id)
         // A session reporting this account's quota after the switch is using the new login, so the note that Lilt cannot
         // see whether sessions followed has nothing left to say. Sessions still on the previous account are not counted.
-        appliedPending = false
+        if appliedPending { appliedPending = false }
     }
     private func notePace(_ reading: UsageSnapshot, for id: UUID) {
         if paceAccount != id { paceAccount = id; paceReadings = [] }
@@ -865,7 +868,7 @@ final class AppModel {
         // Once a hand-off is due that preference stays out of the decision.
         let early = library.preferences.soonerWeekly == true && !due && snapshot.isFresh(at: .now)
         guard due || early else {
-            if snapshot.available(threshold: threshold, at: .now) { relayPause = nil; relayRetryAt = nil }
+            if snapshot.available(threshold: threshold, at: .now), relayPause != nil || relayRetryAt != nil { relayPause = nil; relayRetryAt = nil }
             return
         }
         // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
@@ -1009,7 +1012,10 @@ final class AppModel {
         return ["terminal", "iterm", "warp", "orca", "ghostty", "kitty", "alacritty", "wezterm", "hyper", "tabby", "vscode", "cursor", "zed"].contains { foreground.contains($0) }
     }
     private func tick() async {
-        clock = .now
+        // Everything on screen that depends on time reads `clock`, and with sorting on so does the order of every
+        // account, so each change redraws the whole window. Near the threshold passes come every 3 seconds; the
+        // figures that depend on time change by the minute, so the clock moves at most every 15 seconds.
+        if Date.now.timeIntervalSince(clock) >= 15 || Date.now < clock { clock = .now }
         guard !busy, !loading else { return }
         if demo { touchDemoSamples(); await relay(); return }
         // A pass woken early by a status line reading skips the scope check when one passed moments ago. Each check starts

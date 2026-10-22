@@ -78,10 +78,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) { model?.login.cancel(); model?.flushSaves() }
+    /// The process has to be alive as well: the list of running applications lags a quit by a moment, and a copy opened
+    /// right after an update quit the old one found it still listed and closed itself.
     static func otherInstance() -> NSRunningApplication? {
         let me = NSRunningApplication.current
         return NSWorkspace.shared.runningApplications.first {
-            $0.processIdentifier != me.processIdentifier && !$0.isTerminated &&
+            $0.processIdentifier != me.processIdentifier && !$0.isTerminated && kill($0.processIdentifier, 0) == 0 &&
             ((me.bundleIdentifier != nil && $0.bundleIdentifier == me.bundleIdentifier) || (me.executableURL != nil && $0.executableURL == me.executableURL))
         }
     }
