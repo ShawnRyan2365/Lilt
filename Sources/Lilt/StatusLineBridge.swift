@@ -7,14 +7,14 @@ import LiltCore
 /// the same input, so the terminal shows what it showed before. Nothing else from the session is stored.
 enum StatusLineBridge {
     private static var home: URL { FileManager.default.homeDirectoryForCurrentUser }
-    static var settingsFile: URL { home.appendingPathComponent(".claude/settings.json") }
-    private static var script: URL { Disk.root.appendingPathComponent("statusline.sh") }
-    private static var chain: URL { Disk.root.appendingPathComponent("statusline-chain.sh") }
-    private static var previous: URL { Disk.root.appendingPathComponent("statusline-previous.json") }
-    private static var record: URL { Disk.root.appendingPathComponent("live-usage.json") }
-    private static var label: URL { Disk.root.appendingPathComponent("statusline-label.txt") }
+    static var settingsFile: URL { home.appending(path: ".claude/settings.json", directoryHint: .notDirectory) }
+    private static var script: URL { Disk.file("statusline.sh") }
+    private static var chain: URL { Disk.file("statusline-chain.sh") }
+    private static var previous: URL { Disk.file("statusline-previous.json") }
+    private static var record: URL { Disk.file("live-usage.json") }
+    private static var label: URL { Disk.file("statusline-label.txt") }
     /// A copy of the settings file as it was before Lilt first touched it, kept for good.
-    static var backup: URL { Disk.root.appendingPathComponent("claude-settings-before-lilt.json") }
+    static var backup: URL { Disk.file("claude-settings-before-lilt.json") }
     static var command: String { "/bin/sh " + shellQuote(script.path) }
 
     private static func readSettings() throws -> [String: Any] {

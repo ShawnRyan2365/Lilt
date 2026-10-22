@@ -114,6 +114,19 @@ final class AppModel {
     private var paceAccount: UUID?
     private var scopeCheckedAt = Date.distantPast
     private var preparedAt = Date.distantPast
+    /// When the last status line reading was taken, for the 接入 page. Kept here so drawing the page reads no file.
+    private(set) var liveUsageSampledAt: Date?
+    /// One scope sequence at a time: a check and what it takes in, or a switch. Their reads and writes run on the I/O
+    /// queue, so without this a pass of the monitor and a switch by hand could each read the scope halfway through the
+    /// other changing it.
+    private var scopeHeld = false
+    private var scopeWaiting: [CheckedContinuation<Void, Never>] = []
+    /// Renewals in flight, one per account. A switch and a background read of the same account share one, so the two
+    /// never spend the same refresh token: the second spend is refused, and the account would need a new login.
+    private var renewals: [UUID: Task<Credential, Error>] = [:]
+    /// The library as it should be on disk, waiting for the I/O queue. Updates arriving meanwhile fold into one write.
+    private var unsaved: Library?
+    private var saving = false
     private var monitor: Task<Void, Never>?
     private var usageClient = UsageClient()
     let updater = Updater()
@@ -130,7 +143,9 @@ final class AppModel {
             do { try CLILogin.cleanupStaleLogins() } catch { message = "上次授权的临时资料未能清理，请检查钥匙串与目录权限。" }
         }
         restoreRelayPreference()
-        if storageAvailable, library.preferences.scopeEnabled { _ = checkAPIMode() }
+        if storageAvailable, library.preferences.scopeEnabled {
+            do { observeAPIMode(try runtime.hasAPIOverride()) } catch { noteUnreadable(error) }
+        }
         if storageAvailable, managesDefaultLogin, liveUsageEnabled, !apiModeDetected { connectStatusLine() }
         Task { version = await CLILogin.version() }
         monitor = Task { [weak self] in
@@ -140,7 +155,7 @@ final class AppModel {
                 for _ in 0..<5 {
                     try? await Task.sleep(for: .seconds(3))
                     guard let self else { return }
-                    if self.liveReadingWaiting { break }
+                    if await self.liveReadingWaiting() { break }
                 }
                 guard let self else { return }
                 self.updater.checkIfDue(enabled: self.autoUpdateCheck)
@@ -170,7 +185,8 @@ final class AppModel {
     /// The relay order: the user's own, or the sorted one while automatic sorting is on. `library.accounts` keeps the
     /// user's arrangement either way, so turning sorting off brings it back.
     var accounts: [Account] { autoSort ? RelayOrder.sorted(library.accounts, at: max(clock, .now)) : library.accounts }
-    var active: Account? { accounts.first { $0.id == library.activeID } }
+    /// Looked up in the stored list: the order does not matter here, and sorting on every lookup was most of its cost.
+    var active: Account? { library.accounts.first { $0.id == library.activeID } }
     var enabledCount: Int { accounts.filter(\.enabled).count }
     var threshold: Double { library.preferences.threshold }
     /// Off unless the user turns it on. Nil in an older preferences file means off.
@@ -183,13 +199,36 @@ final class AppModel {
         guard !demo else { return }
         persist(library)
     }
+    /// Written on the I/O queue; every quota reading saves, and a write waits for `fsync`.
     private func persist(_ value: Library) {
         guard storageAvailable else { return }
-        do { try Disk.save(value) } catch {
-            autoRelay = false; storageAvailable = false
-            relayPause = "本地数据保存失败，请检查存储后重新打开 Lilt。"
-            lastEvent = relayPause!; message = "本地数据保存失败，自动接力已停止。"
+        unsaved = value
+        guard !saving else { return }
+        saving = true
+        Task {
+            while let next = unsaved, storageAvailable {
+                unsaved = nil
+                do { try await IOQueue.run { try Disk.save(next) } } catch { failStorage() }
+            }
+            unsaved = nil; saving = false
         }
+    }
+    /// For the few changes whose caller has to know at once that they reached the disk.
+    private func saveNow() {
+        guard !demo, storageAvailable else { return }
+        unsaved = nil
+        do { try IOQueue.sync { try Disk.save(library) } } catch { failStorage() }
+    }
+    /// Lilt is quitting: what is still waiting is written before it goes.
+    func flushSaves() {
+        guard let next = unsaved else { return }
+        unsaved = nil
+        IOQueue.sync { try? Disk.save(next) }
+    }
+    private func failStorage() {
+        autoRelay = false; storageAvailable = false
+        relayPause = "本地数据保存失败，请检查存储后重新打开 Lilt。"
+        lastEvent = relayPause!; message = "本地数据保存失败，自动接力已停止。"
     }
     /// Preferences belong to the real library even while a demo is on screen, so a change made there still sticks.
     private func updatePreferences(_ change: (inout Preferences) -> Void) {
@@ -211,6 +250,7 @@ final class AppModel {
         if loggingIn { return "正在添加账号，完成后再更新" }
         if busy { return "正在切换账号，完成后再更新" }
         if loading { return "正在读取额度，稍后再更新" }
+        if saving || unsaved != nil { return "正在保存账号资料，稍后再更新" }
         return nil
     }
     func checkForUpdates() {
@@ -273,9 +313,17 @@ final class AppModel {
     /// The monitor only observes API settings. It never clears them without a manual account selection.
     /// True when Lilt must not write this pass: API mode, or a settings file that could not be read. Another tool
     /// writing the file in place can be caught halfway, so that waits for the next pass rather than stopping relay.
-    @discardableResult private func checkAPIMode() -> Bool {
-        do { observeAPIMode(try runtime.hasAPIOverride()); return apiModeDetected }
+    @discardableResult private func checkAPIMode() async -> Bool {
+        let runtime = self.runtime
+        do { observeAPIMode(try await IOQueue.run { try runtime.hasAPIOverride() }); return apiModeDetected }
         catch { noteUnreadable(error); return true }
+    }
+    /// Runs `work` once no other scope sequence is running (see `scopeHeld`). Sequences already inside one call the
+    /// parts they need directly, never this, so it is never waited for from inside itself.
+    private func exclusively<T>(_ work: () async throws -> T) async rethrows -> T {
+        if scopeHeld { await withCheckedContinuation { scopeWaiting.append($0) } } else { scopeHeld = true }
+        defer { if scopeWaiting.isEmpty { scopeHeld = false } else { scopeWaiting.removeFirst().resume() } }
+        return try await work()
     }
     private func noteUnreadable(_ error: Error) {
         if scopeUnreadableSince == nil { scopeUnreadableSince = .now; status = "暂时读不到\(scopeName)，稍后重试" }
@@ -347,13 +395,14 @@ final class AppModel {
     private func syncScope(afterReplacing id: UUID?) async {
         guard let id, id == library.activeID, !demo, library.preferences.scopeEnabled else { return }
         // Whatever the scope held for this account is superseded by what the user just saved.
-        if (try? runtime.check()) == nil { try? runtime.rebaseline() }
+        let runtime = self.runtime
+        await exclusively { await IOQueue.perform { if (try? runtime.check()) == nil { try? runtime.rebaseline() } } }
         await apply(id)
     }
     /// True while `credential` is still what is stored for the account. An answer that arrives after the stored
     /// credential was replaced describes the old one and must not be recorded against the new one.
-    private func isCurrent(_ credential: Credential, for id: UUID) -> Bool {
-        guard let stored = (try? storedSecret(id.uuidString)) ?? nil else { return false }
+    private func isCurrent(_ credential: Credential, for id: UUID) async -> Bool {
+        guard let stored = await IOQueue.perform({ (try? AccountVault.read(account: id.uuidString)) ?? nil }) else { return false }
         return OAuthDocument.accessToken(stored) == credential.token
     }
     /// The other account, if any, that is the same Claude account as this identity.
@@ -376,8 +425,10 @@ final class AppModel {
         } else {
             var account = Account(id: accountID, label: label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "新账号 \(accounts.count + 1)" : label, kind: kind)
             account.expiresAt = credential.expiresAt
-            library.accounts.append(account); save()
+            library.accounts.append(account)
         }
+        // A new login has to be on disk before the caller is told it was saved.
+        saveNow()
         if !storageAvailable {
             if id == nil { try? AccountVault.delete(account: accountID.uuidString); library.accounts.removeAll { $0.id == accountID } }
             throw AppFailure("凭据保存后账号资料写入失败，请检查存储。")
@@ -414,8 +465,10 @@ final class AppModel {
         }
         return try AccountVault.read(account: account)
     }
-    private func credential(for id: UUID) throws -> Credential {
-        guard let data = try storedSecret(id.uuidString) else { throw AppFailure("没有找到这个账号的本地凭据，请重新授权。") }
+    /// The stored login, read on the I/O queue.
+    private func credential(for id: UUID) async throws -> Credential {
+        if !demo, !AccountVault.hasFile(account: id.uuidString) { status = "正在把凭据从钥匙串移到本机，这一次之后切换不再询问密码" }
+        guard let data = try await IOQueue.run({ try AccountVault.read(account: id.uuidString) }) else { throw AppFailure("没有找到这个账号的本地凭据，请重新授权。") }
         let result = Credential(data: data); try result.validate(); return result
     }
     private func identity(for id: UUID) -> Data? { (try? storedSecret(Keychain.identityAccount(id))) ?? nil }
@@ -424,12 +477,23 @@ final class AppModel {
     /// The lead is `RelayPolicy.renewalLead` (ten minutes), twice Claude Code's own five-minute refresh buffer,
     /// so the token written into the scope is not already due for the CLI to refresh it again.
     private func renewedCredential(for id: UUID) async throws -> Credential {
-        let stored = try credential(for: id)
-        guard !demo, id != library.activeID, stored.refreshable, stored.expires(within: RelayPolicy.renewalLead) else { return stored }
+        let renewal: Task<Credential, Error>
+        if let running = renewals[id] { renewal = running } else {
+            let stored = try await credential(for: id)
+            guard !demo, id != library.activeID, stored.refreshable, stored.expires(within: RelayPolicy.renewalLead) else { return stored }
+            if let running = renewals[id] { renewal = running } else {
+                renewal = Task {
+                    let fresh = try await TokenRenewer().renew(stored)
+                    // Saved before anything else uses it: the old refresh token may already be spent.
+                    try await IOQueue.run { try AccountVault.write(fresh.data, account: id.uuidString) }
+                    return fresh
+                }
+                renewals[id] = renewal
+            }
+        }
+        defer { if renewals[id] == renewal { renewals[id] = nil } }
         do {
-            let fresh = try await TokenRenewer().renew(stored)
-            // Saved before anything else uses it: the old refresh token may already be spent.
-            try AccountVault.write(fresh.data, account: id.uuidString)
+            let fresh = try await renewal.value
             update(id) { $0.expiresAt = fresh.expiresAt; $0.refreshRejected = nil }
             return fresh
         } catch TokenRenewer.Failure.rejected {
@@ -446,9 +510,14 @@ final class AppModel {
     /// tried again on the next pass; earlier versions took it for an outside change and switched relay off.
     @discardableResult
     func reconcileScope() async -> Bool {
+        await exclusively { await reconcileScopeHeld() }
+    }
+    /// `reconcileScope` for a caller already running exclusively.
+    private func reconcileScopeHeld() async -> Bool {
         guard !demo, library.preferences.scopeEnabled, let active else { return true }
-        if checkAPIMode() || keepsAPIMode { return false }
-        do { try runtime.check() }
+        if await checkAPIMode() || keepsAPIMode { return false }
+        let runtime = self.runtime
+        do { try await IOQueue.run { try runtime.check() } }
         catch let failure as ScopeUnreadable { noteUnreadable(failure); return false }
         catch {
             switch await readBack(into: active) {
@@ -467,24 +536,38 @@ final class AppModel {
     /// The CLI's own note of who is logged in is checked first, as ORCA does; when that cannot settle it, the official
     /// profile endpoint is asked. Nil when the question could not be answered at all.
     private func readBack(into account: Account) async -> OAuthDocument.ReadBack? {
-        guard !runtime.transactionPending, let stored = (try? storedSecret(account.id.uuidString)) ?? nil else { return .unverifiable }
-        let held: Credential?
-        do { held = try runtime.currentCredential() }
-        catch let failure as ScopeUnreadable { noteUnreadable(failure); return nil }
-        catch { return .unverifiable }
-        guard let found = held, (try? found.validate()) != nil else { return .unverifiable }
-        let mine = OAuthDocument.Identity(oauthAccount: identity(for: account.id))
+        enum Read: Sendable { case found(stored: Data, held: Credential, mine: Data?, theirs: Data?), unverifiable, unreadable(ScopeUnreadable) }
+        let runtime = self.runtime, id = account.id
+        // Everything needed from the disk and the keychain, in one trip to the I/O queue.
+        let read: Read = await IOQueue.perform {
+            guard !runtime.transactionPending, let stored = (try? AccountVault.read(account: id.uuidString)) ?? nil else { return .unverifiable }
+            let held: Credential?
+            do { held = try runtime.currentCredential() }
+            catch let failure as ScopeUnreadable { return .unreadable(failure) }
+            catch { return .unverifiable }
+            guard let held, (try? held.validate()) != nil else { return .unverifiable }
+            return .found(stored: stored, held: held, mine: (try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil, theirs: runtime.readIdentity())
+        }
+        let stored: Data, found: Credential, mine: OAuthDocument.Identity, theirs: Data?
+        switch read {
+        case .unreadable(let failure): noteUnreadable(failure); return nil
+        case .unverifiable: return .unverifiable
+        case .found(let s, let h, let m, let t): stored = s; found = h; mine = .init(oauthAccount: m); theirs = t
+        }
         var verdict = OAuthDocument.readBack(stored: stored, runtime: found.data, storedIdentity: mine,
-                                             runtimeIdentity: .init(oauthAccount: runtime.readIdentity()))
+                                             runtimeIdentity: .init(oauthAccount: theirs))
         if verdict == .unverifiable || verdict == .foreign, mine.account != nil, found.refreshable {
             // The config file can be stale; the server's answer for this very token cannot.
             guard let asked = await IdentityClient().fetch(found) else { return nil }
             verdict = OAuthDocument.readBack(stored: stored, runtime: found.data, storedIdentity: mine, runtimeIdentity: .init(oauthAccount: asked))
         }
         guard verdict == .adopt || verdict == .unchanged else { return verdict }
+        let adopt = verdict == .adopt
         do {
-            if verdict == .adopt { try AccountVault.write(found.data, account: account.id.uuidString) }
-            try runtime.rebaseline()
+            try await IOQueue.run {
+                if adopt { try AccountVault.write(found.data, account: id.uuidString) }
+                try runtime.rebaseline()
+            }
             if verdict == .adopt {
                 update(account.id) { $0.expiresAt = found.expiresAt; $0.issue = nil; $0.refreshRejected = nil }
                 failures[account.id] = nil; backoffs[account.id] = nil; status = "已同步官方 CLI 续期的凭据"
@@ -517,17 +600,18 @@ final class AppModel {
             let credential = try await renewedCredential(for: id)
             asked = credential
             let snapshot = try await usageClient.fetch(credential)
-            guard accounts.contains(where: { $0.id == id }), isCurrent(credential, for: id) else { return }
+            guard accounts.contains(where: { $0.id == id }), await isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil }
             if id == library.activeID { notePace(snapshot, for: id) }
             backoffs[id, default: Backoff()].succeed(); failures[id] = nil; status = "额度已更新"
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
-            if identity(for: id) == nil, credential.refreshable, let record = await IdentityClient().fetch(credential), isCurrent(credential, for: id) {
-                try? AccountVault.write(record, account: Keychain.identityAccount(id))
+            if credential.refreshable, !AccountVault.hasFile(account: Keychain.identityAccount(id)),
+               let record = await IdentityClient().fetch(credential), await isCurrent(credential, for: id) {
+                _ = try? await IOQueue.run { try AccountVault.write(record, account: Keychain.identityAccount(id)) }
             }
         } catch {
             // Likewise a failure: if the credential was replaced while the request was out, it says nothing about the new one.
-            if let asked, !isCurrent(asked, for: id) { return }
+            if let asked, await !isCurrent(asked, for: id) { return }
             let failure = error as? UsageFailure ?? .authentication
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
             if case .rateLimited(let seconds) = failure { usagePausedUntil = Date.now.addingTimeInterval(max(60, seconds)) }
@@ -554,45 +638,53 @@ final class AppModel {
     }
     @discardableResult
     func apply(_ id: UUID, automatically: Bool = false) async -> Bool {
-        // A quota read running in the background is no reason to refuse the user's own switch, so the account buttons
-        // stay usable meanwhile; each read ends within its request timeout.
-        if !automatically {
-            let deadline = Date.now.addingTimeInterval(30)
-            while loading, !busy, Date.now < deadline { try? await Task.sleep(for: .milliseconds(200)) }
-        }
-        guard !busy, !loading, storageAvailable, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
+        // A quota read running in the background is no reason to hold up the user's own switch. Earlier versions waited
+        // up to 30 seconds for it with nothing on screen; the two now share any renewal (`renewals`) and take turns at
+        // the scope (`exclusively`), which is all the waiting was for.
+        guard !busy, storageAvailable, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
         if automatically, apiModeDetected || keepsAPIMode { return false }
         if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先接管 Claude Code 默认登录。"; return false }
         busy = true
         defer { busy = false }
+        if !automatically, !demo { status = "正在切换到“\(target.label)”…" }
         do {
             if !demo {
                 let credential: Credential
                 // A network hiccup is no reason to refuse: the CLI can renew an expired login itself.
-                do { credential = try await renewedCredential(for: id) } catch UsageFailure.network { credential = try self.credential(for: id) }
-                if automatically {
-                    // The CLI may have renewed the login in use while the other accounts were being read. Take that in
-                    // right before writing. What cannot be settled now is left as it is for the next pass, which stops
-                    // relay only when the scope provably holds something else.
-                    guard await reconcileScope() else { return false }
-                } else if (try? runtime.hasAPIOverride()) == false, (try? runtime.check()) == nil, let leaving = active, leaving.id != id {
-                    // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
-                    _ = await readBack(into: leaving)
+                do { credential = try await renewedCredential(for: id) } catch UsageFailure.network { credential = try await self.credential(for: id) }
+                let runtime = self.runtime, leaving = active
+                let wrote = try await exclusively { () async throws -> Bool in
+                    if automatically {
+                        // The CLI may have renewed the login in use while the other accounts were being read. Take that in
+                        // right before writing. What cannot be settled now is left as it is for the next pass, which stops
+                        // relay only when the scope provably holds something else.
+                        guard await reconcileScopeHeld() else { return false }
+                    } else if let leaving, leaving.id != id,
+                              await IOQueue.perform({ (try? runtime.hasAPIOverride()) == false && (try? runtime.check()) == nil }) {
+                        // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
+                        _ = await readBack(into: leaving)
+                    }
+                    do { try await IOQueue.run { try runtime.apply(credential, replacingExternalState: !automatically) } }
+                    catch {
+                        // Nothing was written: the scope changed or did not read in the moment since it was checked.
+                        // The next pass looks again, and relay stays on.
+                        guard automatically, !(await IOQueue.perform({ runtime.transactionPending })) else { throw error }
+                        status = "接力稍后重试"; return false
+                    }
+                    await IOQueue.perform {
+                        try? runtime.writeIdentity((try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil)
+                    }
+                    return true
                 }
-                do { try runtime.apply(credential, replacingExternalState: !automatically) }
-                catch _ where automatically && !runtime.transactionPending {
-                    // Nothing was written: the scope changed or did not read in the moment since it was checked.
-                    // The next pass looks again, and relay stays on.
-                    status = "接力稍后重试"; return false
-                }
-                try? runtime.writeIdentity(identity(for: id))
+                guard wrote else { return false }
             }
             library.activeID = id; appliedPending = !demo; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
             apiModeDetected = false; library.preferences.keepAPIMode = nil
             library.preferences.autoRelayStopReason = nil; save()
             if !demo {
                 lastSwitchAt = .now
-                if managesDefaultLogin, liveUsageEnabled { StatusLineBridge.setLabel(target.label) }
+                SwitchLog.record(automatically ? "auto" : "manual")
+                if managesDefaultLogin, liveUsageEnabled { let label = target.label; await IOQueue.perform { StatusLineBridge.setLabel(label) } }
                 // Status line readings are matched to the account by when its windows reset, so the account just put in
                 // place needs one current reading of its own.
                 if !(target.usage?.isFresh(at: .now) ?? false) { Task { await self.refresh(id) } }
@@ -622,13 +714,18 @@ final class AppModel {
         busy = true
         var adopted: UUID?
         do {
-            if let found = try scope.currentCredential(), (try? found.validate()) != nil {
-                let identity = scope.readIdentity()
-                let twin = twin(of: identity, besides: nil)
-                try store(found, label: "当前登录", kind: found.refreshable ? .oauth : .setupToken, replacing: twin?.id, identity: identity)
-                adopted = twin?.id ?? accounts.last?.id
+            try await exclusively {
+                let current = try await IOQueue.run { () throws -> (Credential, Data?)? in
+                    guard let found = try scope.currentCredential(), (try? found.validate()) != nil else { return nil }
+                    return (found, scope.readIdentity())
+                }
+                if let (found, identity) = current {
+                    let twin = twin(of: identity, besides: nil)
+                    try store(found, label: "当前登录", kind: found.refreshable ? .oauth : .setupToken, replacing: twin?.id, identity: identity)
+                    adopted = twin?.id ?? accounts.last?.id
+                }
+                try await IOQueue.run { try scope.rebaseline() }
             }
-            try scope.rebaseline()
         } catch {
             busy = false
             message = (error as? AppFailure)?.message ?? "无法接管默认登录，没有改动任何东西。"; return
@@ -666,10 +763,10 @@ final class AppModel {
     }
     /// Another tool (ORCA reinstalls its own) may put a different status line back. Lilt takes its place again at most
     /// every ten minutes, so the two never trade places in a loop.
-    private func checkStatusLine() {
+    private func checkStatusLine() async {
         guard managesDefaultLogin, liveUsageEnabled, Date.now.timeIntervalSince(lastStatusLineCheck) >= 300 else { return }
         lastStatusLineCheck = .now
-        guard !StatusLineBridge.isInstalled else { statusLineIssue = nil; return }
+        guard !(await IOQueue.perform { StatusLineBridge.isInstalled }) else { statusLineIssue = nil; return }
         guard Date.now.timeIntervalSince(lastStatusLineRepair) >= 600 else {
             statusLineIssue = "状态栏被别的工具换掉了，Lilt 稍后再接上；在这之前按时查询额度。"; return
         }
@@ -677,9 +774,10 @@ final class AppModel {
         connectStatusLine()
     }
     /// The latest reading a Claude Code session handed its status line, if it is about the account in use.
-    private func ingestLiveUsage() {
-        guard !demo, managesDefaultLogin, liveUsageEnabled, let active,
-              let live = StatusLineBridge.latest(), live.sampledAt != liveStamp else { return }
+    private func ingestLiveUsage() async {
+        guard !demo, managesDefaultLogin, liveUsageEnabled, let live = await IOQueue.perform({ StatusLineBridge.latest() }) else { return }
+        liveUsageSampledAt = live.sampledAt
+        guard let active, live.sampledAt != liveStamp else { return }
         liveStamp = live.sampledAt
         let now = Date.now
         // A session that has not picked the new login up yet still reports the previous account; its readings are
@@ -698,19 +796,20 @@ final class AppModel {
         paceReadings.removeAll { $0.sampledAt >= reading.sampledAt || reading.sampledAt.timeIntervalSince($0.sampledAt) > UsagePace.span }
         paceReadings.append(reading)
     }
-    /// When the last status line reading arrived, for the 接入 page.
-    var liveUsageSampledAt: Date? { StatusLineBridge.latest()?.sampledAt }
     /// Stop managing the default login. It keeps whatever account is in it; nothing is logged out.
     func releaseDefaultLogin() {
         guard !demo, managesDefaultLogin else { return }
+        let runtime = self.runtime
         setAutoRelay(false)
         updatePreferences { $0.scopeEnabled = false }
         scopeIssue = nil; appliedPending = false
         disconnectStatusLine()
+        Task { await exclusively { await IOQueue.perform { runtime.removeSignal() } } }
         status = "Lilt 不再管理默认登录"
     }
     func startDemo() {
-        guard !busy, !loading, !demo else { return }
+        // Not while a scope check is out on the I/O queue: it would come back to the demo's accounts.
+        guard !busy, !loading, !scopeHeld, !demo else { return }
         savedLibrary = library; savedPending = appliedPending; demo = true; library = Library(); autoRelay = false; appliedPending = false; relayPause = nil
         savedAPIMode = apiModeDetected; apiModeDetected = false
         relayRetryAt = nil
@@ -867,9 +966,11 @@ final class AppModel {
     }
     /// A session has reported quota that the monitor has not taken in yet, and the account in use is close enough to
     /// the threshold that waiting for the next ordinary pass could carry it past.
-    private var liveReadingWaiting: Bool {
+    private func liveReadingWaiting() async -> Bool {
         guard autoRelay, !demo, !busy, !loading, managesDefaultLogin, liveUsageEnabled, scopeIssue == nil, scopeUnreadable == nil,
-              nearThreshold, let sampled = StatusLineBridge.latest()?.sampledAt else { return false }
+              nearThreshold else { return false }
+        // Read beside the I/O queue rather than on it: a keychain call waiting there has nothing to do with this file.
+        guard let sampled = await Task.detached(priority: .userInitiated, operation: { StatusLineBridge.latest()?.sampledAt }).value else { return false }
         return sampled != liveStamp
     }
     /// While the account in use is close to the threshold, read ahead the accounts that would take over, one at a time,
@@ -911,14 +1012,14 @@ final class AppModel {
         clock = .now
         guard !busy, !loading else { return }
         if demo { touchDemoSamples(); await relay(); return }
-        // A pass woken early by a status line reading skips the scope check when one passed moments ago. Reading the
-        // keychain holds up the main thread for a moment, and an automatic hand-off checks the scope again before writing.
+        // A pass woken early by a status line reading skips the scope check when one passed moments ago. Each check starts
+        // a keychain process, and an automatic hand-off checks the scope again before writing.
         if Date.now.timeIntervalSince(scopeCheckedAt) >= 10 {
             guard await reconcileScope() else { return }
             scopeCheckedAt = .now
         }
-        checkStatusLine()
-        ingestLiveUsage()
+        await checkStatusLine()
+        await ingestLiveUsage()
         guard let active else { return }
         // Readings from a working session arrive with every response; the endpoint is only asked when none has come
         // for five minutes (ORCA waits the same).
@@ -1007,21 +1108,29 @@ final class AppModel {
     /// account's credential (a renewed token replaces the old one for good) and resume managing the scope.
     func adoptScopeCredential() {
         guard !demo, !busy, let active else { return }
-        do {
-            guard let credential = try runtime.currentCredential() else { throw AppFailure("\(scopeName)里没有可采纳的登录。") }
-            try credential.validate()
-            try AccountVault.write(credential.data, account: active.id.uuidString)
-            try runtime.rebaseline()
-            update(active.id) {
-                $0.expiresAt = credential.expiresAt; $0.issue = nil
-                // What was adopted decides what the account is: a login that can renew itself is a full login.
-                $0.kind = credential.refreshable ? .oauth : .setupToken; $0.usageCapability = .unknown
-            }
-            failures[active.id] = nil; backoffs[active.id] = nil
-            scopeIssue = nil; status = "已采纳，继续管理\(scopeName)"
-            // Reading the quota also records whose login this is, so the next renewal can be taken in unasked.
-            Task { await refresh(active.id) }
-        } catch { message = (error as? AppFailure)?.message ?? "采纳失败，未改动任何凭据。" }
+        let runtime = self.runtime, id = active.id, name = scopeName
+        Task {
+            do {
+                let credential = try await exclusively {
+                    try await IOQueue.run { () throws -> Credential in
+                        guard let credential = try runtime.currentCredential() else { throw AppFailure("\(name)里没有可采纳的登录。") }
+                        try credential.validate()
+                        try AccountVault.write(credential.data, account: id.uuidString)
+                        try runtime.rebaseline()
+                        return credential
+                    }
+                }
+                update(id) {
+                    $0.expiresAt = credential.expiresAt; $0.issue = nil
+                    // What was adopted decides what the account is: a login that can renew itself is a full login.
+                    $0.kind = credential.refreshable ? .oauth : .setupToken; $0.usageCapability = .unknown
+                }
+                failures[id] = nil; backoffs[id] = nil
+                scopeIssue = nil; status = "已采纳，继续管理\(name)"
+                // Reading the quota also records whose login this is, so the next renewal can be taken in unasked.
+                await refresh(id)
+            } catch { message = (error as? AppFailure)?.message ?? "采纳失败，未改动任何凭据。" }
+        }
     }
     /// The user says the scope should go back to the account Lilt put there, whatever is in it now.
     func reclaimScope() {

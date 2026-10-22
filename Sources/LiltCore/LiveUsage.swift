@@ -51,18 +51,22 @@ public enum UsagePace {
     /// However fast the pace, a hand-off never starts more than this many points above the threshold.
     public static let maxMargin: Double = 10
 
-    /// True when a window of `latest`, at the pace seen since the oldest of `earlier` within `span`, would reach
-    /// `threshold` within `lead`. Only readings of the same window count: one from before a reset says nothing about now.
+    /// True when a window of `latest` would reach `threshold` within `lead`, at the faster of two paces: the one since
+    /// the oldest of `earlier` within `span`, and the one since the most recent reading at least `minimumSpan` older.
+    /// The long one alone lags a burst: several sessions starting at once on an account that sat idle for minutes.
+    /// Only readings of the same window count: one from before a reset says nothing about now.
     public static func nearing(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], threshold: Double, at now: Date, lifetime: TimeInterval) -> Bool {
         for (window, pick) in [(latest.fiveHour, \UsageSnapshot.fiveHour), (latest.sevenDay, \UsageSnapshot.sevenDay)] {
             guard let remaining = latest.validRemaining(window, at: now, lifetime: lifetime) else { continue }
-            let base = earlier.filter {
+            let bases = earlier.filter {
                 let gap = latest.sampledAt.timeIntervalSince($0.sampledAt)
                 return gap >= minimumSpan && gap <= span && sameWindow($0[keyPath: pick], window)
-            }.min { $0.sampledAt < $1.sampledAt }
-            guard let base, let before = base[keyPath: pick]?.remaining else { continue }
-            let rate = (before - remaining) / latest.sampledAt.timeIntervalSince(base.sampledAt)
-            guard rate > 0 else { continue }
+            }
+            let rate = [bases.min { $0.sampledAt < $1.sampledAt }, bases.max { $0.sampledAt < $1.sampledAt }].compactMap { base -> Double? in
+                guard let base, let before = base[keyPath: pick]?.remaining else { return nil }
+                return (before - remaining) / latest.sampledAt.timeIntervalSince(base.sampledAt)
+            }.max()
+            guard let rate, rate > 0 else { continue }
             if remaining - min(maxMargin, rate * lead) <= threshold + 0.000001 { return true }
         }
         return false

@@ -81,7 +81,7 @@ import LiltCore
         try await scopeWatchChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, automatic order, scope reads that fail for a moment. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope reads that fail for a moment, the signal file for running CLIs. No live credentials or requests.")
     }
 }
 
@@ -159,11 +159,24 @@ import LiltCore
     settled = await model.apply(spare.id, automatically: true); precondition(settled && model.active?.id == spare.id)
     precondition(held == theirs)
 
+    // Every switch leaves running CLIs the signal to look again: an empty document whose time moves, never a login.
+    let signal = home.appendingPathComponent(".claude/.credentials.json")
+    func signalTime() -> Date? { (try? FileManager.default.attributesOfItem(atPath: signal.path))?[.modificationDate] as? Date }
+    precondition((try? Data(contentsOf: signal)) == RuntimeScope.signal, "A switch leaves the signal, not a login")
+    let firstTime = signalTime()
+    settled = await model.apply(active.id); precondition(settled && held == renewed)
+    precondition(signalTime() != nil && signalTime() != firstTime, "Each switch moves the signal's time")
+    settled = await model.apply(spare.id); precondition(settled && held == theirs)
+    settled = await model.reconcileScope(); precondition(settled && model.autoRelay, "The signal is part of what was written, not an outside change")
+
     // Another Claude account in the scope still stops relay and asks the user.
     held = document("fixture-access-c", refresh: nil)
     try SecureFiles.write(Data(#"{"oauthAccount":{"accountUuid":"fixture-account-c"}}"#.utf8), to: config)
     settled = await model.reconcileScope(); precondition(!settled)
     precondition(!model.autoRelay && model.scopeIssue != nil && model.library.preferences.autoRelayStopReason != nil)
+    // Stopping management takes the signal away again, so the CLI goes back to watching the keychain by itself.
+    scope.removeSignal()
+    precondition(!FileManager.default.fileExists(atPath: signal.path))
 }
 
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up
@@ -203,10 +216,11 @@ import LiltCore
     model.busy = true
     precondition(model.blocks(.reauthorize(back)) && !model.blocks(.confirmApplied))
     model.busy = false
-    // A switch by hand waits for the read in progress instead of being refused.
-    Task { try? await Task.sleep(for: .milliseconds(400)); model.loading = false }
+    // A switch by hand goes ahead during a read in progress: it neither waits for the read nor is refused.
+    let started = Date.now
     let switched = await model.apply(active.id)
-    precondition(switched && model.active?.id == active.id && !model.loading)
+    precondition(switched && model.active?.id == active.id && model.loading && Date.now.timeIntervalSince(started) < 0.2)
+    model.loading = false
 }
 
 /// Sorting changes only the order the model shows and relays in. The user's own arrangement survives it, and a
@@ -300,6 +314,15 @@ func runtimeChecks() throws {
     let healthy = Data(#"{"env":{"HTTPS_PROXY":"http://proxy.invalid"},"model":"opus","forceLoginMethod":"claudeai"}"#.utf8)
     precondition((try! AuthenticationSettings.subscriptionSettings(healthy)) == nil)
     try scope.check()
+    // With no login in the fallback file, the switch left Lilt's signal there. A fallback file that holds a login
+    // follows the keychain instead, and is never taken away as if it were the signal.
+    let fallback = home.appendingPathComponent(".claude/.credentials.json")
+    precondition((try! Data(contentsOf: fallback)) == RuntimeScope.signal)
+    try SecureFiles.write(earlier, to: fallback)
+    try scope.rebaseline()
+    precondition((try! Data(contentsOf: fallback)) == subscription.data)
+    scope.removeSignal()
+    precondition(FileManager.default.fileExists(atPath: fallback.path))
     // CC Switch may only change settings, leaving the credential digest unchanged.
     try SecureFiles.write(api, to: settings)
     expectFailure { try scope.apply(subscription) }
@@ -322,11 +345,11 @@ func runtimeChecks() throws {
     let racing = Data(#"{"claudeAiOauth":{"accessToken":"fixture-racing"}}"#.utf8)
     let raced = RuntimeScope(fixtureHome: home, credentials: .init(read: {
         reads += 1
-        return reads > 4 ? racing : held // reads 1–4 prepare the switch; read 5 verifies before writing
+        return reads > 1 ? racing : held // read 1 prepares the switch; read 2 verifies before writing
     }, write: { held = $0 }, delete: { held = nil }))
     let before = held
     expectFailure { try raced.apply(Credential(data: external)) }
-    precondition(reads == 5 && held == before && !raced.transactionPending)
+    precondition(reads == 2 && held == before && !raced.transactionPending)
     let malformed = Data("not-json".utf8)
     try SecureFiles.write(malformed, to: settings)
     held = external

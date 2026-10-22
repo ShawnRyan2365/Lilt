@@ -96,7 +96,7 @@ Lilt 会自己检查新版本。有新版本时，菜单栏面板和管理窗口
 
 0.1 研究预览版，能用，但还有没在真实账号上验证过的部分：
 
-- **切换后，已经在运行的 `claude` 会不会立刻用上新账号，还没有实测。** 切换后请在 CLI 里用 `/status` 核对；不放心就重开一次会话。
+- **切换后，已经在运行的 `claude` 会不会立刻用上新账号，还没有实测。** 按 Claude Code 2.1.308 的代码，正在运行的会话看到 `~/.claude/.credentials.json` 的修改时间变了，会在下一次请求前重新读登录；没有这个文件时，它会把钥匙串里读到的登录最多沿用 30 秒。所以 Lilt 每次切换都会更新这个文件（见下面“数据放在哪里”）。这是读代码得出的，还没有在真实会话里量过。切换后请在 CLI 里用 `/status` 核对；不放心就重开一次会话。
 - 真实账号下的自动接力还没有完整跑过。
 - 如果 ORCA 等工具也在切换 Claude 账号，两边会互相覆盖。Lilt 发现登录被别人改过会停下来，让你选择采纳还是改回，不会硬覆盖。请只保留一个管理方。
 
@@ -104,7 +104,8 @@ Lilt 会自己检查新版本。有新版本时，菜单栏面板和管理窗口
 
 - 账号列表和偏好：`~/Library/Application Support/Lilt/accounts.json`，不含凭据。
 - 每个账号的登录凭据：`~/Library/Application Support/Lilt/secrets/`，权限 0600，只有当前用户能读。
-- 接管后，Lilt 写入 Claude Code 自己读取登录的位置：钥匙串条目 `Claude Code-credentials`（通过系统的 `security` 工具读写）、已存在时的 `~/.claude/.credentials.json`、`~/.claude.json` 里的 `oauthAccount`。
+- 接管后，Lilt 写入 Claude Code 自己读取登录的位置：钥匙串条目 `Claude Code-credentials`（通过系统的 `security` 工具读写）、`~/.claude.json` 里的 `oauthAccount`，以及 `~/.claude/.credentials.json`。最后这个文件原来存着登录时，Lilt 让它跟着钥匙串一起换。原来没有这个文件时，Lilt 只放一个空的 `{}`，不放任何凭据，用途是在每次切换时改动它的修改时间，提醒正在运行的 `claude` 重新读登录。停止接管时，Lilt 会删掉这个空文件。
+- 切换记录：`~/Library/Application Support/Lilt/switches.log`，最近 200 次切换的时间和方式（手动或自动接力），不含账号名称或凭据。会话里出现 “Connection lost mid-response” 之类的错误时，可以拿来对照是不是刚好在切换。
 - 实时额度（默认开，可在“接入”页关闭）：在 `~/.claude/settings.json` 的状态栏命令前加一个小脚本，只取 Claude Code 交给状态栏的额度数据，终端里显示的内容不变。第一次改动前会把原文件备份为 `claude-settings-before-lilt.json`，关闭时放回原来的状态栏。
 - 额度查询有节制：自动接力开着时当前账号每 5 分钟查一次（离阈值 15 个百分点以内时每 2 分钟）。其他账号只在当前账号快到阈值、需要接力或手动刷新时才查，每 15 秒最多一个；10 分钟内的读数直接用，额度已用完的账号在重置前不再重复查。遇到限流时全部暂停，等官方允许再查。
 - 更新时下载的安装包放在系统临时目录，装好或放弃后删除。

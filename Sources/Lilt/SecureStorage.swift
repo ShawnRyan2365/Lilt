@@ -92,14 +92,15 @@ enum CLIKeychain {
         let process = Process(); let output = Pipe(); let stdin = Pipe()
         process.executableURL = tool; process.arguments = arguments
         process.standardOutput = output; process.standardError = FileHandle.nullDevice; process.standardInput = stdin
+        // Woken by the exit itself rather than by polling, so each call costs what `security` takes and no more.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         do { try process.run() } catch { throw AppFailure("无法访问钥匙串。") }
         if let input { try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8)) }
         try? stdin.fileHandleForWriting.close()
         // A keychain waiting for the user to allow access would otherwise hold Lilt up indefinitely. The wait is measured
         // on a clock that stops while the Mac sleeps: a read the system froze halfway through has not hung.
-        let deadline = DispatchTime.now() + wait
-        while process.isRunning && DispatchTime.now() < deadline { usleep(10_000) }
-        if process.isRunning { process.terminate(); throw AppFailure("钥匙串没有响应，可能在等你允许访问。") }
+        if exited.wait(timeout: .now() + wait) == .timedOut { process.terminate(); throw AppFailure("钥匙串没有响应，可能在等你允许访问。") }
         return (process.terminationStatus, output.fileHandleForReading.readDataToEndOfFile())
     }
     static func read(service: String, account explicit: String? = nil, wait: TimeInterval = 5) throws -> Data? {
@@ -145,12 +146,12 @@ enum CLIKeychain {
 /// "always allow" and asks for the Mac password on the next access — once per account, so every switch
 /// asked. A 0600 file in Lilt's own directory does not. The official CLI's login item is untouched.
 enum AccountVault {
-    private static var directory: URL { Disk.root.appendingPathComponent("secrets") }
+    private static let directory = Disk.root.appending(component: "secrets", directoryHint: .isDirectory)
     private static func file(_ account: String) throws -> URL {
         guard !account.isEmpty, account.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else {
             throw AppFailure("凭据名称无效。")
         }
-        return directory.appendingPathComponent(account)
+        return directory.appending(component: account, directoryHint: .notDirectory)
     }
     static func hasFile(account: String) -> Bool {
         guard let url = try? file(account), FileManager.default.fileExists(atPath: url.path) else { return false }
@@ -168,10 +169,12 @@ enum AccountVault {
         return legacy
     }
     static func write(_ data: Data, account: String) throws {
+        let moving = !hasFile(account: account)
         try Disk.directory(directory)
         try Disk.write(data, to: try file(account))
-        // The login-keychain copy is what kept prompting. It is only removed after the file is in place.
-        try? CLIKeychain.delete(service: Keychain.service, account: account)
+        // The login-keychain copy is what kept prompting. It is only removed after the file is in place, and only when
+        // this write is the move: once a file exists, the copy is long gone, and asking again started a process per write.
+        if moving { try? CLIKeychain.delete(service: Keychain.service, account: account) }
     }
     static func delete(account: String) throws {
         let url = try file(account)
@@ -183,22 +186,56 @@ enum AccountVault {
     }
 }
 struct Disk {
-    static let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Lilt")
+    static let root = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/Lilt", directoryHint: .isDirectory)
+    /// A file of Lilt's own. Saying it is not a directory spares a disk lookup that `appendingPathComponent` makes.
+    static func file(_ name: String) -> URL { root.appending(component: name, directoryHint: .notDirectory) }
     static func directory(_ url: URL) throws { try SecureFiles.directory(url) }
     static func write(_ data: Data, to url: URL) throws { try SecureFiles.write(data, to: url) }
     static func load() throws -> Library {
         try directory(root)
-        let path = root.appendingPathComponent("accounts.json")
+        let path = file("accounts.json")
         if !FileManager.default.fileExists(atPath: path.path) { return Library() }
         return try JSONDecoder().decode(Library.self, from: Data(contentsOf: path))
     }
-    static func save(_ library: Library) throws { try write(JSONEncoder().encode(library), to: root.appendingPathComponent("accounts.json")) }
+    static func save(_ library: Library) throws { try write(JSONEncoder().encode(library), to: file("accounts.json")) }
+}
+
+/// Where blocking work goes instead of the main thread: each keychain call starts a `security` process, and each write
+/// waits for `fsync`. With many Claude sessions writing to disk at once a plain read took tens of milliseconds, and a
+/// switch, made of several of each, froze the window. One serial queue, so reads and writes reach the scope and Lilt's
+/// files in the order they were asked for.
+enum IOQueue {
+    private static let queue = DispatchQueue(label: "app.lilt.io", qos: .userInitiated)
+    static func run<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in queue.async { continuation.resume(with: Result { try work() }) } }
+    }
+    static func perform<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in queue.async { continuation.resume(returning: work()) } }
+    }
+    /// Waits for everything queued, then runs `work`: for a write the caller must know reached the disk, and on quitting.
+    static func sync<T>(_ work: () throws -> T) rethrows -> T { try queue.sync(execute: work) }
+}
+
+/// When Lilt switched the login, and whether by hand or by relay: the last 200 switches, one line each, in
+/// `switches.log`. It is there to set beside errors a Claude Code session reports, such as "Connection lost
+/// mid-response", and see whether they follow a switch. Times and kinds only: no names, tokens or account ids.
+enum SwitchLog {
+    static func record(_ kind: String, at date: Date = .now) {
+        let line = date.formatted(.iso8601) + " " + kind + "\n"
+        Task { await IOQueue.perform {
+            let url = Disk.file("switches.log")
+            let kept = ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").suffix(199).map { $0 + "\n" }.joined()
+            try? Disk.write(Data((kept + line).utf8), to: url)
+        } }
+    }
 }
 
 /// The place the official CLI looks for its login, written to as one transaction.
 /// `system` is Claude Code's default login (keychain item `Claude Code-credentials`, `~/.claude`, `~/.claude.json`),
 /// the same surfaces ORCA writes. `dedicated` is a directory of Lilt's own that only the launch command points at.
-final class RuntimeScope {
+/// Every stored property is a constant, and `AppModel` runs the reads and writes one at a time on its I/O queue, so a
+/// scope can be handed to that queue; that includes the in-memory store of the regression checks.
+final class RuntimeScope: @unchecked Sendable {
     struct CredentialAccess {
         var read: () throws -> Data?
         var write: (Data) throws -> Void
@@ -212,16 +249,28 @@ final class RuntimeScope {
     init(target: ScopeTarget) {
         self.target = target
         root = Disk.root; home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
-        directory = target == .system ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
-                                       : Disk.root.appendingPathComponent("scope")
+        directory = target == .system ? FileManager.default.homeDirectoryForCurrentUser.appending(component: ".claude", directoryHint: .isDirectory)
+                                       : Disk.root.appending(component: "scope", directoryHint: .isDirectory)
     }
     /// Isolated transaction checks use an in-memory credential store, never a macOS keychain item.
     init(fixtureHome: URL, credentials: CredentialAccess) {
         target = .system; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
         directory = fixtureHome.appendingPathComponent(".claude"); credentialAccess = credentials
     }
-    private var file: URL { directory.appendingPathComponent(".credentials.json") }
-    private var settingsFile: URL { directory.appendingPathComponent("settings.json") }
+    /// What Lilt keeps in `.credentials.json` when the file holds no login of its own: an empty document. The CLI reads
+    /// the keychain first and finds nothing in this, so it changes nothing about which login is used; it is there for
+    /// its modification time. A running CLI that sees that time change drops every login it has cached and reads the
+    /// keychain on its next request. Without the file it keeps what it read from the keychain for up to 30 seconds, so a
+    /// busy session went on spending the account just left after a switch, and could run into its limit meanwhile.
+    /// (Claude Code 2.1.308, read from its code; not yet measured against running sessions.)
+    static let signal = Data("{}".utf8)
+    /// The fallback file holds a login, rather than nothing or Lilt's signal. Such a file is kept in step with the keychain.
+    static func holdsLogin(_ data: Data?) -> Bool {
+        guard let data, let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        return object["claudeAiOauth"] != nil
+    }
+    private var file: URL { directory.appending(component: ".credentials.json", directoryHint: .notDirectory) }
+    private var settingsFile: URL { directory.appending(component: "settings.json", directoryHint: .notDirectory) }
     private func readSettings() throws -> Data? {
         guard FileManager.default.fileExists(atPath: settingsFile.path) else { return nil }
         guard try settingsFile.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
@@ -234,13 +283,13 @@ final class RuntimeScope {
         do { return try AuthenticationSettings.hasAPIOverride(data) }
         catch { throw AppFailure("Claude 用户配置格式无效，请修复 settings.json 后再切换。") }
     }
-    private var journal: URL { root.appendingPathComponent(target == .system ? "transaction-system.json" : "transaction.json") }
+    private var journal: URL { root.appending(component: target == .system ? "transaction-system.json" : "transaction.json", directoryHint: .notDirectory) }
     private var service: String { target == .system ? "Claude Code-credentials" : Keychain.cliService(directory: directory) }
     /// Where the CLI keeps its account record: in the directory when one is named, otherwise `~/.claude.json`.
     private var configFile: URL {
-        let inside = directory.appendingPathComponent(".claude.json")
+        let inside = directory.appending(component: ".claude.json", directoryHint: .notDirectory)
         if target == .dedicated || FileManager.default.fileExists(atPath: inside.path) { return inside }
-        return home.appendingPathComponent(".claude.json")
+        return home.appending(component: ".claude.json", directoryHint: .notDirectory)
     }
     // The default login's item belongs to the CLI and is reached through its tool. The dedicated one keeps the
     // access it was created with, so existing setups do not start asking for keychain permission.
@@ -277,22 +326,38 @@ final class RuntimeScope {
     }
     func check() throws {
         try prepare()
-        let current = try state()
+        try verify(state())
+    }
+    /// The scope as read is what Lilt last recorded there.
+    private func verify(_ current: Stamp) throws {
         if let expected = try expected() {
             guard !expected.pending, expected == current else { throw AppFailure("作用域凭据已被外部修改，或上次切换未完成。自动接力已暂停；请检查管理方。") }
         } else if current.file != nil || current.keychain != nil { throw AppFailure("此作用域已有未确认归属的凭据；Lilt 不会覆盖。") }
     }
-    /// What the CLI currently holds for this scope: its keychain item, or the fallback file.
+    /// What the CLI currently holds for this scope: its keychain item, or the fallback file. Lilt's signal is not a login.
     func currentCredential() throws -> Credential? {
-        guard let data = try keychainRead() ?? readFile() else { return nil }
-        return Credential(data: data)
+        if let held = try keychainRead() { return Credential(data: held) }
+        guard let onDisk = try readFile(), onDisk != Self.signal else { return nil }
+        return Credential(data: onDisk)
     }
     /// Take the scope as it is now for the baseline. Only after the caller has saved what is there.
     func rebaseline() throws {
         try prepare()
-        // The CLI keeps its login in the keychain. Bring the fallback file along so an old token is not left lying in it.
-        if let held = try keychainRead(), let onDisk = try readFile(), onDisk != held { try Disk.write(held, to: file) }
-        try Disk.write(JSONEncoder().encode(try state()), to: journal)
+        // Read once: every keychain read starts a process.
+        let held = try keychainRead()
+        var onDisk = try readFile()
+        // The CLI keeps its login in the keychain. Bring a fallback file that holds a login along, so an old token is not
+        // left lying in it. Lilt's signal stays what it is.
+        if let held, let stale = onDisk, stale != held, target == .dedicated || Self.holdsLogin(stale) {
+            try Disk.write(held, to: file); onDisk = held
+        }
+        try Disk.write(JSONEncoder().encode(Stamp(file: digest(onDisk), keychain: digest(held))), to: journal)
+    }
+    /// Take Lilt's signal away when Lilt stops managing the default login, so the CLI goes back to noticing keychain
+    /// changes by itself. A file that holds anything else is left alone.
+    func removeSignal() {
+        guard target == .system, (try? readFile()) == Self.signal else { return }
+        try? FileManager.default.removeItem(at: file)
     }
     /// A switch that started and did not finish. Nothing is taken in automatically while this is set.
     var transactionPending: Bool { ((try? expected()) ?? nil)?.pending == true }
@@ -322,26 +387,30 @@ final class RuntimeScope {
     }
     func apply(_ credential: Credential, replacingExternalState: Bool = false) throws {
         try credential.validate(); try prepare()
-        if !replacingExternalState { try check() }
         // The lock lives with Lilt's own data: nothing of Lilt's is left inside ~/.claude.
-        let lockURL = target == .system ? root.appendingPathComponent(".lilt-lock-system") : directory.appendingPathComponent(".lilt-lock")
+        let lockURL = target == .system ? root.appending(component: ".lilt-lock-system", directoryHint: .notDirectory)
+                                        : directory.appending(component: ".lilt-lock", directoryHint: .notDirectory)
         let fd = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw AppFailure("无法锁定作用域。") }
         defer { flock(fd, LOCK_UN); close(fd) }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw AppFailure("另一个 Lilt 实例正在切换。") }
+        // One read prepares the switch: what is there now is compared with the journal, written over and, if anything
+        // fails, put back. Every keychain read starts a process, and an automatic switch is a race with the limit.
+        let oldKey = try keychainRead()
+        let oldFile = try readFile()
+        let previous = Stamp(file: digest(oldFile), keychain: digest(oldKey))
         // An explicit account selection authorizes replacing the current login; automatic relay never does.
         // Keep the lock and compare-before-write checks even for an explicit replacement.
-        if !replacingExternalState { try check() }
+        if !replacingExternalState { try verify(previous) }
         let oldSettings = try readSettings()
         if !replacingExternalState, try oldSettings.map(AuthenticationSettings.hasAPIOverride) == true {
             throw AppFailure("检测到 API 模式，自动接力不会覆盖；请手动选择订阅账号。")
         }
         let newSettings = try replacingExternalState ? oldSettings.flatMap(AuthenticationSettings.subscriptionSettings) : nil
-        let previous = try state()
-        let oldKey = try keychainRead()
-        let oldFile = try readFile()
-        // On macOS the CLI reads the keychain; the fallback file is kept in step only where one already exists.
-        let writesFile = target == .dedicated || oldFile != nil
+        // On macOS the CLI reads the keychain. A fallback file that holds a login is kept in step; otherwise the file is
+        // Lilt's signal (see `signal`), written last so that running CLIs look again once everything else is in place.
+        let fileContent = target == .dedicated || Self.holdsLogin(oldFile) ? credential.data : Self.signal
+        var wroteFile = false
         var pending = previous; pending.pending = true
         let priorJournal = try? Data(contentsOf: journal)
         try Disk.write(JSONEncoder().encode(pending), to: journal)
@@ -356,11 +425,11 @@ final class RuntimeScope {
         do {
             try keychainWrite(credential.data)
             guard digest(try readFile()) == previous.file else { throw AppFailure("检测到外部写入，已停止。") }
-            if writesFile { try Disk.write(credential.data, to: file) }
             guard try readSettings() == oldSettings else { throw AppFailure("API 配置被其他工具同时修改，请稍后重试。") }
             if let newSettings { try Disk.write(newSettings, to: settingsFile) }
+            try Disk.write(fileContent, to: file); wroteFile = true
             let next = try state()
-            guard next.keychain == digest(credential.data), !writesFile || next.file == digest(credential.data),
+            guard next.keychain == digest(credential.data), next.file == digest(fileContent),
                   try readSettings() == (newSettings ?? oldSettings) else { throw AppFailure("登录配置同步不一致，已暂停。") }
             try Disk.write(JSONEncoder().encode(next), to: journal)
         } catch {
@@ -371,7 +440,8 @@ final class RuntimeScope {
             if digest(try? keychainRead()) == digest(credential.data) {
                 if let oldKey { try? keychainWrite(oldKey) } else { try? keychainDelete() }
             }
-            if writesFile, digest(try? readFile()) == digest(credential.data) {
+            // Written again even when it was the signal before, so a CLI that looked in between looks once more.
+            if wroteFile, digest(try? readFile()) == digest(fileContent) {
                 if let oldFile { try? Disk.write(oldFile, to: file) } else { try? FileManager.default.removeItem(at: file) }
             }
             // Leave a pending journal for explicit inspection after any interrupted transaction.

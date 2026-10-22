@@ -77,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-    func applicationWillTerminate(_ notification: Notification) { model?.login.cancel() }
+    func applicationWillTerminate(_ notification: Notification) { model?.login.cancel(); model?.flushSaves() }
     static func otherInstance() -> NSRunningApplication? {
         let me = NSRunningApplication.current
         return NSWorkspace.shared.runningApplications.first {

@@ -33,8 +33,11 @@ public enum SecureFiles {
     public static func directory(_ url: URL) throws {
         // Inspect every existing path component, including dangling symlinks.
         try rejectSymlinks(url)
-        if FileManager.default.fileExists(atPath: url.path) {
-            guard try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { throw SecureFileError.unsafePath }
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            guard info.st_mode & S_IFMT == S_IFDIR else { throw SecureFileError.unsafePath }
+            // Checked on every pass of the monitor; changing the mode only when it is wrong keeps that a read.
+            if info.st_mode & 0o777 == 0o700 { return }
         } else { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }

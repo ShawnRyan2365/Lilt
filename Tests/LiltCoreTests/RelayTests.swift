@@ -396,8 +396,11 @@ final class RelayTests {
         // However fast, at most ten points early.
         expectFalse(UsagePace.nearing(reading(16, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
         expect(UsagePace.nearing(reading(15, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
-        // The oldest reading within ten minutes sets the pace, so one quick step among slow ones does not.
+        // A point rounded up between two recent readings is no burst.
         expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 590), reading(9, ago: 40)], threshold: 5, at: now, lifetime: 300))
+        // A burst after a quiet stretch counts at its own pace: three points in the last 40 seconds, whatever the
+        // ten-minute average says. Sessions started all at once on an idle account spend like this.
+        expect(UsagePace.nearing(latest, after: [reading(9, ago: 590), reading(11, ago: 40)], threshold: 5, at: now, lifetime: 300))
         // A reading too old to act on is not acted on early either.
         expectFalse(UsagePace.nearing(reading(8, ago: 301), after: [reading(12, ago: 361)], threshold: 5, at: now, lifetime: 300))
         // The policy takes the hand-off as due.
