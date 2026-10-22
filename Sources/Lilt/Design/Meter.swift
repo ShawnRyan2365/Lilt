@@ -56,27 +56,20 @@ struct TickRuler: View {
         return min(count, max(1, Int((min(1, fraction) * Double(count)).rounded())))
     }
 
-    /// 0.72...1.0 of the full height.
-    private func wave(_ index: Int) -> CGFloat {
-        let t = Double(index) / Double(max(1, count - 1))
-        return 0.86 + 0.14 * CGFloat(sin(t * .pi * 2.4 + 0.6))
-    }
-
+    // Two shapes, lit and unlit ticks, rather than a view per tick: every account row has two rulers, and with twenty-odd
+    // accounts a view per tick meant well over a thousand views laid out again on every redraw of the window.
     var body: some View {
-        HStack(alignment: .bottom, spacing: 3) {
-            ForEach(0..<count, id: \.self) { index in
-                let on = index < filled
-                if fraction == nil {
-                    // Unknown is a row of dots (Particles), so it never reads as an empty ruler.
-                    Circle().fill(Tokens.trackOff).frame(maxWidth: 3, maxHeight: 3).frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    Capsule()
-                        .fill(on ? (tone == .neutral ? series.map { AnyShapeStyle($0) } ?? tone.solid : tone.solid) : AnyShapeStyle(Tokens.trackOff))
-                        .frame(maxWidth: tickWidth)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: height * wave(index) * (on ? 1 : 0.78))
-                        .animation(reduceMotion ? nil : Motion.snap.delay(Double(index) * 0.010), value: filled)
-                }
+        ZStack {
+            if fraction == nil {
+                // Unknown is a row of dots (Particles), so it never reads as an empty ruler.
+                RulerTicks(count: count, tickWidth: tickWidth, filled: 0, lit: false, dots: true).fill(Tokens.trackOff)
+            } else {
+                RulerTicks(count: count, tickWidth: tickWidth, filled: Double(filled), lit: false)
+                    .fill(Tokens.trackOff)
+                    .animation(reduceMotion ? nil : Motion.snap, value: filled)
+                RulerTicks(count: count, tickWidth: tickWidth, filled: Double(filled), lit: true)
+                    .fill(tone == .neutral ? series.map { AnyShapeStyle($0) } ?? tone.solid : tone.solid)
+                    .animation(reduceMotion ? nil : Motion.snap, value: filled)
             }
         }
         .frame(height: height, alignment: .bottom)
@@ -84,6 +77,48 @@ struct TickRuler: View {
         .motion(Motion.fade, value: dimmed)
         .onAppear { appeared = true }
         .accessibilityHidden(true)
+    }
+}
+
+/// The ticks of a `TickRuler` as one shape: the lit ones, or the unlit ones. Ticks share the width evenly, 3 points
+/// apart, bottom-aligned, with heights on a slow wave; an unlit tick is 0.78 of its lit height. `filled` animates, so a
+/// change still sweeps across the ruler one tick after another, each growing as the sweep passes it.
+private struct RulerTicks: Shape {
+    var count: Int
+    var tickWidth: CGFloat
+    var filled: Double
+    var lit: Bool
+    /// The unknown state: a dot in the middle of each tick's place.
+    var dots = false
+    var animatableData: Double {
+        get { filled }
+        set { filled = newValue }
+    }
+    /// 0.72...1.0 of the full height.
+    private func wave(_ index: Int) -> CGFloat {
+        let t = Double(index) / Double(max(1, count - 1))
+        return 0.86 + 0.14 * CGFloat(sin(t * .pi * 2.4 + 0.6))
+    }
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard count > 0 else { return path }
+        let spacing: CGFloat = 3
+        let slot = max(0, (rect.width - spacing * CGFloat(count - 1)) / CGFloat(count))
+        for index in 0..<count {
+            let left = rect.minX + CGFloat(index) * (slot + spacing)
+            if dots {
+                let size = min(3, slot)
+                path.addEllipse(in: CGRect(x: left + (slot - size) / 2, y: rect.midY - size / 2, width: size, height: size))
+                continue
+            }
+            let on = CGFloat(min(1, max(0, filled - Double(index))))
+            guard (on > 0.5) == lit else { continue }
+            let width = min(tickWidth, slot)
+            let height = rect.height * wave(index) * (0.78 + 0.22 * on)
+            path.addRoundedRect(in: CGRect(x: left + (slot - width) / 2, y: rect.maxY - height, width: width, height: height),
+                                cornerSize: CGSize(width: width / 2, height: min(width, height) / 2))
+        }
+        return path
     }
 }
 
