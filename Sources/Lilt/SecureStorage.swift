@@ -218,10 +218,13 @@ enum IOQueue {
 
 /// When Lilt switched the login, and whether by hand or by relay: the last 200 switches, one line each, in
 /// `switches.log`. It is there to set beside errors a Claude Code session reports, such as "Connection lost
-/// mid-response", and see whether they follow a switch. Times and kinds only: no names, tokens or account ids.
+/// mid-response", and see whether they follow a switch. A switch or takeover that failed is recorded too, with the
+/// error's own text, because the alert that showed it is gone by the time anyone asks why relay stopped. Those texts
+/// are Lilt's fixed messages and status codes: no names, tokens or account ids.
 enum SwitchLog {
-    static func record(_ kind: String, at date: Date = .now) {
-        let line = date.formatted(.iso8601) + " " + kind + "\n"
+    static func record(_ kind: String, detail: String? = nil, at date: Date = .now) {
+        let reason = detail.map { " " + $0.replacingOccurrences(of: "\n", with: " ") } ?? ""
+        let line = date.formatted(.iso8601) + " " + kind + reason + "\n"
         Task { await IOQueue.perform {
             let url = Disk.file("switches.log")
             let kept = ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").suffix(199).map { $0 + "\n" }.joined()
@@ -359,8 +362,16 @@ final class RuntimeScope: @unchecked Sendable {
         guard target == .system, (try? readFile()) == Self.signal else { return }
         try? FileManager.default.removeItem(at: file)
     }
-    /// A switch that started and did not finish. Nothing is taken in automatically while this is set.
+    /// A switch that started and did not finish. Nothing is taken in automatically while this is set, except by `settle`.
     var transactionPending: Bool { ((try? expected()) ?? nil)?.pending == true }
+    /// Ends a switch that stopped halfway, once the caller has found the keychain holding a login Lilt keeps. The
+    /// fallback file is left as a finished switch leaves it: a login there follows the keychain, and otherwise Lilt's
+    /// signal is written again so running CLIs read the keychain once more. The journal then records the scope as it is.
+    func settle() throws {
+        try prepare()
+        if target == .system, !Self.holdsLogin(try readFile()) { try Disk.write(Self.signal, to: file) }
+        try rebaseline()
+    }
 
     /// `oauthAccount` from a CLI config directory, as JSON. Nil when the file or the entry is missing.
     static func identity(in directory: URL) -> Data? { identity(at: directory.appendingPathComponent(".claude.json")) }
@@ -444,7 +455,12 @@ final class RuntimeScope: @unchecked Sendable {
             if wroteFile, digest(try? readFile()) == digest(fileContent) {
                 if let oldFile { try? Disk.write(oldFile, to: file) } else { try? FileManager.default.removeItem(at: file) }
             }
-            // Leave a pending journal for explicit inspection after any interrupted transaction.
+            // When everything reads back as it was before, the switch left nothing behind to inspect, and the journal
+            // goes back to what it said. Otherwise (a keychain that did not answer, or another writer) it stays
+            // pending until `settle` or the user can account for what the scope holds.
+            if (try? state()) == previous, (try? readSettings()) == oldSettings {
+                if let priorJournal { try? Disk.write(priorJournal, to: journal) } else { try? FileManager.default.removeItem(at: journal) }
+            }
             throw error
         }
     }

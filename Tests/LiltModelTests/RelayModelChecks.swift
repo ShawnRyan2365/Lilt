@@ -86,9 +86,10 @@ import LiltCore
         try await pauseChecks()
         try await autoSortChecks()
         try await scopeWatchChecks()
+        try await interruptedSwitchChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope reads that fail for a moment, the signal file for running CLIs, a threshold per window. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope reads that fail for a moment, switches the keychain stops halfway, the signal file for running CLIs, a threshold per window. No live credentials or requests.")
     }
 }
 
@@ -184,6 +185,85 @@ import LiltCore
     // Stopping management takes the signal away again, so the CLI goes back to watching the keychain by itself.
     scope.removeSignal()
     precondition(!FileManager.default.fileExists(atPath: signal.path))
+}
+
+/// A hand-off the keychain stops halfway (a write or the read after it does not answer) keeps relay on. A switch that
+/// left nothing changed leaves no unfinished journal; one that left the scope unknown is settled by the next check that
+/// reads: forward when the new login landed, back when it did not. Anything else in the scope still stops relay.
+@MainActor func interruptedSwitchChecks() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    precondition(home.path.contains("/work/"), "Run through scripts/check-relay-model.sh, which points the home directory at work/")
+    try SecureFiles.directory(home.appendingPathComponent(".claude"))
+    func document(_ access: String) -> Data { try! JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": access, "refreshToken": access + "-refresh"]]) }
+    func fresh(_ used: Double) -> UsageSnapshot { UsageSnapshot(fiveHour: UsageWindow(used: used), sevenDay: UsageWindow(used: 20)) }
+    var active = Account(label: "Fixture D", kind: .oauth); active.usage = fresh(99); active.usageCapability = .verified
+    var spare = Account(label: "Fixture E", kind: .oauth); spare.usage = fresh(10); spare.usageCapability = .verified
+    var library = Library()
+    library.accounts = [active, spare]; library.activeID = active.id
+    library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system
+    library.preferences.autoRelay = true; library.preferences.liveUsage = false
+    let mine = document("fixture-access-d"), theirs = document("fixture-access-e")
+    try AccountVault.write(mine, account: active.id.uuidString)
+    try AccountVault.write(theirs, account: spare.id.uuidString)
+    try AccountVault.write(Data(#"{"accountUuid":"fixture-account-d"}"#.utf8), account: Keychain.identityAccount(active.id))
+    try AccountVault.write(Data(#"{"accountUuid":"fixture-account-e"}"#.utf8), account: Keychain.identityAccount(spare.id))
+    let config = home.appendingPathComponent(".claude.json")
+    try SecureFiles.write(Data(#"{"oauthAccount":{"accountUuid":"fixture-account-d"}}"#.utf8), to: config)
+    let signal = home.appendingPathComponent(".claude/.credentials.json")
+    try? FileManager.default.removeItem(at: signal)
+
+    var held: Data? = mine
+    var failing: [Bool] = [] // one entry per keychain read, true = that read fails
+    var writes: [Bool] = []  // one entry per keychain write: true = it lands and then reports a failure, false = it fails without landing
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        if !failing.isEmpty, failing.removeFirst() { throw AppFailure("钥匙串没有响应，可能在等你允许访问。") }
+        return held
+    }, write: { data in
+        guard !writes.isEmpty else { held = data; return }
+        if writes.removeFirst() { held = data }
+        throw AppFailure("钥匙串没有响应，可能在等你允许访问。")
+    }, delete: { held = nil }))
+    try scope.rebaseline()
+    let model = AppModel(fixture: library, runtime: scope)
+    var done: Bool
+
+    // The write fails and everything reads back as before: nothing to settle, relay on and waiting to try again.
+    writes = [false]
+    done = await model.apply(spare.id, automatically: true); precondition(!done)
+    precondition(model.autoRelay && model.library.preferences.autoRelayStopReason == nil && model.relayRetryAt != nil)
+    precondition(model.active?.id == active.id && held == mine && !scope.transactionPending, "A clean rollback leaves no unfinished switch")
+    precondition(model.relayPause?.contains("Fixture E") == true, "The wait says which account and why")
+
+    // The write fails, and the keychain does not answer to the rollback either: the switch stays pending, relay stays on.
+    // Reads: the check before writing and the switch's own two succeed; the rollback's and the final look fail.
+    writes = [false]; failing = [false, false, false, true, true]
+    done = await model.apply(spare.id, automatically: true); precondition(!done)
+    precondition(model.autoRelay && model.library.preferences.autoRelayStopReason == nil && scope.transactionPending)
+    // While the keychain still does not answer, the check waits rather than stopping anything.
+    failing = [true]
+    done = await model.reconcileScope(); precondition(!done && model.autoRelay && model.scopeIssue == nil)
+    // Once it answers, the scope holds the login Lilt keeps for the account in use: the switch never landed.
+    done = await model.reconcileScope(); precondition(done && model.autoRelay && model.scopeIssue == nil)
+    precondition(model.active?.id == active.id && !scope.transactionPending && held == mine)
+
+    // The write lands but reports a failure, and the keychain then stops answering: once it answers again, the
+    // switch is finished, not undone.
+    writes = [true]; failing = [false, false, false, true, true]
+    done = await model.apply(spare.id, automatically: true); precondition(!done)
+    precondition(model.autoRelay && scope.transactionPending && held == theirs && model.active?.id == active.id)
+    done = await model.reconcileScope(); precondition(done && model.autoRelay && model.scopeIssue == nil)
+    precondition(model.active?.id == spare.id && !scope.transactionPending, "The account that landed is the one in use")
+    precondition((try? Data(contentsOf: signal)) == RuntimeScope.signal, "Running CLIs are told to look again")
+    precondition(RuntimeScope.identity(at: config).flatMap { String(data: $0, encoding: .utf8) }?.contains("fixture-account-e") == true)
+    done = await model.reconcileScope(); precondition(done && model.autoRelay)
+
+    // A switch left pending with a login Lilt does not keep in the scope still stops relay and asks the user.
+    writes = [false]; failing = [false, false, false, true, true]
+    done = await model.apply(active.id, automatically: true); precondition(!done && scope.transactionPending)
+    held = document("fixture-access-f")
+    done = await model.reconcileScope(); precondition(!done)
+    precondition(!model.autoRelay && model.scopeIssue != nil && model.library.preferences.autoRelayStopReason != nil)
+    try? FileManager.default.removeItem(at: signal)
 }
 
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up

@@ -77,7 +77,7 @@ final class AppModel {
     private(set) var apiModeDetected = false
     var keepsAPIMode: Bool { library.preferences.keepAPIMode == true }
     var displayedActiveID: UUID? { apiModeDetected || keepsAPIMode || scopeIssue != nil ? nil : library.activeID }
-    private var relayRetryAt: Date?
+    private(set) var relayRetryAt: Date?
     private let retryClock: () -> Date
     /// Where the selected account's login goes. Files from before there was a choice always meant Lilt's own directory;
     /// anything set up now takes over Claude Code's default login.
@@ -102,6 +102,7 @@ final class AppModel {
     var liveUsageEnabled: Bool { library.preferences.liveUsage != false }
     private(set) var statusLineIssue: String?
     private var lastSwitchAt = Date.distantPast
+    private var lastFailureLogged: (text: String, at: Date)?
     private var liveStamp: Date?
     private var lastStatusLineCheck = Date.distantPast
     private var lastStatusLineRepair = Date.distantPast
@@ -530,18 +531,56 @@ final class AppModel {
         do { try await IOQueue.run { try runtime.check() } }
         catch let failure as ScopeUnreadable { noteUnreadable(failure); return false }
         catch {
-            switch await readBack(into: active) {
-            case .adopt, .unchanged: break
-            case nil: return false // could not tell this time (no network, or the scope did not read); look again on the next pass
-            case .unverifiable, .foreign:
-                stopRelay(because: "无法确认当前登录仍属于所选账号，请到“接入”检查并决定采纳还是改回。")
-                scopeIssue = (error as? AppFailure)?.message ?? "登录检查失败。"; status = "\(scopeName)被别处改了，管理已暂停"
-                return false
+            guard let settled = await settleInterrupted() else { return false }
+            if !settled {
+                switch await readBack(into: active) {
+                case .adopt, .unchanged: break
+                case nil: return false // could not tell this time (no network, or the scope did not read); look again on the next pass
+                case .unverifiable, .foreign:
+                    stopRelay(because: "无法确认当前登录仍属于所选账号，请到“接入”检查并决定采纳还是改回。")
+                    scopeIssue = (error as? AppFailure)?.message ?? "登录检查失败。"; status = "\(scopeName)被别处改了，管理已暂停"
+                    return false
+                }
             }
         }
         // Assigned only when something changes: every assignment redraws whatever reads it, even an equal value.
         if scopeIssue != nil || scopeUnreadable != nil || scopeUnreadableSince != nil { scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil }
         return true
+    }
+    /// A switch the keychain left halfway (a write or the read after it did not answer in time) leaves its journal
+    /// pending. Once the scope reads again and holds, byte for byte, the login Lilt keeps for one of its accounts, the
+    /// switch either never landed or landed on that account. Lilt wrote what is there either way, so it is settled
+    /// without asking. Nil while the scope does not read; false when nothing is pending or the scope holds anything
+    /// else, which the usual checks then look at.
+    private func settleInterrupted() async -> Bool? {
+        enum Outcome: Sendable { case settled(UUID), other, unreadable(ScopeUnreadable) }
+        let runtime = self.runtime, ids = accounts.map(\.id), current = library.activeID
+        let outcome: Outcome = await IOQueue.perform {
+            guard runtime.transactionPending else { return .other }
+            do {
+                guard let held = try runtime.currentCredential(),
+                      let id = ids.first(where: { AccountVault.hasFile(account: $0.uuidString) && (try? AccountVault.read(account: $0.uuidString)) == held.data })
+                else { return .other }
+                try runtime.settle()
+                if id != current { try? runtime.writeIdentity((try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil) }
+                return .settled(id)
+            } catch let failure as ScopeUnreadable { return .unreadable(failure) }
+            catch { return .other }
+        }
+        switch outcome {
+        case .unreadable(let failure): noteUnreadable(failure); return nil
+        case .other: return false
+        case .settled(let id):
+            SwitchLog.record("settled")
+            // The reading that started the switch may start it again.
+            latch = RelayLatch()
+            guard id != library.activeID, let target = accounts.first(where: { $0.id == id }) else { status = "上次没切换成功，仍是原来的账号"; return true }
+            departedID = library.activeID; departedAt = .now
+            library.activeID = id; appliedPending = true; lastSwitchAt = .now; relayPause = nil; relayRetryAt = nil; save()
+            if managesDefaultLogin, liveUsageEnabled { let label = target.label; await IOQueue.perform { StatusLineBridge.setLabel(label) } }
+            status = "已切换到“\(target.label)”"
+            return true
+        }
     }
     /// What the scope holds relative to `account`'s stored login, taking it in when it is the same login renewed.
     /// The CLI's own note of who is logged in is checked first, as ORCA does; when that cannot settle it, the official
@@ -677,13 +716,8 @@ final class AppModel {
                         // Keep whatever the CLI renewed for the account being left; without this its stored login would go stale.
                         _ = await readBack(into: leaving)
                     }
-                    do { try await IOQueue.run { try runtime.apply(credential, replacingExternalState: !automatically) } }
-                    catch {
-                        // Nothing was written: the scope changed or did not read in the moment since it was checked.
-                        // The next pass looks again, and relay stays on.
-                        guard automatically, !(await IOQueue.perform({ runtime.transactionPending })) else { throw error }
-                        status = "接力稍后重试"; return false
-                    }
+                    // A failure here goes to the catch below, which keeps relay on whether or not anything was written.
+                    try await IOQueue.run { try runtime.apply(credential, replacingExternalState: !automatically) }
                     await IOQueue.perform {
                         try? runtime.writeIdentity((try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil)
                     }
@@ -707,10 +741,44 @@ final class AppModel {
             if demo { lastEvent = "演示：已接力至 \(target.label)" }
             return true
         } catch {
-            let wasRelaying = autoRelay
-            stopRelay(because: "凭据切换未完成，请检查登录和存储状态后重新开启。"); status = "切换未完成"
-            message = ((error as? AppFailure)?.message ?? (error as? UsageFailure)?.message ?? "凭据应用失败。") + (wasRelaying ? " 自动接力已关闭。" : "")
+            let reason = Self.reason(error) ?? "凭据应用失败。"
+            logFailure(automatically ? "auto-failed" : "manual-failed", reason)
+            status = "切换未完成"
+            // Relay stays on, as it does when a read fails. What stops a switch here passes by itself: the keychain not
+            // answering for a while, another writer in the same moment, a renewal turned down for a moment. A switch
+            // left halfway is finished or undone by the next scope check (`settleInterrupted`), and that check still
+            // stops relay when the scope holds a login Lilt cannot account for. Earlier versions stopped relay here,
+            // and it stayed off until the user came back.
+            if automatically { waitForRelay(because: "没能换到“\(target.label)”：\(reason)稍后自动重试。", until: retryClock().addingTimeInterval(15)) }
+            else { message = reason }
             return false
+        }
+    }
+    /// Runs `work` up to three times, two seconds apart, while the scope does not read: the keychain stops answering
+    /// for a while when many sessions use it, and a step the user asked for is better late than refused. Only for
+    /// steps that can be repeated as they are.
+    private static func patiently<T>(_ work: () async throws -> T) async throws -> T {
+        for _ in 1..<3 {
+            do { return try await work() } catch is ScopeUnreadable { try? await Task.sleep(for: .seconds(2)) }
+        }
+        return try await work()
+    }
+    /// Writes a failure to `switches.log`, once per kind and text in ten minutes: relay tries again every 15 seconds,
+    /// and a failure that lasts would otherwise push the record of past switches out of the 200 lines kept.
+    private func logFailure(_ kind: String, _ reason: String?) {
+        let text = kind + (reason ?? "")
+        if let last = lastFailureLogged, last.text == text, Date.now.timeIntervalSince(last.at) < 600 { return }
+        lastFailureLogged = (text, .now)
+        SwitchLog.record(kind, detail: reason)
+    }
+    /// The text an error of Lilt's own carries. Nil for anything else, whose description may name files and so is
+    /// neither shown nor written to `switches.log`.
+    private static func reason(_ error: Error) -> String? {
+        switch error {
+        case let failure as AppFailure: failure.message
+        case let failure as ScopeUnreadable: failure.message
+        case let failure as UsageFailure: failure.message
+        default: nil
         }
     }
     /// The user's own check in the CLI. Lilt records it and does not present it as independent verification.
@@ -724,24 +792,29 @@ final class AppModel {
         guard !demo, !busy, storageAvailable else { return }
         let scope = RuntimeScope(target: .system)
         let wanted = library.activeID
-        busy = true
+        busy = true; status = "正在接管默认登录…"
         var adopted: UUID?
         do {
             try await exclusively {
-                let current = try await IOQueue.run { () throws -> (Credential, Data?)? in
-                    guard let found = try scope.currentCredential(), (try? found.validate()) != nil else { return nil }
-                    return (found, scope.readIdentity())
+                let current = try await Self.patiently {
+                    try await IOQueue.run { () throws -> (Credential, Data?)? in
+                        guard let found = try scope.currentCredential(), (try? found.validate()) != nil else { return nil }
+                        return (found, scope.readIdentity())
+                    }
                 }
                 if let (found, identity) = current {
                     let twin = twin(of: identity, besides: nil)
                     try store(found, label: "当前登录", kind: found.refreshable ? .oauth : .setupToken, replacing: twin?.id, identity: identity)
                     adopted = twin?.id ?? accounts.last?.id
                 }
-                try await IOQueue.run { try scope.rebaseline() }
+                try await Self.patiently { try await IOQueue.run { try scope.rebaseline() } }
             }
         } catch {
-            busy = false
-            message = (error as? AppFailure)?.message ?? "无法接管默认登录，没有改动任何东西。"; return
+            busy = false; status = "接管未完成"
+            let reason = Self.reason(error)
+            logFailure("takeover-failed", reason)
+            // The reason is shown: without it, a keychain that was not answering looked like something wrong for good.
+            message = "无法接管默认登录。" + (reason.map { $0 + "默认登录没有改动，稍后再试。" } ?? "没有改动任何东西。"); return
         }
         updatePreferences { $0.scopeTarget = .system; $0.scopeEnabled = true }
         scopeIssue = nil; relayPause = nil; latch = RelayLatch(); appliedPending = false

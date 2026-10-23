@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import LiltCore
 
 final class NoRedirect: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -81,7 +82,12 @@ struct TokenRenewer {
 enum OrcaProbe {
     static func managesDefaultLogin() -> Bool {
         let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        let apps = (try? FileManager.default.contentsOfDirectory(atPath: support.path))?.filter { $0.lowercased().hasPrefix("orca") } ?? []
+        // Only a copy of ORCA that is running switches anything. Each copy keeps its data in a folder named after the
+        // app ("orca" for Orca.app, "Orca Relay" for Orca Relay.app), and the folder stays when the copy is no longer
+        // used: an old build that last ran weeks ago, with its Claude switching still on, raised the warning for good.
+        let running = Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.deletingPathExtension().lastPathComponent.lowercased() })
+        let apps = (try? FileManager.default.contentsOfDirectory(atPath: support.path))?
+            .filter { $0.lowercased().hasPrefix("orca") && running.contains($0.lowercased()) } ?? []
         for app in apps {
             let profiles = support.appendingPathComponent(app).appendingPathComponent("profiles")
             for profile in (try? FileManager.default.contentsOfDirectory(atPath: profiles.path)) ?? [] {
