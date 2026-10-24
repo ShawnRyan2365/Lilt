@@ -52,6 +52,7 @@ actor ScriptedUsage: UsageFetching {
         }
         return snapshot
     }
+    func reset(_ newScripts: [String: [UsageFailure?]]) { scripts = newScripts; calls = 0 }
 }
 struct FakeIdentity: IdentityFetching {
     let identities: [String: Data]
@@ -104,18 +105,23 @@ func testRefreshRecovery() async throws {
     let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), requestGap: 0)
     let aID = try await engine.add(a, identity: identity("refresh-a"), label: "A", kind: .oauth)
     _ = try await engine.takeOver(label: nil)
+    await Task.yield()
+    await engine.refresh(aID)
+    await usage.reset([a.token!: [.network, nil], b.token!: [.rateLimited(120), nil]])
     await engine.refresh(aID)
     await engine.refresh(aID)
-    expect(await usage.calls == 1, "automatic refresh ignored ordinary backoff")
+    let automaticCalls = await usage.calls
+    expect(automaticCalls == 1, "automatic refresh ignored ordinary backoff")
     await engine.refresh(aID, manually: true)
-    expect(await usage.calls == 2, "manual refresh did not override ordinary backoff")
+    let manualCalls = await usage.calls
+    expect(manualCalls == 2, "manual refresh did not override ordinary backoff: calls=\(manualCalls)")
     let state = await engine.snapshot()
     expect(state.0.accounts[0].usage?.fiveHour?.used == 25 && state.1.message == "额度已更新", "manual refresh recovery")
-    _ = try await engine.add(b, identity: identity("refresh-b"), label: "B", kind: .oauth)
-    let bID = state.0.activeID == aID ? try await engine.snapshot().0.accounts.first { $0.label == "B" }!.id : aID
+    let bID = try await engine.add(b, identity: identity("refresh-b"), label: "B", kind: .oauth)
     await engine.refresh(bID, manually: true)
     await engine.refresh(bID, manually: true)
-    expect(await usage.calls == 3, "manual refresh bypassed server 429")
+    let limitedCalls = await usage.calls
+    expect(limitedCalls == 3, "manual refresh bypassed server 429")
 }
 
 func testFreshServerTakeover() async throws {
@@ -154,6 +160,15 @@ func testAutomaticRelay() async throws {
     var externalConfig = try JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.globalClaudeConfig)) as! [String: Any]
     externalConfig["oauthAccount"] = try JSONSerialization.jsonObject(with: identity("a"))
     try SecureFiles.write(try JSONSerialization.data(withJSONObject: externalConfig), to: store.paths.globalClaudeConfig)
+    let vault = store.paths.dataRoot.appendingPathComponent("secrets").appendingPathComponent(bID.uuidString)
+    let backup = vault.appendingPathExtension("backup")
+    try FileManager.default.moveItem(at: vault, to: backup)
+    try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: false)
+    await engine.tick()
+    let waiting = await engine.snapshot()
+    expect(waiting.0.preferences.autoRelay == true && waiting.1.scopeUnreadable != nil, "local read failure became a permanent stop")
+    try FileManager.default.removeItem(at: vault)
+    try FileManager.default.moveItem(at: backup, to: vault)
     await engine.tick()
     let stopped = await engine.snapshot().0
     expect(stopped.preferences.autoRelay == false, "foreign login did not stop automatic relay")
@@ -164,6 +179,7 @@ expect(SHA256.hex(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a3
 expect(SHA256.hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "SHA-256 empty")
 try testSecureRuntime()
 try testStatusLine()
+try await testRefreshRecovery()
 try await testFreshServerTakeover()
 try await testAutomaticRelay()
-print("LiltBackendChecks: PASS (6 groups: digest, secure runtime, API preservation, status line, fresh server, automatic relay)")
+print("LiltBackendChecks: PASS (7 groups: digest, secure runtime, API preservation, status line, refresh recovery, fresh server, automatic relay)")

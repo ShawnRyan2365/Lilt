@@ -311,10 +311,13 @@ public actor HeadlessEngine {
         if switching { if manually { message = "正在切换账号，完成后即可刷新" }; return }
         if let task = refreshTasks[id] {
             if manually { message = "正在读取额度，请稍候" }
-            await task.value; return
+            await task.value
+            if refreshTasks[id] == task { refreshTasks[id] = nil }
+            return
         }
         let task = Task { await self.performRefresh(id, manually: manually) }
-        refreshTasks[id] = task; await task.value; refreshTasks[id] = nil
+        refreshTasks[id] = task; await task.value
+        if refreshTasks[id] == task { refreshTasks[id] = nil }
     }
     private func performRefresh(_ id: UUID, manually: Bool) async {
         guard library.accounts.contains(where: { $0.id == id }) else { return }
