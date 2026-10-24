@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 public extension UsageParser {
     static let statusLineSource = "Claude Code 状态栏"

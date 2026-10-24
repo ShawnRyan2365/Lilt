@@ -106,6 +106,8 @@ public struct Preferences: Codable, Sendable {
     public var keepAPIMode: Bool?
     /// Nil in files written before there was a choice; those always meant `dedicated`.
     public var scopeTarget: ScopeTarget?
+    /// Store the runtime login in `.credentials.json` instead of the macOS keychain. Nil keeps the existing behavior.
+    public var runtimeFileStorage: Bool?
     /// Read quota from Claude Code's status line. Nil means on.
     public var liveUsage: Bool?
     /// Use an account whose 7-day window resets sooner, even while the active account is still above

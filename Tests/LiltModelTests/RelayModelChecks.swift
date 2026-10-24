@@ -87,9 +87,12 @@ import LiltCore
         try await autoSortChecks()
         try await scopeWatchChecks()
         try await interruptedSwitchChecks()
+        try await refreshRecoveryChecks()
+        try await emptyFileTakeoverCheck()
+        try fileRuntimeChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope reads that fail for a moment, switches the keychain stops halfway, the signal file for running CLIs, a threshold per window. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, manual retry vs server 429, the signal file for running CLIs, a threshold per window. No live credentials or requests.")
     }
 }
 
@@ -151,6 +154,19 @@ import LiltCore
     settled = await model.reconcileScope(); precondition(settled && model.autoRelay)
     let kept = try AccountVault.read(account: active.id.uuidString)
     precondition(kept == renewed, "The renewal is kept for the account")
+
+    // A local credential read that throws is also temporary, not proof of an outside account.
+    let vault = Disk.root.appendingPathComponent("secrets").appendingPathComponent(active.id.uuidString)
+    let backup = vault.appendingPathExtension("backup")
+    try FileManager.default.moveItem(at: vault, to: backup)
+    try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: false)
+    held = document("fixture-access-a3", refresh: "fixture-refresh-a3")
+    settled = await model.reconcileScope(); precondition(!settled)
+    precondition(model.autoRelay && model.scopeIssue == nil, "A local read failure must not become a permanent safety stop")
+    try FileManager.default.removeItem(at: vault)
+    try FileManager.default.moveItem(at: backup, to: vault)
+    held = renewed
+    settled = await model.reconcileScope(); precondition(settled && model.autoRelay && model.scopeUnreadable == nil)
 
     // A settings file caught mid-write by another tool reads as malformed. That waits too.
     let settings = home.appendingPathComponent(".claude/settings.json")
@@ -266,6 +282,68 @@ import LiltCore
     try? FileManager.default.removeItem(at: signal)
 }
 
+/// Quota reads use the account's own stored login, not the scope's keychain or lock. Temporary local failures do not
+/// become authentication failures; a person can retry through an ordinary backoff, but not through a server 429.
+@MainActor func refreshRecoveryChecks() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    precondition(home.path.contains("/work/"))
+    var active = Account(label: "Fixture refresh A", kind: .oauth)
+    active.usage = UsageSnapshot(fiveHour: UsageWindow(used: 30), sevenDay: UsageWindow(used: 20))
+    active.usageCapability = .verified
+    var spare = Account(label: "Fixture refresh B", kind: .oauth)
+    spare.usage = active.usage; spare.usageCapability = .verified
+    var library = Library()
+    library.accounts = [active, spare]; library.activeID = active.id
+    library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system
+    library.preferences.autoRelay = true; library.preferences.liveUsage = false
+    let login = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-refresh-access", "refreshToken": "fixture-refresh-token"]])
+    try AccountVault.write(login, account: active.id.uuidString)
+    var keychainCalls = 0
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        keychainCalls += 1
+        throw AppFailure("Fixture keychain unavailable")
+    }, write: { _ in }, delete: { }))
+    var calls = 0
+    var failures: [Error?] = []
+    let model = AppModel(fixture: library, runtime: scope, usageFetch: { _ in
+        calls += 1
+        if !failures.isEmpty, let failure = failures.removeFirst() { throw failure }
+        return UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    })
+
+    await model.refresh(active.id, manually: true)
+    precondition(calls == 1 && keychainCalls == 0, "A quota read neither reads nor waits for the scope keychain")
+    precondition(model.active?.usage?.fiveHour?.used == 25 && model.status == "额度已更新")
+
+    failures = [ScopeUnreadable(AppFailure("Fixture local read unavailable"))]
+    await model.refresh(active.id)
+    precondition(calls == 2 && model.active?.issue == nil && model.autoRelay)
+    await model.refresh(active.id)
+    precondition(calls == 3, "A temporary local failure creates no authentication backoff")
+
+    failures = [UsageFailure.network]
+    await model.refresh(active.id)
+    precondition(calls == 4)
+    await model.refresh(active.id)
+    precondition(calls == 4, "Automatic reads respect an ordinary backoff")
+    await model.refresh(active.id, manually: true)
+    precondition(calls == 5 && model.status == "额度已更新", "A manual refresh can retry an ordinary backoff")
+
+    model.busy = true
+    await model.refresh(active.id, manually: true)
+    precondition(model.status == "正在切换账号，完成后即可刷新")
+    model.busy = false; model.loading = true
+    await model.refresh(active.id, manually: true)
+    precondition(model.status == "正在读取额度，请稍候")
+    model.loading = false
+
+    failures = [UsageFailure.rateLimited(120)]
+    await model.refresh(active.id, manually: true)
+    precondition(calls == 6)
+    await model.refresh(active.id, manually: true)
+    precondition(calls == 6 && model.status.contains("稍后再查"), "A server 429 still blocks a manual retry")
+}
+
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up
 /// to two minutes later; many accounts sharing one reason are summed up in one phrase. Background reads leave the
 /// notice's dismiss button and the account buttons usable.
@@ -299,7 +377,7 @@ import LiltCore
     model.appliedPending = true
     model.loading = true
     precondition(!model.blocks(.confirmApplied) && !model.blocks(.openScope), "Dismissing a note never waits for a read")
-    precondition(model.blocks(.refresh(back)) && !model.blocks(.reauthorize(back)))
+    precondition(!model.blocks(.refresh(back)) && !model.blocks(.reauthorize(back)), "A manual refresh stays clickable and explains the read in progress")
     model.busy = true
     precondition(model.blocks(.reauthorize(back)) && !model.blocks(.confirmApplied))
     model.busy = false
@@ -366,6 +444,96 @@ func keychainCommandChecks() throws {
         guard multilineRead == multiline else { throw AppFailure("Fixture multiline JSON did not round-trip exactly.") }
         print("PASS: isolated macOS keychain item — large JSON and multiline JSON round-trip, no real credentials accessed.")
     }
+}
+
+/// Selecting file storage before the first takeover must also work when Claude has no runtime login yet.
+@MainActor func emptyFileTakeoverCheck() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    precondition(home.path.contains("/work/"))
+    var wanted = Account(label: "Fixture empty takeover", kind: .oauth)
+    wanted.usage = UsageSnapshot(fiveHour: UsageWindow(used: 10), sevenDay: UsageWindow(used: 20))
+    wanted.usageCapability = .verified
+    var library = Library()
+    library.accounts = [wanted]; library.activeID = wanted.id
+    library.preferences.runtimeFileStorage = true; library.preferences.liveUsage = false
+    let login = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-empty-takeover"]])
+    try AccountVault.write(login, account: wanted.id.uuidString)
+    var keychainCalls = 0
+    let scope = RuntimeScope(fixtureHome: home, fileStorage: true, credentials: .init(read: {
+        keychainCalls += 1; return nil
+    }, write: { _ in keychainCalls += 1 }, delete: { keychainCalls += 1 }))
+    let model = AppModel(fixture: library, runtime: scope)
+    await model.takeOverDefaultLogin()
+    precondition(model.library.preferences.scopeEnabled && model.active?.id == wanted.id)
+    precondition(try! scope.currentCredential()?.data == login)
+    precondition(keychainCalls == 0 && !model.busy && model.status == "已接管默认登录")
+}
+
+/// Runtime file mode never calls the keychain. Both migration directions preserve the login, and failures roll back.
+func fileRuntimeChecks() throws {
+    let home = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("work/Lilt-file-storage-fixture-" + UUID().uuidString)
+    try SecureFiles.directory(home.appendingPathComponent(".claude"))
+    defer { try? FileManager.default.removeItem(at: home) }
+    let file = home.appendingPathComponent(".claude/.credentials.json")
+    let earlier = Data(#"{"claudeAiOauth":{"accessToken":"fixture-file-earlier"}}"#.utf8)
+    let subscription = Credential(data: Data(#"{"claudeAiOauth":{"accessToken":"fixture-file-subscription"}}"#.utf8))
+    let external = Data(#"{"claudeAiOauth":{"accessToken":"fixture-file-external"}}"#.utf8)
+    var held: Data? = earlier
+    var reads = 0, writes = 0, deletes = 0
+    var onWrite: (() throws -> Void)?
+    var onDelete: (() throws -> Void)?
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        reads += 1; return held
+    }, write: {
+        writes += 1; held = $0; try onWrite?()
+    }, delete: {
+        deletes += 1; try onDelete?(); held = nil
+    }))
+    // First takeover has no journal yet: the explicit adoption establishes the file baseline directly.
+    try scope.migrateCredentialStorage(toFile: true, replacingExternalState: true)
+    precondition(scope.fileStorage && held == nil)
+    precondition((try! Data(contentsOf: file)) == earlier)
+    precondition(try! scope.currentCredential()?.data == earlier)
+    let mode = (try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue
+    precondition(mode == 0o600, "The runtime login file is private to the current user")
+
+    reads = 0; writes = 0; deletes = 0
+    try scope.apply(subscription)
+    try scope.check()
+    try scope.rebaseline()
+    try scope.settle()
+    precondition(try! scope.currentCredential()?.data == subscription.data)
+    precondition(reads == 0 && writes == 0 && deletes == 0, "File-mode checks, switches and settling never call the keychain")
+    scope.removeSignal()
+    precondition((try! Data(contentsOf: file)) == subscription.data, "Releasing management leaves a file login in place")
+
+    try SecureFiles.write(external, to: file)
+    do { try scope.apply(subscription); fatalError("Expected external file refusal") } catch {}
+    precondition((try! Data(contentsOf: file)) == external)
+    try scope.rebaseline()
+    try scope.migrateCredentialStorage(toFile: false)
+    precondition(!scope.fileStorage && held == external)
+    precondition((try! Data(contentsOf: file)) == RuntimeScope.signal)
+    precondition(try! scope.currentCredential()?.data == external)
+    try scope.check()
+
+    // A failed keychain delete restores the original file and leaves no pending transaction.
+    onDelete = { throw AppFailure("Fixture delete failed") }
+    do { try scope.migrateCredentialStorage(toFile: true); fatalError("Expected delete failure") } catch {}
+    precondition(!scope.fileStorage && held == external)
+    precondition((try! Data(contentsOf: file)) == RuntimeScope.signal && !scope.transactionPending)
+    try scope.check()
+    onDelete = nil
+
+    // A failed keychain write while moving back leaves the file login and its baseline intact.
+    try scope.migrateCredentialStorage(toFile: true)
+    onWrite = { throw AppFailure("Fixture write failed") }
+    do { try scope.migrateCredentialStorage(toFile: false); fatalError("Expected write failure") } catch {}
+    precondition(scope.fileStorage && held == nil)
+    precondition((try! Data(contentsOf: file)) == external && !scope.transactionPending)
+    try scope.check()
+    onWrite = nil
+    print("PASS: runtime file storage — no keychain calls, 0600 file, switches/settling, bidirectional migration and rollback. Fictional credentials only.")
 }
 
 func runtimeChecks() throws {

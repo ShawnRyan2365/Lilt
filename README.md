@@ -101,11 +101,66 @@ Lilt 会自己检查新版本。有新版本时，菜单栏面板和管理窗口
 - 如果 ORCA 等工具也在切换 Claude 账号，两边会互相覆盖。Lilt 发现登录被别人改过会停下来，让你选择采纳还是改回，不会硬覆盖。请只保留一个管理方。
 - 切换途中钥匙串一时没有响应（会话很多时偶尔出现），自动接力不会关掉：Lilt 等十几秒再换，切到一半的那次会在钥匙串恢复后自动补完或撤回。只有登录确实被别人换掉、Lilt 认不出来时，才会停下来问你。
 
+## Linux 服务器版
+
+Linux 版是独立的 `lilt` 命令行与同用户 `liltd` 后台服务，不需要图形界面，不开 HTTP 端口，也不转发模型请求。CLI 与后台服务只通过当前用户可访问的 Unix socket 通信。账号库、凭据和状态默认分别放在 `~/.local/share/lilt/`、`~/.local/state/lilt/`，遵循对应的 `XDG_*_HOME` 设置；Claude 登录写入 `${CLAUDE_CONFIG_DIR:-~/.claude}/.credentials.json`。
+
+安装静态二进制后，先安装用户服务，再接管或添加账号：
+
+```sh
+lilt service install          # 安装并启动 systemd 用户服务
+lilt takeover                 # 接管当前 Claude 默认登录
+lilt login --label 工作       # 通过官方 CLI 添加完整 OAuth 登录
+lilt list
+lilt switch 2
+lilt auto on
+lilt status
+```
+
+如果服务器还没有登录过，先运行 `lilt login`，再运行 `lilt takeover`；默认登录为空时会把第一个受管账号应用进去。远程服务器没有本地浏览器时，`lilt login` 仍由官方 CLI 在当前 SSH 终端给出授权流程；按终端提示在浏览器完成即可。也可以添加 `claude setup-token` 的长效 Token，但它读不到订阅额度，只能手动切换，不能参与自动接力。Token 只从标准输入读取：
+
+```sh
+read -rsp 'Token: ' TOKEN; echo
+printf '%s\n' "$TOKEN" | lilt add-token --label 备用
+unset TOKEN
+```
+
+常用操作：
+
+```sh
+lilt refresh                  # 刷新全部账号额度
+lilt auto once                # 在 cron/systemd timer 中做一次检查
+lilt config set five-hour-threshold 5
+lilt config set seven-day-threshold 1
+lilt config set auto-sort on
+lilt statusline off           # 关闭实时额度并还原原状态栏
+lilt release                  # 停止接管，不退出当前 Claude 登录
+lilt service uninstall        # 停止并移除用户服务，保留账号库
+lilt status --json            # 脚本使用的机器可读输出
+lilt daemon                   # 不用 systemd 时前台运行
+```
+
+如果希望退出所有 SSH 会话后服务仍运行，系统还需允许该用户 linger；是否启用由服务器管理员决定。多个终端共用同一个凭据作用域时会一起切换，不是每个进程独立绑定账号。
+
+Linux 后端已有隔离 HOME 的规则、文件事务、状态栏、自动接力及 CLI/socket 端到端检查。**真实服务器上的 systemd 生命周期、官方 OAuth 登录、两个真实账号的原会话热切换和长期自动接力仍需受控验收。** 不要把编译和虚构数据检查当作这些真实能力的验收结果。
+
+从源码检查与构建：
+
+```sh
+swift run LiltChecks
+swift run LiltBackendChecks
+swift build --product lilt
+bash scripts/check-linux-cli.sh
+# 安装 Swift Static Linux SDK 后，构建 ARM64 与 x86-64 静态包：
+./scripts/build-linux.sh
+```
+
 ## 数据放在哪里
 
 - 账号列表和偏好：`~/Library/Application Support/Lilt/accounts.json`，不含凭据。
 - 每个账号的登录凭据：`~/Library/Application Support/Lilt/secrets/`，权限 0600，只有当前用户能读。
-- 接管后，Lilt 写入 Claude Code 自己读取登录的位置：钥匙串条目 `Claude Code-credentials`（通过系统的 `security` 工具读写）、`~/.claude.json` 里的 `oauthAccount`，以及 `~/.claude/.credentials.json`。最后这个文件原来存着登录时，Lilt 让它跟着钥匙串一起换。原来没有这个文件时，Lilt 只放一个空的 `{}`，不放任何凭据，用途是在每次切换时改动它的修改时间，提醒正在运行的 `claude` 重新读登录。停止接管时，Lilt 会删掉这个空文件。
+- 接管后，Lilt 默认把运行时登录写入 Claude Code 自己读取的钥匙串条目 `Claude Code-credentials`（通过系统的 `security` 工具读写），并同步 `~/.claude.json` 里的 `oauthAccount`。`~/.claude/.credentials.json` 原来存着登录时，Lilt 让它跟着钥匙串一起换；否则只写空的 `{}` 信号，提醒正在运行的 `claude` 重新读登录。停止接管时会删掉这个空文件。
+- 设置里的“运行时登录存到本地文件”可改为只使用 `~/.claude/.credentials.json`（0600），开启后 Lilt 的日常检查和切换不再读写 macOS 钥匙串。双向迁移先验证新位置再移除旧副本，失败回滚。文件不受钥匙串加密保护，不要同步或分享它；真实 CLI 文件模式热切换仍需受控验证。
 - 切换记录：`~/Library/Application Support/Lilt/switches.log`，最近 200 条：每次切换的时间和方式（手动或自动接力），以及切换或接管没成功时 Lilt 给出的原因，不含账号名称或凭据。会话里出现 “Connection lost mid-response” 之类的错误时，可以拿来对照是不是刚好在切换。
 - 实时额度（默认开，可在“接入”页关闭）：在 `~/.claude/settings.json` 的状态栏命令前加一个小脚本，只取 Claude Code 交给状态栏的额度数据，终端里显示的内容不变。第一次改动前会把原文件备份为 `claude-settings-before-lilt.json`，关闭时放回原来的状态栏。
 - 额度查询有节制：自动接力开着时当前账号每 5 分钟查一次（离阈值 15 个百分点以内时每 2 分钟）。其他账号只在当前账号快到阈值、需要接力或手动刷新时才查：快到阈值时提前查排在最前的账号（读数超过 5 分钟才查，每 15 秒最多一个）；换号前查要换上的账号（2 分钟内查过的直接用），查出来不够就查下一个，一次最多 4 个；额度已用完的账号在重置前不再重复查。遇到限流时全部暂停，等官方允许再查。

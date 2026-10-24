@@ -290,6 +290,12 @@ struct SettingsView: View {
                 }
             } footer: { Text("按 7 天额度排接力顺序：先重置的在前，同一天重置的剩余多的在前。换号时先挑 5 小时额度最空的账号，一样空的按这个顺序，换上后一直用到阈值。和「先用快重置的周额度」二选一，关闭后恢复手动顺序。") }
             Section {
+                LabeledContent("运行时登录存到本地文件") {
+                    LiquidToggle(label: "运行时登录存到本地文件", isOn: Binding(get: { model.runtimeFileStorage }, set: { model.setRuntimeFileStorage($0) }), width: 44)
+                        .disabled(model.demo || model.busy)
+                }
+            } footer: { Text("默认关闭。开启后使用 ~/.claude/.credentials.json（仅当前用户可读写），Lilt 不再读写 macOS 钥匙串。文件不受钥匙串加密保护，仅建议在这台个人 Mac 上使用；关闭时可安全迁回。") }
+            Section {
                 Picker("快速面板快捷键", selection: shortcut) { Text("⌘⌥L").tag(UInt32(37)); Text("⌘⌥J").tag(UInt32(38)); Text("⌘⌥K").tag(UInt32(40)) }
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
             } footer: { Text("在任何应用里按下，打开或收起菜单栏面板。Lilt 无法得知其他应用是否占用了同一组合；按下没有反应时请换一个。") }
@@ -387,10 +393,10 @@ struct MenuPanel: View {
             HStack(spacing: 2) {
                 Button("管理账号") { model.selectedPage = .accounts; openMain() }.buttonStyle(.lilt(.ghost, size: .small))
                 Spacer()
-                Button { refreshSpin += 1; if let id = model.active?.id { Task { await model.refresh(id) } } } label: {
+                Button { refreshSpin += 1; if let id = model.active?.id { Task { await model.refresh(id, manually: true) } } } label: {
                     Image(systemName: "arrow.clockwise").symbolEffect(.rotate, value: reduceMotion ? 0 : refreshSpin)
                 }
-                .buttonStyle(.liltIcon(.ghost, diameter: 28)).disabled(model.active == nil || model.loading || model.busy)
+                .buttonStyle(.liltIcon(.ghost, diameter: 28)).disabled(model.active == nil)
                 .help("刷新额度").accessibilityLabel("刷新额度")
                 Button { openSettings(); NSApp.activate(ignoringOtherApps: true) } label: { Image(systemName: "gearshape") }
                     .buttonStyle(.liltIcon(.ghost, diameter: 28)).help("设置").accessibilityLabel("设置")

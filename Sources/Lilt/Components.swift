@@ -390,7 +390,7 @@ struct AccountRow: View {
             }
             .frame(width: AccountColumns.action)
             Menu {
-                Button("刷新额度") { Task { await model.refresh(account.id) } }
+                Button("刷新额度") { Task { await model.refresh(account.id, manually: true) } }
                 Button("修改备注", action: onRename)
                 Button(account.enabled ? "停用" : "启用") { model.update(account.id) { $0.enabled.toggle() } }
                 Button("上移") { model.move(account.id, by: -1) }.disabled(model.autoSort || index == 0)

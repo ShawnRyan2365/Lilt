@@ -116,10 +116,10 @@ struct MainView: View {
                 .accessibilityElement(children: .ignore).accessibilityLabel("当前账号：\(active.label)")
                 Spacer(minLength: 8)
                 if let usage = active.usage { FreshnessText(date: usage.sampledAt).font(Typo.caption).foregroundStyle(Tokens.muted) }
-                Button { refreshSpin += 1; Task { await model.refresh(active.id) } } label: {
+                Button { refreshSpin += 1; Task { await model.refresh(active.id, manually: true) } } label: {
                     Image(systemName: "arrow.clockwise").symbolEffect(.rotate, value: reduceMotion ? 0 : refreshSpin)
                 }
-                .buttonStyle(.liltIcon(.filled)).disabled(model.loading || model.busy)
+                .buttonStyle(.liltIcon(.filled))
                 .help("刷新额度").accessibilityLabel("刷新当前账号额度")
             }
             ViewThatFits(in: .horizontal) {
@@ -167,7 +167,7 @@ struct MainView: View {
     @ViewBuilder private func accountMenu(_ id: UUID) -> some View {
         if let account = model.accounts.first(where: { $0.id == id }) {
             let active = id == model.library.activeID
-            Button("刷新额度") { Task { await model.refresh(id) } }
+            Button("刷新额度") { Task { await model.refresh(id, manually: true) } }
             Button("修改备注") { rename = account.label; renameID = id }
             Button(account.enabled ? "停用" : "启用") { model.update(id) { $0.enabled.toggle() } }
             Divider()
@@ -239,6 +239,7 @@ struct MainView: View {
                 fact("Claude Code", model.version.replacingOccurrences(of: " (Claude Code)", with: ""))
                 fact("系统", "macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)")
                 fact("接入方式", !model.library.preferences.scopeEnabled ? "未接管" : model.scopeTarget == .system ? "Claude Code 默认登录" : "Lilt 专属目录")
+                fact("运行时登录", model.runtimeFileStorage ? "本地文件（0600）" : "macOS 钥匙串")
                 fact("实时额度", !model.managesDefaultLogin ? "未接管默认登录" : !model.liveUsageEnabled ? "关闭（按时查询接口）" : model.liveUsageSampledAt.map { "状态栏 · \(Wording.age($0, now: .now))" } ?? "状态栏 · 尚无读数")
                 fact("模型转发", "无", last: true)
             }

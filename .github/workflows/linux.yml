@@ -1,0 +1,22 @@
+name: Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Core rules
+        run: swift run LiltChecks
+      - name: Headless backend
+        run: swift run LiltBackendChecks
+      - name: CLI and daemon
+        run: |
+          swift build --product lilt
+          bash scripts/check-linux-cli.sh

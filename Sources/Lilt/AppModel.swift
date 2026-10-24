@@ -82,7 +82,8 @@ final class AppModel {
     /// Where the selected account's login goes. Files from before there was a choice always meant Lilt's own directory;
     /// anything set up now takes over Claude Code's default login.
     var scopeTarget: ScopeTarget { library.preferences.scopeTarget ?? (library.preferences.scopeEnabled ? .dedicated : .system) }
-    var runtime: RuntimeScope { fixtureRuntime ?? RuntimeScope(target: scopeTarget) }
+    var runtimeFileStorage: Bool { library.preferences.runtimeFileStorage == true }
+    var runtime: RuntimeScope { fixtureRuntime ?? RuntimeScope(target: scopeTarget, fileStorage: runtimeFileStorage) }
     private var fixtureRuntime: RuntimeScope?
     /// Lilt is putting logins into Claude Code's default login, so a plain `claude` in any terminal uses them.
     var managesDefaultLogin: Bool { library.preferences.scopeEnabled && scopeTarget == .system }
@@ -114,6 +115,8 @@ final class AppModel {
     private var paceReadings: [UsageSnapshot] = []
     private var paceAccount: UUID?
     private var scopeCheckedAt = Date.distantPast
+    private var scopeRetryAt = Date.distantPast
+    private var scopeReadFailures = 0
     private var preparedAt = Date.distantPast
     /// When the last status line reading was taken, for the 接入 page. Kept here so drawing the page reads no file.
     private(set) var liveUsageSampledAt: Date?
@@ -129,7 +132,7 @@ final class AppModel {
     private var unsaved: Library?
     private var saving = false
     private var monitor: Task<Void, Never>?
-    private var usageClient = UsageClient()
+    private var usageFetch: (Credential) async throws -> UsageSnapshot = { try await UsageClient().fetch($0) }
     let updater = Updater()
     enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", scope = "接入", diagnostics = "诊断"
         var symbol: String { switch self { case .overview: "square.grid.2x2"; case .accounts: "person.2"; case .scope: "terminal"; case .diagnostics: "waveform.path.ecg" } }
@@ -173,10 +176,11 @@ final class AppModel {
     }
     /// A live model whose scope is an in-memory fixture, for regression checks of how the scope is watched. Lilt's own
     /// files still go under `Disk.root`, so the caller must point the home directory at a fixture first.
-    init(fixture library: Library, runtime: RuntimeScope) {
+    init(fixture library: Library, runtime: RuntimeScope, usageFetch: ((Credential) async throws -> UsageSnapshot)? = nil) {
         retryClock = { .now }
         self.library = library
         fixtureRuntime = runtime
+        if let usageFetch { self.usageFetch = usageFetch }
         restoreRelayPreference()
     }
     private func restoreRelayPreference() {
@@ -310,6 +314,7 @@ final class AppModel {
         relayPause = reason; status = "自动接力已停止：\(reason)"; lastEvent = reason
         library.preferences.autoRelay = false
         library.preferences.autoRelayStopReason = reason
+        if !demo { logFailure("relay-stopped", reason) }
         if !demo, storageAvailable { save() }
     }
     /// Waiting for quota or a cooldown is not withdrawal of the user's consent.
@@ -339,6 +344,9 @@ final class AppModel {
     private func noteUnreadable(_ error: Error) {
         if scopeUnreadableSince == nil { scopeUnreadableSince = .now; status = "暂时读不到\(scopeName)，稍后重试" }
         scopeUnreadable = (error as? LocalizedError)?.errorDescription ?? "读取失败，稍后重试。"
+        if let since = scopeUnreadableSince, Date.now.timeIntervalSince(since) >= 120 {
+            logFailure("scope-unreadable", scopeUnreadable)
+        }
     }
     func observeAPIMode(_ detected: Bool) {
         guard detected != apiModeDetected else { return }
@@ -479,7 +487,11 @@ final class AppModel {
     /// The stored login, read on the I/O queue.
     private func credential(for id: UUID) async throws -> Credential {
         if !demo, !AccountVault.hasFile(account: id.uuidString) { status = "正在把凭据从钥匙串移到本机，这一次之后切换不再询问密码" }
-        guard let data = try await IOQueue.run({ try AccountVault.read(account: id.uuidString) }) else { throw AppFailure("没有找到这个账号的本地凭据，请重新授权。") }
+        let data: Data?
+        do { data = try await IOQueue.run({ try AccountVault.read(account: id.uuidString) }) }
+        catch let failure as ScopeUnreadable { throw failure }
+        catch { throw ScopeUnreadable(AppFailure("本地凭据暂时读不出来，稍后自动重试。")) }
+        guard let data else { throw AppFailure("没有找到这个账号的本地凭据，请重新授权。") }
         let result = Credential(data: data); try result.validate(); return result
     }
     private func identity(for id: UUID) -> Data? { (try? storedSecret(Keychain.identityAccount(id))) ?? nil }
@@ -521,7 +533,16 @@ final class AppModel {
     /// tried again on the next pass; earlier versions took it for an outside change and switched relay off.
     @discardableResult
     func reconcileScope() async -> Bool {
-        await exclusively { await reconcileScopeHeld() }
+        if scopeRetryAt > .now { return false }
+        let settled = await exclusively { await reconcileScopeHeld() }
+        if settled {
+            scopeReadFailures = 0; scopeRetryAt = .distantPast
+        } else if scopeUnreadable != nil {
+            scopeReadFailures += 1
+            let delay = scopeReadFailures < 2 ? 0 : min(60, 15 * pow(2, Double(min(scopeReadFailures - 2, 2))))
+            scopeRetryAt = .now.addingTimeInterval(delay)
+        }
+        return settled
     }
     /// `reconcileScope` for a caller already running exclusively.
     private func reconcileScopeHeld() async -> Bool {
@@ -547,8 +568,8 @@ final class AppModel {
         if scopeIssue != nil || scopeUnreadable != nil || scopeUnreadableSince != nil { scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil }
         return true
     }
-    /// A switch the keychain left halfway (a write or the read after it did not answer in time) leaves its journal
-    /// pending. Once the scope reads again and holds, byte for byte, the login Lilt keeps for one of its accounts, the
+    /// A switch the selected storage left halfway leaves its journal pending. Once the scope reads again and holds,
+    /// byte for byte, the login Lilt keeps for one of its accounts, the
     /// switch either never landed or landed on that account. Lilt wrote what is there either way, so it is settled
     /// without asking. Nil while the scope does not read; false when nothing is pending or the scope holds anything
     /// else, which the usual checks then look at.
@@ -558,14 +579,18 @@ final class AppModel {
         let outcome: Outcome = await IOQueue.perform {
             guard runtime.transactionPending else { return .other }
             do {
-                guard let held = try runtime.currentCredential(),
-                      let id = ids.first(where: { AccountVault.hasFile(account: $0.uuidString) && (try? AccountVault.read(account: $0.uuidString)) == held.data })
-                else { return .other }
+                guard let held = try runtime.currentCredential() else { return .other }
+                var matched: UUID?
+                for id in ids where AccountVault.hasFile(account: id.uuidString) {
+                    let saved = try AccountVault.read(account: id.uuidString)
+                    if saved == held.data { matched = id; break }
+                }
+                guard let id = matched else { return .other }
                 try runtime.settle()
                 if id != current { try? runtime.writeIdentity((try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil) }
                 return .settled(id)
             } catch let failure as ScopeUnreadable { return .unreadable(failure) }
-            catch { return .other }
+            catch { return .unreadable(ScopeUnreadable(AppFailure("上次切换暂时无法收尾，稍后自动重试。"))) }
         }
         switch outcome {
         case .unreadable(let failure): noteUnreadable(failure); return nil
@@ -588,15 +613,16 @@ final class AppModel {
     private func readBack(into account: Account) async -> OAuthDocument.ReadBack? {
         enum Read: Sendable { case found(stored: Data, held: Credential, mine: Data?, theirs: Data?), unverifiable, unreadable(ScopeUnreadable) }
         let runtime = self.runtime, id = account.id
-        // Everything needed from the disk and the keychain, in one trip to the I/O queue.
+        // Everything needed from local files and the selected runtime storage, in one trip to the I/O queue.
         let read: Read = await IOQueue.perform {
-            guard !runtime.transactionPending, let stored = (try? AccountVault.read(account: id.uuidString)) ?? nil else { return .unverifiable }
-            let held: Credential?
-            do { held = try runtime.currentCredential() }
-            catch let failure as ScopeUnreadable { return .unreadable(failure) }
-            catch { return .unverifiable }
-            guard let held, (try? held.validate()) != nil else { return .unverifiable }
-            return .found(stored: stored, held: held, mine: (try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil, theirs: runtime.readIdentity())
+            guard !runtime.transactionPending else { return .unverifiable }
+            do {
+                guard let stored = try AccountVault.read(account: id.uuidString) else { return .unverifiable }
+                guard let held = try runtime.currentCredential(), (try? held.validate()) != nil else { return .unverifiable }
+                let mine = try AccountVault.read(account: Keychain.identityAccount(id))
+                return .found(stored: stored, held: held, mine: mine, theirs: runtime.readIdentity())
+            } catch let failure as ScopeUnreadable { return .unreadable(failure) }
+            catch { return .unreadable(ScopeUnreadable(AppFailure("本地登录资料暂时读不出来，稍后自动重试。"))) }
         }
         let stored: Data, found: Credential, mine: OAuthDocument.Identity, theirs: Data?
         switch read {
@@ -626,17 +652,29 @@ final class AppModel {
         } catch let failure as ScopeUnreadable {
             // What was taken in is already saved; the next pass finds it unchanged and records the baseline then.
             noteUnreadable(failure); return nil
-        } catch { return .unverifiable }
+        } catch {
+            noteUnreadable(ScopeUnreadable(AppFailure("本地登录资料暂时无法保存，稍后自动重试。")))
+            return nil
+        }
     }
     static func wait(until date: Date, from now: Date = .now) -> String {
         let seconds = max(0, date.timeIntervalSince(now))
         return seconds < 60 ? "约 \(Int(seconds.rounded(.up))) 秒" : "约 \(Int((seconds / 60).rounded(.up))) 分钟"
     }
-    func refresh(_ id: UUID) async {
-        guard !busy, !loading else { return }
+    func refresh(_ id: UUID, manually: Bool = false) async {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
+        if busy {
+            if manually { status = "正在切换账号，完成后即可刷新" }
+            return
+        }
+        if loading {
+            if manually { status = "正在读取额度，请稍候" }
+            return
+        }
         if let until = usagePausedUntil, until > .now { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续"; return }
-        if let next = backoffs[id]?.nextAttempt, next > .now { status = "接口退避中，\(Self.wait(until: next))后可重试"; return }
+        if !manually, let next = backoffs[id]?.nextAttempt, next > .now {
+            status = "接口退避中，\(Self.wait(until: next))后可重试"; return
+        }
         loading = true
         defer { loading = false }
         // Requests stay a couple of seconds apart, even when several accounts are due at once.
@@ -645,11 +683,9 @@ final class AppModel {
         lastUsageRequest = .now
         var asked: Credential?
         do {
-            // The account in the scope may have been renewed by the CLI since Lilt last looked.
-            if id == library.activeID { await reconcileScope() }
             let credential = try await renewedCredential(for: id)
             asked = credential
-            let snapshot = try await usageClient.fetch(credential)
+            let snapshot = try await usageFetch(credential)
             guard accounts.contains(where: { $0.id == id }), await isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil }
             if id == library.activeID { notePace(snapshot, for: id) }
@@ -661,10 +697,14 @@ final class AppModel {
                let record = await IdentityClient().fetch(credential), await isCurrent(credential, for: id) {
                 _ = try? await IOQueue.run { try AccountVault.write(record, account: Keychain.identityAccount(id)) }
             }
+        } catch let failure as ScopeUnreadable {
+            status = failure.message
+        } catch let failure as AppFailure {
+            status = failure.message
         } catch {
             // Likewise a failure: if the credential was replaced while the request was out, it says nothing about the new one.
             if let asked, await !isCurrent(asked, for: id) { return }
-            let failure = error as? UsageFailure ?? .authentication
+            let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
             if case .rateLimited(let seconds) = failure { usagePausedUntil = Date.now.addingTimeInterval(max(60, seconds)) }
             // Being told to wait, or a dropped connection, says nothing about the account: the last reading stays
@@ -680,7 +720,7 @@ final class AppModel {
     /// A one-off pass the user asked for; never run on a timer.
     func refreshAll() async {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
-        for account in accounts where account.enabled { await refresh(account.id) }
+        for account in accounts where account.enabled { await refresh(account.id, manually: true) }
     }
     /// The panel just opened or the window came forward: what is on screen should not be a minute old.
     func refreshIfStale() async {
@@ -790,7 +830,8 @@ final class AppModel {
     /// the same Claude account), so nothing is lost and nothing is logged out.
     func takeOverDefaultLogin() async {
         guard !demo, !busy, storageAvailable else { return }
-        let scope = RuntimeScope(target: .system)
+        let scope = fixtureRuntime ?? RuntimeScope(target: .system)
+        let useFiles = runtimeFileStorage
         let wanted = library.activeID
         busy = true; status = "正在接管默认登录…"
         var adopted: UUID?
@@ -807,7 +848,10 @@ final class AppModel {
                     try store(found, label: "当前登录", kind: found.refreshable ? .oauth : .setupToken, replacing: twin?.id, identity: identity)
                     adopted = twin?.id ?? accounts.last?.id
                 }
-                try await Self.patiently { try await IOQueue.run { try scope.rebaseline() } }
+                try await Self.patiently { try await IOQueue.run {
+                    if useFiles, current != nil { try scope.migrateCredentialStorage(toFile: true, replacingExternalState: true) }
+                    else { try scope.rebaseline() }
+                } }
             }
         } catch {
             busy = false; status = "接管未完成"
@@ -830,6 +874,28 @@ final class AppModel {
             if await apply(wanted) { status = "已接管默认登录" }
         } else {
             library.activeID = nil; save(); status = "已接管默认登录"
+        }
+    }
+    func setRuntimeFileStorage(_ on: Bool) {
+        guard !demo, !busy, storageAvailable, on != runtimeFileStorage else { return }
+        guard library.preferences.scopeEnabled else {
+            updatePreferences { $0.runtimeFileStorage = on }
+            status = on ? "接管后将使用本地登录文件" : "接管后将使用 macOS 钥匙串"
+            return
+        }
+        let runtime = self.runtime
+        busy = true; status = on ? "正在把登录迁到本地文件…" : "正在把登录迁回钥匙串…"
+        Task {
+            do {
+                try await exclusively { try await IOQueue.run { try runtime.migrateCredentialStorage(toFile: on) } }
+                updatePreferences { $0.runtimeFileStorage = on }
+                scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil
+                status = on ? "已改用本地登录文件" : "已改用 macOS 钥匙串"
+            } catch {
+                status = "登录存储方式未改变"
+                message = Self.reason(error) ?? "登录存储迁移未完成，请稍后重试。"
+            }
+            busy = false
         }
     }
     func setLiveUsage(_ on: Bool) {
@@ -1087,8 +1153,8 @@ final class AppModel {
         if Date.now.timeIntervalSince(clock) >= 15 || Date.now < clock { clock = .now }
         guard !busy, !loading else { return }
         if demo { touchDemoSamples(); await relay(); return }
-        // A pass woken early by a status line reading skips the scope check when one passed moments ago. Each check starts
-        // a keychain process, and an automatic hand-off checks the scope again before writing.
+        // A pass woken early by a status line reading skips the scope check when one passed moments ago. Keychain checks
+        // start a process, and an automatic hand-off checks the selected storage again before writing.
         if Date.now.timeIntervalSince(scopeCheckedAt) >= 10 {
             guard await reconcileScope() else { return }
             scopeCheckedAt = .now
@@ -1164,15 +1230,14 @@ final class AppModel {
     /// left the button greyed out while the notice stayed on screen.
     func blocks(_ action: Notice.Action) -> Bool {
         switch action {
-        case .confirmApplied, .openScope: false
+        case .confirmApplied, .openScope, .refresh, .refreshAll: false
         case .reauthorize, .adoptScope: busy
-        case .refresh, .refreshAll: busy || loading
         }
     }
     func perform(_ action: Notice.Action) {
         switch action {
         case .reauthorize(let id): requestAdd(replacing: id)
-        case .refresh(let id): Task { await refresh(id) }
+        case .refresh(let id): Task { await refresh(id, manually: true) }
         case .refreshAll: Task { await refreshAll() }
         case .openScope: selectedPage = .scope
         case .confirmApplied: confirmApplied()
@@ -1216,7 +1281,7 @@ final class AppModel {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Lilt-diagnostics.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // Fixed fields only: no nicknames, account IDs, paths, CLI output, or server error bodies.
-        let text = "\(AppBuild.description)\nBuild: \(AppBuild.timestamp)\nSource: \(AppBuild.revision)\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
+        let text = "\(AppBuild.description)\nBuild: \(AppBuild.timestamp)\nSource: \(AppBuild.revision)\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nRuntime storage: \(runtimeFileStorage ? "file" : "keychain")\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
         do { try Data(text.utf8).write(to: url, options: .atomic); status = "已导出脱敏诊断" } catch { message = "诊断文件保存失败。" }
     }
 }

@@ -1,5 +1,11 @@
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 public enum SecureFileError: Error { case unsafePath, cannotCreate, cannotReplace }
 
@@ -58,7 +64,13 @@ public enum SecureFiles {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < data.count {
+                #if canImport(Darwin)
                 let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+                #elseif canImport(Glibc)
+                let count = Glibc.write(fd, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+                #else
+                let count = Musl.write(fd, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+                #endif
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { throw SecureFileError.cannotReplace }
                 offset += count
