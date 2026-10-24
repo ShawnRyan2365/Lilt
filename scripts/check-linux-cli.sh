@@ -26,10 +26,14 @@ HOME="$HOME_DIR" "$BIN" status --json > "$FIX/status.json"
 HOME="$HOME_DIR" "$BIN" switch 1 >/dev/null
 HOME="$HOME_DIR" "$BIN" remove 2 --yes >/dev/null
 HOME="$HOME_DIR" "$BIN" release >/dev/null
-grep -q '"ok" : true' "$FIX/status.json"
-grep -q '"running" : true' "$FIX/status.json"
-grep -q '"threshold" : 6' "$FIX/status.json"
-grep -q 'Fixture-T' "$FIX/status.json"
+if ! grep -q '"ok" : true' "$FIX/status.json" ||
+   ! grep -q '"running" : true' "$FIX/status.json" ||
+   ! grep -q '"threshold" : 6' "$FIX/status.json" ||
+   ! grep -q 'Fixture-T' "$FIX/status.json"; then
+    cat "$FIX/status.json"
+    cat "$FIX/daemon.log"
+    exit 1
+fi
 HOME="$HOME_DIR" "$BIN" list > "$FIX/list.txt"
 grep -q 'Fixture-A' "$FIX/list.txt"
 [ ! -e "$HOME_DIR/.local/state/lilt/live-usage.json" ]

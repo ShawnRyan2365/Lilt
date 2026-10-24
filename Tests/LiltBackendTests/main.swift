@@ -107,11 +107,12 @@ func testRefreshRecovery() async throws {
     _ = try await engine.takeOver(label: nil)
     await Task.yield()
     await engine.refresh(aID)
+    await engine.refresh(aID, manually: true)
     await usage.reset([a.token!: [.network, nil], b.token!: [.rateLimited(120), nil]])
     await engine.refresh(aID)
     await engine.refresh(aID)
     let automaticCalls = await usage.calls
-    expect(automaticCalls == 1, "automatic refresh ignored ordinary backoff")
+    expect(automaticCalls == 1, "automatic refresh ignored ordinary backoff: calls=\(automaticCalls)")
     await engine.refresh(aID, manually: true)
     let manualCalls = await usage.calls
     expect(manualCalls == 2, "manual refresh did not override ordinary backoff: calls=\(manualCalls)")
