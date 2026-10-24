@@ -181,6 +181,10 @@ open build/Lilt.app
 
 Logo、透明 PNG、SVG 和 App Icon 预览在 [`assets/brand`](assets/brand)。设计与重新生成方法见[品牌资产说明](assets/brand/README.md)。
 
+## Agent Skill
+
+仓库附带项目 Skill：[`.agents/skills/lilt/SKILL.md`](.agents/skills/lilt/SKILL.md)。它包含项目边界、代码结构、macOS/Linux 检查、SSH 安装运维、凭据安全和真实验收规则。支持项目级技能的 agent 可以直接使用；也可以把该目录复制到 `~/.agents/skills/lilt`，作为用户级 Skill。
+
 ## 许可
 
 [MIT](LICENSE)。Lilt 是个人项目，不是 Anthropic 官方产品，与 Anthropic 没有关联。
