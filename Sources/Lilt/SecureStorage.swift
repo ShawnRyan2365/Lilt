@@ -15,6 +15,10 @@ struct ScopeUnreadable: LocalizedError {
     var errorDescription: String? { message }
     init(_ error: Error) { message = (error as? AppFailure)?.message ?? "读取失败，稍后重试。" }
 }
+struct DualRuntimeConflict: LocalizedError {
+    let message = "检测到钥匙串与本地文件中的登录不一致。为避免 Claude Code 使用另一个账号，已暂停切换；请到“接入”选择要保留的登录。"
+    var errorDescription: String? { message }
+}
 struct Credential {
     var data: Data
     var object: [String: Any] { (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:] }
@@ -237,29 +241,28 @@ enum SwitchLog {
 /// `system` is Claude Code's default login (keychain item `Claude Code-credentials`, `~/.claude`, `~/.claude.json`),
 /// the same surfaces ORCA writes. `dedicated` is a directory of Lilt's own that only the launch command points at.
 /// `AppModel` runs reads and writes one at a time on its I/O queue, including the in-memory store of regression checks.
-/// Keychain is the default; file mode keeps the runtime login in `.credentials.json` and never calls the keychain.
+/// The keychain is authoritative. `.credentials.json` is only the CLI's change signal, never a second runtime login.
 final class RuntimeScope: @unchecked Sendable {
     struct CredentialAccess {
         var read: () throws -> Data?
         var write: (Data) throws -> Void
         var delete: () throws -> Void
     }
+    enum DualAuthority { case keychain, file }
     let target: ScopeTarget
     let directory: URL
-    private(set) var fileStorage: Bool
     private let root: URL
     private let home: URL
     private let credentialAccess: CredentialAccess?
-    init(target: ScopeTarget, fileStorage: Bool = false) {
+    init(target: ScopeTarget) {
         self.target = target
-        self.fileStorage = fileStorage
         root = Disk.root; home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
         directory = target == .system ? FileManager.default.homeDirectoryForCurrentUser.appending(component: ".claude", directoryHint: .isDirectory)
                                        : Disk.root.appending(component: "scope", directoryHint: .isDirectory)
     }
     /// Isolated transaction checks use an in-memory credential store, never a macOS keychain item.
-    init(fixtureHome: URL, fileStorage: Bool = false, credentials: CredentialAccess) {
-        target = .system; self.fileStorage = fileStorage; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
+    init(fixtureHome: URL, credentials: CredentialAccess) {
+        target = .system; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
         directory = fixtureHome.appendingPathComponent(".claude"); credentialAccess = credentials
     }
     /// What Lilt keeps in `.credentials.json` when the file holds no login of its own: an empty document. The CLI reads
@@ -325,38 +328,41 @@ final class RuntimeScope: @unchecked Sendable {
         do { return try Data(contentsOf: file) } catch { throw ScopeUnreadable(AppFailure("登录文件暂时读不出来。")) }
     }
     private func state() throws -> Stamp {
-        try Stamp(file: digest(readFile()), keychain: fileStorage ? nil : digest(keychainRead()))
+        try Stamp(file: digest(readFile()), keychain: digest(keychainRead()))
     }
     private func expected() throws -> Stamp? {
         guard FileManager.default.fileExists(atPath: journal.path) else { return nil }
         return try JSONDecoder().decode(Stamp.self, from: Data(contentsOf: journal))
     }
+    private func ensureNoDual() throws {
+        let held = try keychainRead(), onDisk = try readFile()
+        if Self.holdsLogin(onDisk), held != onDisk { throw DualRuntimeConflict() }
+    }
     func check() throws {
-        try prepare()
+        try prepare(); try ensureNoDual()
         try verify(state())
     }
-    /// The scope as read is what Lilt last recorded there.
     private func verify(_ current: Stamp) throws {
         if let expected = try expected() {
             guard !expected.pending, expected == current else { throw AppFailure("作用域凭据已被外部修改，或上次切换未完成。自动接力已暂停；请检查管理方。") }
         } else if current.file != nil || current.keychain != nil { throw AppFailure("此作用域已有未确认归属的凭据；Lilt 不会覆盖。") }
     }
-    /// The selected storage's current login. Lilt's signal is not a login.
     func currentCredential() throws -> Credential? {
-        if !fileStorage, let held = try keychainRead() { return Credential(data: held) }
-        guard let onDisk = try readFile(), onDisk != Self.signal else { return nil }
+        guard let held = try keychainRead() else { return nil }
+        return Credential(data: held)
+    }
+    func fileCredential() throws -> Credential? {
+        guard let onDisk = try readFile(), Self.holdsLogin(onDisk) else { return nil }
         return Credential(data: onDisk)
     }
-    /// Take the scope as it is now for the baseline. Only after the caller has saved what is there.
     func rebaseline() throws {
-        try prepare()
-        let held = fileStorage ? nil : try keychainRead()
-        var onDisk = try readFile()
-        // In keychain mode an existing login file follows the keychain; the signal stays what it is.
-        if let held, let stale = onDisk, stale != held, target == .dedicated || Self.holdsLogin(stale) {
-            try Disk.write(held, to: file); onDisk = held
+        try prepare(); try ensureNoDual()
+        let held = try keychainRead(), onDisk = try readFile()
+        var nextFile = onDisk
+        if held != nil || onDisk != nil {
+            try Disk.write(Self.signal, to: file); nextFile = Self.signal
         }
-        try Disk.write(JSONEncoder().encode(Stamp(file: digest(onDisk), keychain: digest(held))), to: journal)
+        try Disk.write(JSONEncoder().encode(Stamp(file: digest(nextFile), keychain: digest(held))), to: journal)
     }
     /// Take Lilt's signal away when Lilt stops managing the default login, so the CLI goes back to noticing keychain
     /// changes by itself. A file that holds anything else is left alone.
@@ -397,96 +403,34 @@ final class RuntimeScope: @unchecked Sendable {
         // Read and written back at once: the CLI rewrites this file often, so the window stays as short as possible.
         try Disk.write(JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .withoutEscapingSlashes]), to: config)
     }
-    /// Move the same login between the keychain and the file. The new location is verified before the old one is
-    /// removed, and the preference is saved by the caller only after this transaction finishes.
-    func migrateCredentialStorage(toFile enabled: Bool, replacingExternalState: Bool = false) throws {
-        guard fileStorage != enabled else { return }
-        try prepare()
-        let lockURL = target == .system ? root.appending(component: ".lilt-lock-system", directoryHint: .notDirectory)
-                                        : directory.appending(component: ".lilt-lock", directoryHint: .notDirectory)
-        let fd = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
-        guard fd >= 0 else { throw AppFailure("无法锁定作用域。") }
-        defer { flock(fd, LOCK_UN); close(fd) }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw AppFailure("另一个 Lilt 实例正在切换。") }
-
-        let oldKey = fileStorage ? nil : try keychainRead()
-        let oldFile = try readFile()
-        let previous = Stamp(file: digest(oldFile), keychain: digest(oldKey))
-        if !replacingExternalState { try verify(previous) }
-        guard let credential = try currentCredential() else { throw AppFailure("当前没有可迁移的登录。") }
-        try credential.validate()
-        let nextFile = enabled ? credential.data : Self.signal
-        var pending = previous; pending.pending = true
-        let priorJournal = try? Data(contentsOf: journal)
-        try Disk.write(JSONEncoder().encode(pending), to: journal)
-        var wroteFile = false
-        do {
-            guard digest(try readFile()) == previous.file, digest(try keychainRead()) == previous.keychain else {
-                throw AppFailure("检测到并发登录配置变更，已暂停。")
-            }
-            if enabled {
-                try Disk.write(nextFile, to: file); wroteFile = true
-                guard try readFile() == credential.data else { throw AppFailure("登录文件回读不一致，未移除钥匙串副本。") }
-                try keychainDelete()
-                guard try keychainRead() == nil else { throw AppFailure("钥匙串副本未能移除，已恢复原来的存储方式。") }
-            } else {
-                try keychainWrite(credential.data)
-                guard try keychainRead() == credential.data else { throw AppFailure("钥匙串回读不一致，未移除登录文件。") }
-                try Disk.write(nextFile, to: file); wroteFile = true
-            }
-            let next = Stamp(file: digest(nextFile), keychain: enabled ? nil : digest(credential.data))
-            guard digest(try readFile()) == next.file, digest(try keychainRead()) == next.keychain else {
-                throw AppFailure("登录存储迁移结果不一致。")
-            }
-            try Disk.write(JSONEncoder().encode(next), to: journal)
-            fileStorage = enabled
-        } catch {
-            do {
-                if enabled, let oldKey, try keychainRead() == nil { try? keychainWrite(oldKey) }
-                else if !enabled, try keychainRead() == credential.data { try? keychainDelete() }
-            } catch {}
-            if wroteFile, let current = try? readFile(), current == nextFile {
-                if let oldFile { try? Disk.write(oldFile, to: file) } else { try? FileManager.default.removeItem(at: file) }
-            }
-            do {
-                let nowFile = try readFile(), nowKey = try keychainRead()
-                if digest(nowFile) == previous.file, digest(nowKey) == previous.keychain {
-                    if let priorJournal { try? Disk.write(priorJournal, to: journal) } else { try? FileManager.default.removeItem(at: journal) }
-                }
-            } catch {}
-            throw error
-        }
+    func resolveDual(using authority: DualAuthority, expected credential: Credential) throws {
+        try apply(credential, replacingExternalState: true, resolvingDual: authority)
     }
-    func apply(_ credential: Credential, replacingExternalState: Bool = false) throws {
+    func apply(_ credential: Credential, replacingExternalState: Bool = false, resolvingDual: DualAuthority? = nil) throws {
         try credential.validate(); try prepare()
-        // The lock lives with Lilt's own data: nothing of Lilt's is left inside ~/.claude.
         let lockURL = target == .system ? root.appending(component: ".lilt-lock-system", directoryHint: .notDirectory)
                                         : directory.appending(component: ".lilt-lock", directoryHint: .notDirectory)
         let fd = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw AppFailure("无法锁定作用域。") }
         defer { flock(fd, LOCK_UN); close(fd) }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw AppFailure("另一个 Lilt 实例正在切换。") }
-        // One read prepares the switch: what is there now is compared with the journal, written over and, if anything
-        // fails, put back. Keychain mode avoids extra reads because an automatic switch is a race with the limit.
-        let oldKey = fileStorage ? nil : try keychainRead()
+        let oldKey = try keychainRead()
         let oldFile = try readFile()
+        if let authority = resolvingDual {
+            let current = authority == .keychain ? oldKey : oldFile
+            guard current == credential.data else { throw AppFailure("处理期间登录已变化，未应用旧快照；请重新检查。") }
+        } else { try ensureNoDual() }
         let previous = Stamp(file: digest(oldFile), keychain: digest(oldKey))
-        // An explicit account selection authorizes replacing the current login; automatic relay never does.
-        // Keep the lock and compare-before-write checks even for an explicit replacement.
         if !replacingExternalState { try verify(previous) }
         let oldSettings = try readSettings()
         if !replacingExternalState, try oldSettings.map(AuthenticationSettings.hasAPIOverride) == true {
             throw AppFailure("检测到 API 模式，自动接力不会覆盖；请手动选择订阅账号。")
         }
         let newSettings = try replacingExternalState ? oldSettings.flatMap(AuthenticationSettings.subscriptionSettings) : nil
-        // File mode keeps the login only in the file. Keychain mode writes the signal last so running CLIs look again.
-        let fileContent = fileStorage || target == .dedicated || Self.holdsLogin(oldFile) ? credential.data : Self.signal
         var wroteFile = false
         var pending = previous; pending.pending = true
         let priorJournal = try? Data(contentsOf: journal)
         try Disk.write(JSONEncoder().encode(pending), to: journal)
-        // Verify the other writer has not changed anything during preparation. Nothing has been written yet, so a refusal
-        // here puts the journal back as it was: there is no unfinished switch to inspect, only a change to look at.
         do {
             guard try state() == previous, try readSettings() == oldSettings else { throw AppFailure("检测到并发登录配置变更，已暂停。") }
         } catch {
@@ -494,30 +438,25 @@ final class RuntimeScope: @unchecked Sendable {
             throw error
         }
         do {
-            if !fileStorage { try keychainWrite(credential.data) }
+            try keychainWrite(credential.data)
             guard digest(try readFile()) == previous.file else { throw AppFailure("检测到外部写入，已停止。") }
             guard try readSettings() == oldSettings else { throw AppFailure("API 配置被其他工具同时修改，请稍后重试。") }
             if let newSettings { try Disk.write(newSettings, to: settingsFile) }
-            try Disk.write(fileContent, to: file); wroteFile = true
+            try Disk.write(Self.signal, to: file); wroteFile = true
             let next = try state()
-            guard next.keychain == (fileStorage ? nil : digest(credential.data)), next.file == digest(fileContent),
+            guard next.keychain == digest(credential.data), next.file == digest(Self.signal),
                   try readSettings() == (newSettings ?? oldSettings) else { throw AppFailure("登录配置同步不一致，已暂停。") }
             try Disk.write(JSONEncoder().encode(next), to: journal)
         } catch {
             if let newSettings, let oldSettings, (try? readSettings()) == newSettings {
                 try? Disk.write(oldSettings, to: settingsFile)
             }
-            // Roll back only values still matching this transaction. Never replace an external update.
-            if !fileStorage, digest(try? keychainRead()) == digest(credential.data) {
+            if digest(try? keychainRead()) == digest(credential.data) {
                 if let oldKey { try? keychainWrite(oldKey) } else { try? keychainDelete() }
             }
-            // Written again even when it was the signal before, so a CLI that looked in between looks once more.
-            if wroteFile, digest(try? readFile()) == digest(fileContent) {
+            if wroteFile, digest(try? readFile()) == digest(Self.signal) {
                 if let oldFile { try? Disk.write(oldFile, to: file) } else { try? FileManager.default.removeItem(at: file) }
             }
-            // When everything reads back as it was before, the switch left nothing behind to inspect, and the journal
-            // goes back to what it said. Otherwise (a keychain that did not answer, or another writer) it stays
-            // pending until `settle` or the user can account for what the scope holds.
             if (try? state()) == previous, (try? readSettings()) == oldSettings {
                 if let priorJournal { try? Disk.write(priorJournal, to: journal) } else { try? FileManager.default.removeItem(at: journal) }
             }

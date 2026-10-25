@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-VERSION=${VERSION:-0.2.4}
+VERSION=${VERSION:-0.2.5}
 for pair in aarch64:arm64 x86_64:x86-64; do
     triple=${pair%%:*}
     arch=${pair##*:}

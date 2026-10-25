@@ -185,6 +185,11 @@ struct ScopeView: View {
             Text(model.managesDefaultLogin ? "在任何终端直接运行 claude，用的都是 Lilt 里选中的账号。"
                                            : "接管后，在任何终端直接运行 claude，用的都是 Lilt 里选中的账号，不需要特别的启动命令。")
                 .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+            Text("运行时登录只以 macOS 钥匙串为准；`.credentials.json` 仅用于提醒 Claude Code 重新读取。若文件中也出现另一份有效登录，Lilt 会暂停切换并要求处理。")
+                .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+            if model.dualConflict {
+                Button("处理双登录冲突") { model.confirmingDual = true }.buttonStyle(.lilt(.secondary)).disabled(model.busy)
+            }
             if orcaActive {
                 InlineNote(text: "ORCA 也在切换这个登录。两边同时管理会互相覆盖：请在 ORCA 里停用 Claude 账号切换，只留一个。")
             }
@@ -289,12 +294,6 @@ struct SettingsView: View {
                     LiquidToggle(label: "自动排序", isOn: Binding(get: { model.autoSort }, set: { model.setAutoSort($0) }), width: 44)
                 }
             } footer: { Text("按 7 天额度排接力顺序：先重置的在前，同一天重置的剩余多的在前。换号时先挑 5 小时额度最空的账号，一样空的按这个顺序，换上后一直用到阈值。和「先用快重置的周额度」二选一，关闭后恢复手动顺序。") }
-            Section {
-                LabeledContent("运行时登录存到本地文件") {
-                    LiquidToggle(label: "运行时登录存到本地文件", isOn: Binding(get: { model.runtimeFileStorage }, set: { model.setRuntimeFileStorage($0) }), width: 44)
-                        .disabled(model.demo || model.busy)
-                }
-            } footer: { Text("默认关闭。开启后使用 ~/.claude/.credentials.json（仅当前用户可读写），Lilt 不再读写 macOS 钥匙串。文件不受钥匙串加密保护，仅建议在这台个人 Mac 上使用；关闭时可安全迁回。") }
             Section {
                 Picker("快速面板快捷键", selection: shortcut) { Text("⌘⌥L").tag(UInt32(37)); Text("⌘⌥J").tag(UInt32(38)); Text("⌘⌥K").tag(UInt32(40)) }
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }

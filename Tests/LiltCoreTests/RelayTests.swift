@@ -94,12 +94,11 @@ final class RelayTests {
         let old = Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8)
         let decoded = try JSONDecoder().decode(Preferences.self, from: old)
         expectEqual(decoded.autoRelay, nil); expect(decoded.scopeEnabled); expect(decoded.scopeTarget == nil); expectEqual(decoded.soonerWeekly, nil)
-        expectEqual(decoded.autoSort, nil); expectEqual(decoded.runtimeFileStorage, nil)
-        let current = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"scopeTarget":"system"}"#.utf8))
+        expectEqual(decoded.autoSort, nil)
+        let current = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"scopeTarget":"system","runtimeFileStorage":false}"#.utf8))
         expect(current.scopeTarget == .system)
-        var files = current; files.runtimeFileStorage = true
-        let roundTrip = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(files))
-        expect(roundTrip.runtimeFileStorage == true)
+        let legacyFiles = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"runtimeFileStorage":true}"#.utf8))
+        expect(legacyFiles.scopeEnabled && legacyFiles.scopeTarget == nil)
     }
     // Every token below is a made-up placeholder; none of them has ever been issued.
     func document(access: String, refresh: String?, expiresIn seconds: Double, extra: [String: Any] = [:]) -> Data {

@@ -78,6 +78,11 @@ struct MainView: View {
             Button("不是，改回“\(model.active?.label ?? "")”") { model.reclaimScope() }
             Button("取消", role: .cancel) {}
         } message: { Text("在终端运行 claude 后用 /status 看当前是谁。采纳：把现在的登录存为这个账号的，替换原来保存的那份。改回：用 Lilt 保存的那份覆盖现在的登录。") }
+        .confirmationDialog("检测到两份不同的登录", isPresented: $model.confirmingDual, titleVisibility: .visible) {
+            Button("保留钥匙串登录") { model.resolveDualConflict(useFile: false) }
+            Button("保留文件登录（可能切换账号）") { model.resolveDualConflict(useFile: true) }
+            Button("取消", role: .cancel) {}
+        } message: { Text("Claude Code 的钥匙串与本地文件包含不同登录。选择后，Lilt 会把保留的登录写入官方钥匙串，并把文件恢复为变更信号；取消不会改动任何凭据。") }
     }
 
     // MARK: Demo
@@ -239,7 +244,7 @@ struct MainView: View {
                 fact("Claude Code", model.version.replacingOccurrences(of: " (Claude Code)", with: ""))
                 fact("系统", "macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)")
                 fact("接入方式", !model.library.preferences.scopeEnabled ? "未接管" : model.scopeTarget == .system ? "Claude Code 默认登录" : "Lilt 专属目录")
-                fact("运行时登录", model.runtimeFileStorage ? "本地文件（0600）" : "macOS 钥匙串")
+                fact("运行时登录", model.dualConflict ? "macOS 钥匙串 · 双登录冲突" : "macOS 钥匙串")
                 fact("实时额度", !model.managesDefaultLogin ? "未接管默认登录" : !model.liveUsageEnabled ? "关闭（按时查询接口）" : model.liveUsageSampledAt.map { "状态栏 · \(Wording.age($0, now: .now))" } ?? "状态栏 · 尚无读数")
                 fact("模型转发", "无", last: true)
             }

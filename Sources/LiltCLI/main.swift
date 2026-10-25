@@ -2,7 +2,7 @@ import Foundation
 import LiltCore
 import LiltBackend
 
-let version = "0.2.4"
+let version = "0.2.5"
 let paths = BackendPaths()
 let client = LocalSocketClient(paths: paths)
 

@@ -159,8 +159,8 @@ bash scripts/check-linux-cli.sh
 
 - 账号列表和偏好：`~/Library/Application Support/Lilt/accounts.json`，不含凭据。
 - 每个账号的登录凭据：`~/Library/Application Support/Lilt/secrets/`，权限 0600，只有当前用户能读。
-- 接管后，Lilt 默认把运行时登录写入 Claude Code 自己读取的钥匙串条目 `Claude Code-credentials`（通过系统的 `security` 工具读写），并同步 `~/.claude.json` 里的 `oauthAccount`。`~/.claude/.credentials.json` 原来存着登录时，Lilt 让它跟着钥匙串一起换；否则只写空的 `{}` 信号，提醒正在运行的 `claude` 重新读登录。停止接管时会删掉这个空文件。
-- 设置里的“运行时登录存到本地文件”可改为只使用 `~/.claude/.credentials.json`（0600），开启后 Lilt 的日常检查和切换不再读写 macOS 钥匙串。双向迁移先验证新位置再移除旧副本，失败回滚。文件不受钥匙串加密保护，不要同步或分享它；真实 CLI 文件模式热切换仍需受控验证。
+- macOS 运行时登录只以 Claude Code 官方的钥匙串条目 `Claude Code-credentials` 为准，并同步 `~/.claude.json` 里的 `oauthAccount`。不再提供文件运行时或双向存储设置。`~/.claude/.credentials.json` 只写空的 `{}` 变更信号，提醒运行中的 `claude` 重读钥匙串；停止接管时删除这个信号文件。
+- 如果本地文件中也出现有效登录且与钥匙串不一致，Lilt 会停止接力、隐藏当前账号归属并暂停切换，防止两边各走一个账号。用户可明确选择保留钥匙串当前登录，或把文件账号切换到钥匙串；处理后文件恢复为信号。身份归属先匹配账号库，无法匹配时用官方 profile 核验，不只相信缓存。
 - 切换记录：`~/Library/Application Support/Lilt/switches.log`，最近 200 条：每次切换的时间和方式（手动或自动接力），以及切换或接管没成功时 Lilt 给出的原因，不含账号名称或凭据。会话里出现 “Connection lost mid-response” 之类的错误时，可以拿来对照是不是刚好在切换。
 - 实时额度（默认开，可在“接入”页关闭）：在 `~/.claude/settings.json` 的状态栏命令前加一个小脚本，只取 Claude Code 交给状态栏的额度数据，终端里显示的内容不变。第一次改动前会把原文件备份为 `claude-settings-before-lilt.json`，关闭时放回原来的状态栏。
 - 额度查询有节制：自动接力开着时当前账号每 5 分钟查一次（离阈值 15 个百分点以内时每 2 分钟）。其他账号只在当前账号快到阈值、需要接力或手动刷新时才查：快到阈值时提前查排在最前的账号（读数超过 5 分钟才查，每 15 秒最多一个）；换号前查要换上的账号（2 分钟内查过的直接用），查出来不够就查下一个，一次最多 4 个；额度已用完的账号在重置前不再重复查。遇到限流时全部暂停，等官方允许再查。

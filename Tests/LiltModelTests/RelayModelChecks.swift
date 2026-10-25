@@ -87,6 +87,7 @@ import LiltCore
         try await autoSortChecks()
         try await scopeWatchChecks()
         try await interruptedSwitchChecks()
+        try await dualModelChecks()
         try await refreshRecoveryChecks()
         try await emptyFileTakeoverCheck()
         try fileRuntimeChecks()
@@ -252,7 +253,7 @@ import LiltCore
 
     // The write fails, and the keychain does not answer to the rollback either: the switch stays pending, relay stays on.
     // Reads: the check before writing and the switch's own two succeed; the rollback's and the final look fail.
-    writes = [false]; failing = [false, false, false, true, true]
+    writes = [false]; failing = [false, false, false, false, false, true, true]
     done = await model.apply(spare.id, automatically: true); precondition(!done)
     precondition(model.autoRelay && model.library.preferences.autoRelayStopReason == nil && scope.transactionPending)
     // While the keychain still does not answer, the check waits rather than stopping anything.
@@ -264,7 +265,7 @@ import LiltCore
 
     // The write lands but reports a failure, and the keychain then stops answering: once it answers again, the
     // switch is finished, not undone.
-    writes = [true]; failing = [false, false, false, true, true]
+    writes = [true]; failing = [false, false, false, false, false, true, true]
     done = await model.apply(spare.id, automatically: true); precondition(!done)
     precondition(model.autoRelay && scope.transactionPending && held == theirs && model.active?.id == active.id)
     done = await model.reconcileScope(); precondition(done && model.autoRelay && model.scopeIssue == nil)
@@ -274,12 +275,73 @@ import LiltCore
     done = await model.reconcileScope(); precondition(done && model.autoRelay)
 
     // A switch left pending with a login Lilt does not keep in the scope still stops relay and asks the user.
-    writes = [false]; failing = [false, false, false, true, true]
+    writes = [false]; failing = [false, false, false, false, false, true, true]
     done = await model.apply(active.id, automatically: true); precondition(!done && scope.transactionPending)
     held = document("fixture-access-f")
     done = await model.reconcileScope(); precondition(!done)
     precondition(!model.autoRelay && model.scopeIssue != nil && model.library.preferences.autoRelayStopReason != nil)
     try? FileManager.default.removeItem(at: signal)
+}
+
+@MainActor func dualModelChecks() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    try SecureFiles.directory(home.appendingPathComponent(".claude"))
+    let file = home.appendingPathComponent(".claude/.credentials.json")
+    let journal = home.appendingPathComponent("lilt/transaction-system.json")
+    try? FileManager.default.removeItem(at: journal)
+    func document(_ value: String) -> Data { Data(#"{"claudeAiOauth":{"accessToken":""#.utf8) + Data(value.utf8) + Data(#""}}"#.utf8) }
+    func fresh() -> UsageSnapshot { UsageSnapshot(fiveHour: UsageWindow(used: 10), sevenDay: UsageWindow(used: 20)) }
+    var active = Account(label: "Fixture dual A", kind: .oauth); active.usage = fresh(); active.usageCapability = .verified
+    var spare = Account(label: "Fixture dual B", kind: .oauth); spare.usage = fresh(); spare.usageCapability = .verified
+    let mine = document("fixture-dual-a"), theirs = document("fixture-dual-b")
+    try AccountVault.write(mine, account: active.id.uuidString)
+    try AccountVault.write(theirs, account: spare.id.uuidString)
+    try AccountVault.write(Data(#"{"accountUuid":"fixture-dual-a"}"#.utf8), account: Keychain.identityAccount(active.id))
+    try AccountVault.write(Data(#"{"accountUuid":"fixture-dual-b"}"#.utf8), account: Keychain.identityAccount(spare.id))
+    try SecureFiles.write(Data(#"{"oauthAccount":{"accountUuid":"fixture-dual-a"}}"#.utf8), to: home.appendingPathComponent(".claude.json"))
+    var library = Library()
+    library.accounts = [active, spare]; library.activeID = active.id
+    library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system
+    library.preferences.autoRelay = true; library.preferences.liveUsage = false
+    var held: Data? = mine
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: { held }, write: { held = $0 }, delete: { held = nil }))
+    try SecureFiles.write(RuntimeScope.signal, to: file)
+    try scope.rebaseline()
+    var refreshes = 0
+    let model = AppModel(fixture: library, runtime: scope, usageFetch: { _ in refreshes += 1; return fresh() })
+
+    held = theirs
+    try SecureFiles.write(mine, to: file)
+    var done = await model.reconcileScope()
+    precondition(!done && model.dualConflict && !model.autoRelay && model.displayedActiveID == nil)
+    done = await model.apply(spare.id, automatically: true)
+    precondition(!done && held == theirs && (try! Data(contentsOf: file)) == mine)
+
+    model.resolveDualConflict(useFile: true)
+    while model.busy || model.loading { try await Task.sleep(for: .milliseconds(5)) }
+    precondition(!model.dualConflict && model.active?.id == active.id && model.library.accounts.count == 2)
+    precondition(held == mine && (try! Data(contentsOf: file)) == RuntimeScope.signal)
+
+    held = theirs
+    try SecureFiles.write(mine, to: file)
+    done = await model.reconcileScope(); precondition(!done && model.dualConflict)
+    model.resolveDualConflict(useFile: false)
+    while model.busy || model.loading { try await Task.sleep(for: .milliseconds(5)) }
+    precondition(!model.dualConflict && model.active?.id == spare.id && model.library.accounts.count == 2)
+    precondition(held == theirs && (try! Data(contentsOf: file)) == RuntimeScope.signal)
+    let config = home.appendingPathComponent(".claude.json")
+    precondition(RuntimeScope.identity(at: config).flatMap { String(data: $0, encoding: .utf8) }?.contains("fixture-dual-b") == true)
+    let storedIdentity = try AccountVault.read(account: Keychain.identityAccount(spare.id))
+    precondition(storedIdentity.flatMap { String(data: $0, encoding: .utf8) }?.contains("fixture-dual-b") == true)
+
+    // The file may belong to another vault account, not only the currently active one.
+    held = theirs
+    try SecureFiles.write(mine, to: file)
+    done = await model.reconcileScope(); precondition(!done && model.dualConflict)
+    model.resolveDualConflict(useFile: true)
+    while model.busy || model.loading { try await Task.sleep(for: .milliseconds(5)) }
+    precondition(!model.dualConflict && model.active?.id == active.id && model.library.accounts.count == 2)
+    precondition(refreshes == 3, "Every successful resolution gets past busy and refreshes the final account")
 }
 
 /// Quota reads use the account's own stored login, not the scope's keychain or lock. Temporary local failures do not
@@ -446,94 +508,99 @@ func keychainCommandChecks() throws {
     }
 }
 
-/// Selecting file storage before the first takeover must also work when Claude has no runtime login yet.
+/// First takeover works with no runtime login and always applies the selected account to the official keychain.
 @MainActor func emptyFileTakeoverCheck() async throws {
     let home = FileManager.default.homeDirectoryForCurrentUser
     precondition(home.path.contains("/work/"))
+    for path in [".claude/.credentials.json", "lilt/transaction-system.json"] {
+        try? FileManager.default.removeItem(at: home.appendingPathComponent(path))
+    }
     var wanted = Account(label: "Fixture empty takeover", kind: .oauth)
     wanted.usage = UsageSnapshot(fiveHour: UsageWindow(used: 10), sevenDay: UsageWindow(used: 20))
     wanted.usageCapability = .verified
     var library = Library()
     library.accounts = [wanted]; library.activeID = wanted.id
-    library.preferences.runtimeFileStorage = true; library.preferences.liveUsage = false
+    library.preferences.liveUsage = false
     let login = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-empty-takeover"]])
     try AccountVault.write(login, account: wanted.id.uuidString)
     var keychainCalls = 0
-    let scope = RuntimeScope(fixtureHome: home, fileStorage: true, credentials: .init(read: {
-        keychainCalls += 1; return nil
-    }, write: { _ in keychainCalls += 1 }, delete: { keychainCalls += 1 }))
+    var held: Data?
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        keychainCalls += 1; return held
+    }, write: { keychainCalls += 1; held = $0 }, delete: { keychainCalls += 1; held = nil }))
     let model = AppModel(fixture: library, runtime: scope)
     await model.takeOverDefaultLogin()
     precondition(model.library.preferences.scopeEnabled && model.active?.id == wanted.id)
     precondition(try! scope.currentCredential()?.data == login)
-    precondition(keychainCalls == 0 && !model.busy && model.status == "已接管默认登录")
+    precondition(keychainCalls > 0 && !model.busy && model.status == "已接管默认登录")
 }
 
-/// Runtime file mode never calls the keychain. Both migration directions preserve the login, and failures roll back.
+/// The official keychain is authoritative; a real file login is only a conflict to resolve, never a second runtime.
 func fileRuntimeChecks() throws {
-    let home = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("work/Lilt-file-storage-fixture-" + UUID().uuidString)
+    let home = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("work/Lilt-dual-runtime-fixture-" + UUID().uuidString)
     try SecureFiles.directory(home.appendingPathComponent(".claude"))
     defer { try? FileManager.default.removeItem(at: home) }
     let file = home.appendingPathComponent(".claude/.credentials.json")
-    let earlier = Data(#"{"claudeAiOauth":{"accessToken":"fixture-file-earlier"}}"#.utf8)
-    let subscription = Credential(data: Data(#"{"claudeAiOauth":{"accessToken":"fixture-file-subscription"}}"#.utf8))
+    let earlier = Data(#"{"claudeAiOauth":{"accessToken":"fixture-keychain-earlier"}}"#.utf8)
+    let subscription = Credential(data: Data(#"{"claudeAiOauth":{"accessToken":"fixture-subscription"}}"#.utf8))
     let external = Data(#"{"claudeAiOauth":{"accessToken":"fixture-file-external"}}"#.utf8)
     var held: Data? = earlier
-    var reads = 0, writes = 0, deletes = 0
-    var onWrite: (() throws -> Void)?
-    var onDelete: (() throws -> Void)?
-    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
-        reads += 1; return held
-    }, write: {
-        writes += 1; held = $0; try onWrite?()
-    }, delete: {
-        deletes += 1; try onDelete?(); held = nil
-    }))
-    // First takeover has no journal yet: the explicit adoption establishes the file baseline directly.
-    try scope.migrateCredentialStorage(toFile: true, replacingExternalState: true)
-    precondition(scope.fileStorage && held == nil)
-    precondition((try! Data(contentsOf: file)) == earlier)
-    precondition(try! scope.currentCredential()?.data == earlier)
-    let mode = (try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue
-    precondition(mode == 0o600, "The runtime login file is private to the current user")
-
-    reads = 0; writes = 0; deletes = 0
-    try scope.apply(subscription)
-    try scope.check()
-    try scope.rebaseline()
-    try scope.settle()
-    precondition(try! scope.currentCredential()?.data == subscription.data)
-    precondition(reads == 0 && writes == 0 && deletes == 0, "File-mode checks, switches and settling never call the keychain")
-    scope.removeSignal()
-    precondition((try! Data(contentsOf: file)) == subscription.data, "Releasing management leaves a file login in place")
-
+    var writes = 0
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: { held }, write: {
+        writes += 1; held = $0
+    }, delete: { held = nil }))
     try SecureFiles.write(external, to: file)
-    do { try scope.apply(subscription); fatalError("Expected external file refusal") } catch {}
-    precondition((try! Data(contentsOf: file)) == external)
+
+    // The original split-auth report: every ordinary path refuses before changing either side, even explicit force.
+    for action in [{ try scope.check() }, { try scope.apply(subscription, replacingExternalState: true) }, { try scope.rebaseline() }, { try scope.settle() }] {
+        do { try action(); fatalError("Expected dual-runtime conflict") } catch is DualRuntimeConflict {}
+    }
+    precondition(held == earlier && (try! Data(contentsOf: file)) == external && writes == 0)
+
+    try scope.resolveDual(using: .keychain, expected: Credential(data: earlier))
+    precondition(held == earlier && (try! Data(contentsOf: file)) == RuntimeScope.signal)
+    try scope.check()
+
+    // Pending never bypasses dual detection, and an expected snapshot is rechecked under the scope lock.
+    try SecureFiles.write(external, to: file)
+    let journal = home.appendingPathComponent("lilt/transaction-system.json")
+    var transaction = try JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as! [String: Any]
+    transaction["pending"] = true
+    try SecureFiles.write(JSONSerialization.data(withJSONObject: transaction), to: journal)
+    for action in [{ try scope.check() }, { try scope.settle() }, { try scope.apply(subscription, replacingExternalState: true) }] {
+        do { try action(); fatalError("Expected pending dual-runtime conflict") } catch is DualRuntimeConflict {}
+    }
+    transaction["pending"] = false
+    try SecureFiles.write(JSONSerialization.data(withJSONObject: transaction), to: journal)
+    var raceReads = 0
+    let raced = RuntimeScope(fixtureHome: home, credentials: .init(read: {
+        raceReads += 1; return raceReads == 1 ? earlier : external
+    }, write: { _ in writes += 1 }, delete: {}))
+    do { try raced.resolveDual(using: .keychain, expected: Credential(data: earlier)); fatalError("Expected later-change refusal") } catch {}
+    precondition(raceReads >= 2 && writes == 1, "A renewal after the expected read must not be overwritten")
+    do { try scope.resolveDual(using: .file, expected: subscription); fatalError("Expected changed-source refusal") } catch {}
+    precondition(held == earlier && (try! Data(contentsOf: file)) == external)
+    try scope.resolveDual(using: .file, expected: Credential(data: external))
+    precondition(held == external && (try! Data(contentsOf: file)) == RuntimeScope.signal)
+    try scope.check()
+
+    // A file-only fallback also migrates into the official keychain instead of becoming a second runtime.
+    held = nil
+    try SecureFiles.write(external, to: file)
+    do { try scope.check(); fatalError("Expected file-only conflict") } catch is DualRuntimeConflict {}
+    try scope.resolveDual(using: .file, expected: Credential(data: external))
+    precondition(held == external && (try! Data(contentsOf: file)) == RuntimeScope.signal)
+
+    // Identical copies are normalized without an account switch; a missing file needs no conflict action.
+    try SecureFiles.write(external, to: file)
     try scope.rebaseline()
-    try scope.migrateCredentialStorage(toFile: false)
-    precondition(!scope.fileStorage && held == external)
     precondition((try! Data(contentsOf: file)) == RuntimeScope.signal)
-    precondition(try! scope.currentCredential()?.data == external)
     try scope.check()
-
-    // A failed keychain delete restores the original file and leaves no pending transaction.
-    onDelete = { throw AppFailure("Fixture delete failed") }
-    do { try scope.migrateCredentialStorage(toFile: true); fatalError("Expected delete failure") } catch {}
-    precondition(!scope.fileStorage && held == external)
-    precondition((try! Data(contentsOf: file)) == RuntimeScope.signal && !scope.transactionPending)
+    try FileManager.default.removeItem(at: file)
+    try scope.rebaseline()
     try scope.check()
-    onDelete = nil
-
-    // A failed keychain write while moving back leaves the file login and its baseline intact.
-    try scope.migrateCredentialStorage(toFile: true)
-    onWrite = { throw AppFailure("Fixture write failed") }
-    do { try scope.migrateCredentialStorage(toFile: false); fatalError("Expected write failure") } catch {}
-    precondition(scope.fileStorage && held == nil)
-    precondition((try! Data(contentsOf: file)) == external && !scope.transactionPending)
-    try scope.check()
-    onWrite = nil
-    print("PASS: runtime file storage — no keychain calls, 0600 file, switches/settling, bidirectional migration and rollback. Fictional credentials only.")
+    precondition(held == external && writes == 3)
+    print("PASS: keychain-only runtime — split-auth refusal, explicit authority choice, file-only migration and signal normalization.")
 }
 
 func runtimeChecks() throws {
@@ -569,15 +636,14 @@ func runtimeChecks() throws {
     let healthy = Data(#"{"env":{"HTTPS_PROXY":"http://proxy.invalid"},"model":"opus","forceLoginMethod":"claudeai"}"#.utf8)
     precondition((try! AuthenticationSettings.subscriptionSettings(healthy)) == nil)
     try scope.check()
-    // With no login in the fallback file, the switch left Lilt's signal there. A fallback file that holds a login
-    // follows the keychain instead, and is never taken away as if it were the signal.
+    // Identical file and keychain logins normalize to the signal; releasing management removes only that signal.
     let fallback = home.appendingPathComponent(".claude/.credentials.json")
     precondition((try! Data(contentsOf: fallback)) == RuntimeScope.signal)
-    try SecureFiles.write(earlier, to: fallback)
+    try SecureFiles.write(subscription.data, to: fallback)
     try scope.rebaseline()
-    precondition((try! Data(contentsOf: fallback)) == subscription.data)
+    precondition((try! Data(contentsOf: fallback)) == RuntimeScope.signal)
     scope.removeSignal()
-    precondition(FileManager.default.fileExists(atPath: fallback.path))
+    precondition(!FileManager.default.fileExists(atPath: fallback.path))
     // CC Switch may only change settings, leaving the credential digest unchanged.
     try SecureFiles.write(api, to: settings)
     expectFailure { try scope.apply(subscription) }
@@ -600,11 +666,11 @@ func runtimeChecks() throws {
     let racing = Data(#"{"claudeAiOauth":{"accessToken":"fixture-racing"}}"#.utf8)
     let raced = RuntimeScope(fixtureHome: home, credentials: .init(read: {
         reads += 1
-        return reads > 1 ? racing : held // read 1 prepares the switch; read 2 verifies before writing
+        return reads > 1 ? racing : held // early reads prepare; a later read verifies before writing
     }, write: { held = $0 }, delete: { held = nil }))
     let before = held
     expectFailure { try raced.apply(Credential(data: external)) }
-    precondition(reads == 2 && held == before && !raced.transactionPending)
+    precondition(reads == 3 && held == before && !raced.transactionPending)
     let malformed = Data("not-json".utf8)
     try SecureFiles.write(malformed, to: settings)
     held = external

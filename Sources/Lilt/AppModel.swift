@@ -26,7 +26,7 @@ struct AddRequest: Identifiable {
 /// The one thing the user most needs to know about the applied account, with the next step when there is one.
 struct Notice: Equatable {
     enum Action: Equatable {
-        case reauthorize(UUID), refresh(UUID), refreshAll, openScope, confirmApplied, adoptScope
+        case reauthorize(UUID), refresh(UUID), refreshAll, openScope, confirmApplied, adoptScope, resolveDual
         var title: String {
             switch self {
             case .reauthorize: "重新授权"
@@ -34,11 +34,11 @@ struct Notice: Equatable {
             case .refreshAll: "刷新全部额度"
             case .openScope: "查看接入"
             case .confirmApplied: "知道了"
-            case .adoptScope: "处理"
+            case .adoptScope, .resolveDual: "处理"
             }
         }
         /// These continue in the management window, so the menu bar panel has to open it.
-        var needsWindow: Bool { switch self { case .reauthorize, .openScope, .adoptScope: true; default: false } }
+        var needsWindow: Bool { switch self { case .reauthorize, .openScope, .adoptScope, .resolveDual: true; default: false } }
     }
     var symbol: String
     var text: String
@@ -62,6 +62,8 @@ final class AppModel {
     var addRequest: AddRequest?
     /// The user asked to keep the scope's current credential; the window asks once more before it happens.
     var confirmingAdopt = false
+    var confirmingDual = false
+    private(set) var dualConflict = false
     var appliedPending = false
     var lastEvent = "尚无接力记录"
     var shortcutIssue: String?
@@ -76,14 +78,13 @@ final class AppModel {
     private(set) var relayPause: String?
     private(set) var apiModeDetected = false
     var keepsAPIMode: Bool { library.preferences.keepAPIMode == true }
-    var displayedActiveID: UUID? { apiModeDetected || keepsAPIMode || scopeIssue != nil ? nil : library.activeID }
+    var displayedActiveID: UUID? { apiModeDetected || keepsAPIMode || dualConflict || scopeIssue != nil ? nil : library.activeID }
     private(set) var relayRetryAt: Date?
     private let retryClock: () -> Date
     /// Where the selected account's login goes. Files from before there was a choice always meant Lilt's own directory;
     /// anything set up now takes over Claude Code's default login.
     var scopeTarget: ScopeTarget { library.preferences.scopeTarget ?? (library.preferences.scopeEnabled ? .dedicated : .system) }
-    var runtimeFileStorage: Bool { library.preferences.runtimeFileStorage == true }
-    var runtime: RuntimeScope { fixtureRuntime ?? RuntimeScope(target: scopeTarget, fileStorage: runtimeFileStorage) }
+    var runtime: RuntimeScope { fixtureRuntime ?? RuntimeScope(target: scopeTarget) }
     private var fixtureRuntime: RuntimeScope?
     /// Lilt is putting logins into Claude Code's default login, so a plain `claude` in any terminal uses them.
     var managesDefaultLogin: Bool { library.preferences.scopeEnabled && scopeTarget == .system }
@@ -348,6 +349,11 @@ final class AppModel {
             logFailure("scope-unreadable", scopeUnreadable)
         }
     }
+    private func noteDualConflict(_ error: DualRuntimeConflict) {
+        dualConflict = true; scopeIssue = error.message
+        if managesDefaultLogin { Task { await IOQueue.perform { StatusLineBridge.setLabel(nil) } } }
+        stopRelay(because: "钥匙串与本地文件中的登录不一致，需要选择唯一登录。")
+    }
     func observeAPIMode(_ detected: Bool) {
         guard detected != apiModeDetected else { return }
         apiModeDetected = detected
@@ -551,6 +557,7 @@ final class AppModel {
         let runtime = self.runtime
         do { try await IOQueue.run { try runtime.check() } }
         catch let failure as ScopeUnreadable { noteUnreadable(failure); return false }
+        catch let conflict as DualRuntimeConflict { noteDualConflict(conflict); return false }
         catch {
             guard let settled = await settleInterrupted() else { return false }
             if !settled {
@@ -565,6 +572,7 @@ final class AppModel {
             }
         }
         // Assigned only when something changes: every assignment redraws whatever reads it, even an equal value.
+        dualConflict = false
         if scopeIssue != nil || scopeUnreadable != nil || scopeUnreadableSince != nil { scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil }
         return true
     }
@@ -649,6 +657,8 @@ final class AppModel {
                 failures[account.id] = nil; backoffs[account.id] = nil; status = "已同步官方 CLI 续期的凭据"
             }
             return verdict
+        } catch let conflict as DualRuntimeConflict {
+            noteDualConflict(conflict); return nil
         } catch let failure as ScopeUnreadable {
             // What was taken in is already saved; the next pass finds it unchanged and records the baseline then.
             noteUnreadable(failure); return nil
@@ -779,7 +789,10 @@ final class AppModel {
             status = demo ? "演示账号已应用" : "已切换到“\(target.label)”"
             // The relay card records relays; a switch made by hand is not one.
             if demo { lastEvent = "演示：已接力至 \(target.label)" }
+            dualConflict = false
             return true
+        } catch let conflict as DualRuntimeConflict {
+            noteDualConflict(conflict); message = conflict.message; return false
         } catch {
             let reason = Self.reason(error) ?? "凭据应用失败。"
             logFailure(automatically ? "auto-failed" : "manual-failed", reason)
@@ -825,47 +838,49 @@ final class AppModel {
     func confirmApplied() {
         appliedPending = false
     }
-    /// Take over Claude Code's default login, the way ORCA and CC Switch do: from now on a plain `claude` in any terminal
-    /// uses the account selected here. Whatever is logged in now is kept as an account (or refreshes the entry that is
-    /// the same Claude account), so nothing is lost and nothing is logged out.
+    /// Take over the official keychain login. A file-only fallback is imported and normalized to the keychain signal.
     func takeOverDefaultLogin() async {
         guard !demo, !busy, storageAvailable else { return }
         let scope = fixtureRuntime ?? RuntimeScope(target: .system)
-        let useFiles = runtimeFileStorage
         let wanted = library.activeID
         busy = true; status = "正在接管默认登录…"
         var adopted: UUID?
         do {
             try await exclusively {
                 let current = try await Self.patiently {
-                    try await IOQueue.run { () throws -> (Credential, Data?)? in
-                        guard let found = try scope.currentCredential(), (try? found.validate()) != nil else { return nil }
-                        return (found, scope.readIdentity())
+                    try await IOQueue.run { () throws -> (Credential, Data?, RuntimeScope.DualAuthority)? in
+                        let key = try scope.currentCredential(), file = try scope.fileCredential()
+                        if key != nil, file != nil, key!.data != file!.data { throw DualRuntimeConflict() }
+                        guard let found = key ?? file, (try? found.validate()) != nil else { return nil }
+                        return (found, scope.readIdentity(), key != nil ? .keychain : .file)
                     }
                 }
-                if let (found, identity) = current {
+                if let (found, identity, authority) = current {
                     let twin = twin(of: identity, besides: nil)
                     try store(found, label: "当前登录", kind: found.refreshable ? .oauth : .setupToken, replacing: twin?.id, identity: identity)
                     adopted = twin?.id ?? accounts.last?.id
+                    try await Self.patiently { try await IOQueue.run {
+                        if authority == .file { try scope.resolveDual(using: .file, expected: found) }
+                        else { try scope.rebaseline() }
+                    } }
+                } else {
+                    try await Self.patiently { try await IOQueue.run { try scope.rebaseline() } }
                 }
-                try await Self.patiently { try await IOQueue.run {
-                    if useFiles, current != nil { try scope.migrateCredentialStorage(toFile: true, replacingExternalState: true) }
-                    else { try scope.rebaseline() }
-                } }
             }
+        } catch let conflict as DualRuntimeConflict {
+            updatePreferences { $0.scopeTarget = .system; $0.scopeEnabled = true }
+            noteDualConflict(conflict); busy = false; selectedPage = .scope; message = conflict.message; return
         } catch {
             busy = false; status = "接管未完成"
             let reason = Self.reason(error)
             logFailure("takeover-failed", reason)
-            // The reason is shown: without it, a keychain that was not answering looked like something wrong for good.
             message = "无法接管默认登录。" + (reason.map { $0 + "默认登录没有改动，稍后再试。" } ?? "没有改动任何东西。"); return
         }
         updatePreferences { $0.scopeTarget = .system; $0.scopeEnabled = true }
-        scopeIssue = nil; relayPause = nil; latch = RelayLatch(); appliedPending = false
+        dualConflict = false; scopeIssue = nil; relayPause = nil; latch = RelayLatch(); appliedPending = false
         busy = false
         if liveUsageEnabled { connectStatusLine() }
         if let adopted {
-            // What is logged in stays logged in; Lilt only starts keeping track of it.
             library.activeID = adopted; save()
             status = "已接管默认登录"
             await refresh(adopted)
@@ -876,24 +891,56 @@ final class AppModel {
             library.activeID = nil; save(); status = "已接管默认登录"
         }
     }
-    func setRuntimeFileStorage(_ on: Bool) {
-        guard !demo, !busy, storageAvailable, on != runtimeFileStorage else { return }
-        guard library.preferences.scopeEnabled else {
-            updatePreferences { $0.runtimeFileStorage = on }
-            status = on ? "接管后将使用本地登录文件" : "接管后将使用 macOS 钥匙串"
-            return
-        }
+    func resolveDualConflict(useFile: Bool) {
+        guard !demo, !busy, storageAvailable else { return }
         let runtime = self.runtime
-        busy = true; status = on ? "正在把登录迁到本地文件…" : "正在把登录迁回钥匙串…"
+        busy = true; status = "正在统一为官方钥匙串登录…"
         Task {
+            var adopted: UUID?
             do {
-                try await exclusively { try await IOQueue.run { try runtime.migrateCredentialStorage(toFile: on) } }
-                updatePreferences { $0.runtimeFileStorage = on }
-                scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil
-                status = on ? "已改用本地登录文件" : "已改用 macOS 钥匙串"
+                try await exclusively {
+                    let ids = accounts.map(\.id)
+                    let found = try await IOQueue.run { () throws -> (Credential, UUID?, Data?) in
+                        guard let credential = useFile ? try runtime.fileCredential() : try runtime.currentCredential() else {
+                            throw AppFailure("要保留的登录不存在，请重新检查。")
+                        }
+                        try credential.validate()
+                        var matched: UUID?, identity: Data?
+                        for id in ids where AccountVault.hasFile(account: id.uuidString) {
+                            if try AccountVault.read(account: id.uuidString) == credential.data {
+                                matched = id
+                                identity = try AccountVault.read(account: Keychain.identityAccount(id))
+                                break
+                            }
+                        }
+                        return (credential, matched, identity)
+                    }
+                    var identity = found.2
+                    if found.1 == nil { identity = await IdentityClient().fetch(found.0) }
+                    let existing = found.1 ?? twin(of: identity, besides: nil)?.id
+                    try store(found.0, label: "当前登录", kind: found.0.refreshable ? .oauth : .setupToken, replacing: existing, identity: identity)
+                    adopted = existing ?? accounts.last?.id
+                    try await IOQueue.run { try runtime.resolveDual(using: useFile ? .file : .keychain, expected: found.0) }
+                    let id = adopted ?? active?.id
+                    await IOQueue.perform {
+                        try? runtime.writeIdentity(id.flatMap { (try? AccountVault.read(account: Keychain.identityAccount($0))) ?? nil })
+                    }
+                }
+                if let adopted { library.activeID = adopted }
+                updatePreferences { $0.scopeEnabled = true; $0.autoRelayStopReason = nil }
+                dualConflict = false; confirmingDual = false; scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil
+                relayPause = nil; latch = RelayLatch(); appliedPending = true; lastSwitchAt = .now; save()
+                if managesDefaultLogin, liveUsageEnabled, let label = active?.label {
+                    await IOQueue.perform { StatusLineBridge.setLabel(label) }
+                }
+                status = "已统一为官方钥匙串登录"
+                busy = false
+                if let id = active?.id { await refresh(id) }
+            } catch let conflict as DualRuntimeConflict {
+                noteDualConflict(conflict); message = conflict.message
             } catch {
-                status = "登录存储方式未改变"
-                message = Self.reason(error) ?? "登录存储迁移未完成，请稍后重试。"
+                status = "双登录处理未完成"
+                message = Self.reason(error) ?? "双登录处理未完成，请稍后重试。"
             }
             busy = false
         }
@@ -927,7 +974,8 @@ final class AppModel {
     }
     /// The latest reading a Claude Code session handed its status line, if it is about the account in use.
     private func ingestLiveUsage() async {
-        guard !demo, managesDefaultLogin, liveUsageEnabled, let live = await IOQueue.perform({ StatusLineBridge.latest() }) else { return }
+        guard !demo, managesDefaultLogin, liveUsageEnabled, !dualConflict, scopeIssue == nil,
+              let live = await IOQueue.perform({ StatusLineBridge.latest() }) else { return }
         if liveUsageSampledAt != live.sampledAt { liveUsageSampledAt = live.sampledAt }
         guard let active, live.sampledAt != liveStamp else { return }
         liveStamp = live.sampledAt
@@ -1003,7 +1051,7 @@ final class AppModel {
     }
     func relay() async {
         guard autoRelay, !busy, !loading, let active, let snapshot = active.usage else { return }
-        guard storageAvailable, library.preferences.scopeEnabled || demo, scopeIssue == nil,
+        guard storageAvailable, library.preferences.scopeEnabled || demo, !dualConflict, scopeIssue == nil,
               !apiModeDetected, !keepsAPIMode else { return }
         // A status-line reading is already the session's own report, and the endpoint is not asked again
         // for five minutes. The hand-off has to be allowed to start from that reading for the whole five
@@ -1177,6 +1225,10 @@ final class AppModel {
     }
     func notice(at now: Date = .now) -> Notice? {
         if !storageAvailable { return Notice(symbol: "externaldrive.badge.exclamationmark", text: "本地数据不可用，已停止写入", detail: "检查 ~/Library/Application Support/Lilt 的权限后重新打开 Lilt。", warning: true) }
+        if dualConflict {
+            return Notice(symbol: "exclamationmark.triangle", text: "检测到两份不同的登录",
+                          detail: "钥匙串与本地文件中的登录不一致，Claude Code 可能使用另一个账号。选择唯一保留的登录后再恢复管理。", warning: true, action: .resolveDual)
+        }
         if apiModeDetected {
             return Notice(symbol: "arrow.triangle.branch", text: keepsAPIMode ? "已保留 API 模式" : "检测到 API 模式",
                           detail: "点击订阅账号会清除用户配置中的 API 覆盖项并应用所选登录。", warning: !keepsAPIMode)
@@ -1231,7 +1283,7 @@ final class AppModel {
     func blocks(_ action: Notice.Action) -> Bool {
         switch action {
         case .confirmApplied, .openScope, .refresh, .refreshAll: false
-        case .reauthorize, .adoptScope: busy
+        case .reauthorize, .adoptScope, .resolveDual: busy
         }
     }
     func perform(_ action: Notice.Action) {
@@ -1242,12 +1294,13 @@ final class AppModel {
         case .openScope: selectedPage = .scope
         case .confirmApplied: confirmApplied()
         case .adoptScope: confirmingAdopt = true
+        case .resolveDual: confirmingDual = true
         }
     }
     /// The user has confirmed the scope still belongs to the account in use: keep what the CLI left there as that
     /// account's credential (a renewed token replaces the old one for good) and resume managing the scope.
     func adoptScopeCredential() {
-        guard !demo, !busy, let active else { return }
+        guard !demo, !busy, !dualConflict, let active else { return }
         let runtime = self.runtime, id = active.id, name = scopeName
         Task {
             do {
@@ -1274,14 +1327,14 @@ final class AppModel {
     }
     /// The user says the scope should go back to the account Lilt put there, whatever is in it now.
     func reclaimScope() {
-        guard !demo, !busy, let active else { return }
+        guard !demo, !busy, !dualConflict, let active else { return }
         Task { if await apply(active.id) { status = "已改回“\(active.label)”" } }
     }
     func exportDiagnostics() {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Lilt-diagnostics.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // Fixed fields only: no nicknames, account IDs, paths, CLI output, or server error bodies.
-        let text = "\(AppBuild.description)\nBuild: \(AppBuild.timestamp)\nSource: \(AppBuild.revision)\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nRuntime storage: \(runtimeFileStorage ? "file" : "keychain")\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
+        let text = "\(AppBuild.description)\nBuild: \(AppBuild.timestamp)\nSource: \(AppBuild.revision)\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nRuntime storage: keychain\nDual login conflict: \(dualConflict ? "present" : "none")\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
         do { try Data(text.utf8).write(to: url, options: .atomic); status = "已导出脱敏诊断" } catch { message = "诊断文件保存失败。" }
     }
 }
