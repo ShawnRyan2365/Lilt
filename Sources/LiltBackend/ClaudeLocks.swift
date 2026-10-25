@@ -70,6 +70,9 @@ private func withDirectoryLock<T>(_ path: URL, stale: TimeInterval, _ work: () t
 
 public enum ClaudeLocks {
     public static func withCredentials<T>(_ paths: BackendPaths, _ work: () throws -> T) throws -> T {
+        try withCredentials(paths.runtimeScope, work)
+    }
+    public static func withCredentials<T>(_ paths: RuntimeScopePaths, _ work: () throws -> T) throws -> T {
         let primary = paths.claudeDirectory.appendingPathComponent(".oauth_refresh.lock", isDirectory: true)
         let legacy = paths.claudeDirectory.deletingLastPathComponent().appendingPathComponent(paths.claudeDirectory.lastPathComponent + ".lock", isDirectory: true)
         return try withDirectoryLock(primary, stale: 60) {
@@ -79,12 +82,18 @@ public enum ClaudeLocks {
         }
     }
     public static func withConfig<T>(_ paths: BackendPaths, _ work: () throws -> T) throws -> T {
+        try withConfig(paths.runtimeScope, work)
+    }
+    public static func withConfig<T>(_ paths: RuntimeScopePaths, _ work: () throws -> T) throws -> T {
         try withDirectoryLock(paths.globalClaudeConfig.appendingPathExtension("lock"), stale: 10, work)
     }
     public static func withAll<T>(_ paths: BackendPaths, _ work: () throws -> T) throws -> T {
+        try withAll(paths.runtimeScope, work)
+    }
+    public static func withAll<T>(_ paths: RuntimeScopePaths, _ work: () throws -> T) throws -> T {
         try withCredentials(paths) { try withConfig(paths, work) }
     }
-    private static func withOwnLock<T>(_ paths: BackendPaths, _ work: () throws -> T) throws -> T {
+    private static func withOwnLock<T>(_ paths: RuntimeScopePaths, _ work: () throws -> T) throws -> T {
         let file = paths.stateRoot.appendingPathComponent("runtime.lock")
         let fd = open(file.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw BackendFailure("无法锁定 Lilt 运行时。") }

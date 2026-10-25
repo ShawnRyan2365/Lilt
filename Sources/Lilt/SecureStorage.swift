@@ -202,6 +202,16 @@ struct Disk {
         return try JSONDecoder().decode(Library.self, from: Data(contentsOf: path))
     }
     static func save(_ library: Library) throws { try write(JSONEncoder().encode(library), to: file("accounts.json")) }
+    static func loadProjects() throws -> ProjectCatalog {
+        try directory(root)
+        let path = file("projects.json")
+        if !FileManager.default.fileExists(atPath: path.path) { return ProjectCatalog() }
+        return try JSONDecoder().decode(ProjectCatalog.self, from: Data(contentsOf: path))
+    }
+    static func saveProjects(_ catalog: ProjectCatalog) throws {
+        try directory(root)
+        try write(JSONEncoder().encode(catalog), to: file("projects.json"))
+    }
 }
 
 /// Where blocking work goes instead of the main thread: each keychain call starts a `security` process, and each write
@@ -250,19 +260,40 @@ final class RuntimeScope: @unchecked Sendable {
     }
     enum DualAuthority { case keychain, file }
     let target: ScopeTarget
+    let projectID: UUID?
     let directory: URL
     private let root: URL
     private let home: URL
+    private let projectRoot: String?
     private let credentialAccess: CredentialAccess?
     init(target: ScopeTarget) {
         self.target = target
+        projectID = nil; projectRoot = nil
         root = Disk.root; home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
         directory = target == .system ? FileManager.default.homeDirectoryForCurrentUser.appending(component: ".claude", directoryHint: .isDirectory)
                                        : Disk.root.appending(component: "scope", directoryHint: .isDirectory)
     }
+    /// A project's own Claude configuration, `projects/<id>/claude`, with its journal and lock state beside it in
+    /// `projects/<id>/state`. Its keychain item is the CLI's item for that directory, reached through `CLIKeychain`,
+    /// and `.credentials.json` only ever holds the `{}` signal, as for the default login.
+    init(project: ProjectBinding) {
+        target = .dedicated; projectID = project.id; projectRoot = project.rootPath
+        home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
+        let base = Disk.root.appendingPathComponent("projects", isDirectory: true).appendingPathComponent(project.id.uuidString, isDirectory: true)
+        root = base.appendingPathComponent("state", isDirectory: true)
+        directory = base.appendingPathComponent("claude", isDirectory: true)
+    }
+    /// A project scope at its usual place under `Disk.root` (a fixture home in checks), with an in-memory keychain.
+    init(fixtureHome: URL, project: ProjectBinding, credentials: CredentialAccess) {
+        target = .dedicated; projectID = project.id; projectRoot = project.rootPath
+        home = fixtureHome; credentialAccess = credentials
+        let base = Disk.root.appendingPathComponent("projects", isDirectory: true).appendingPathComponent(project.id.uuidString, isDirectory: true)
+        root = base.appendingPathComponent("state", isDirectory: true)
+        directory = base.appendingPathComponent("claude", isDirectory: true)
+    }
     /// Isolated transaction checks use an in-memory credential store, never a macOS keychain item.
     init(fixtureHome: URL, credentials: CredentialAccess) {
-        target = .system; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
+        target = .system; projectID = nil; projectRoot = nil; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
         directory = fixtureHome.appendingPathComponent(".claude"); credentialAccess = credentials
     }
     /// What Lilt keeps in `.credentials.json` when the file holds no login of its own: an empty document. The CLI reads
@@ -299,21 +330,22 @@ final class RuntimeScope: @unchecked Sendable {
         if target == .dedicated || FileManager.default.fileExists(atPath: inside.path) { return inside }
         return home.appending(component: ".claude.json", directoryHint: .notDirectory)
     }
-    // The default login's item belongs to the CLI and is reached through its tool. The dedicated one keeps the
-    // access it was created with, so existing setups do not start asking for keychain permission.
+    // Project and default items are written through the CLI's own keychain tool so the CLI can read them.
+    // Legacy dedicated items keep the access control under which they were created.
+    private var usesCLIKeychain: Bool { target == .system || projectID != nil }
     private func keychainRead() throws -> Data? {
         do {
             if let credentialAccess { return try credentialAccess.read() }
-            return target == .system ? try CLIKeychain.read(service: service) : try Keychain.read(service: service, account: NSUserName())
+            return usesCLIKeychain ? try CLIKeychain.read(service: service) : try Keychain.read(service: service, account: NSUserName())
         } catch { throw ScopeUnreadable(error) }
     }
     private func keychainWrite(_ data: Data) throws {
         if let credentialAccess { try credentialAccess.write(data); return }
-        if target == .system { try CLIKeychain.write(data, service: service) } else { try Keychain.write(data, service: service, account: NSUserName()) }
+        if usesCLIKeychain { try CLIKeychain.write(data, service: service) } else { try Keychain.write(data, service: service, account: NSUserName()) }
     }
     private func keychainDelete() throws {
         if let credentialAccess { try credentialAccess.delete(); return }
-        if target == .system { try CLIKeychain.delete(service: service) } else { try Keychain.delete(service: service, account: NSUserName()) }
+        if usesCLIKeychain { try CLIKeychain.delete(service: service) } else { try Keychain.delete(service: service, account: NSUserName()) }
     }
     /// Lilt's own folders. `~/.claude` belongs to the CLI and is never created or re-permissioned here.
     private func prepare() throws {
@@ -463,15 +495,24 @@ final class RuntimeScope: @unchecked Sendable {
             throw error
         }
     }
-    private var launchParts: [String] {
-        ["env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN",
-         "-u CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR -u CLAUDE_CODE_HOST_CREDS_FILE",
+    /// `env` first removes every variable that could put another login or provider in place of this scope's
+    /// (`ProjectRules.clearedEnvironment`), then sets the configuration and keychain directory. Each argument is quoted
+    /// for the shell on its own, so a path or argument with spaces, quotes or `$(...)` stays one literal argument.
+    private func launchParts(executable: String, arguments: [String]) -> [String] {
+        ["env " + ProjectRules.clearedEnvironment.map { "-u \($0)" }.joined(separator: " "),
          "CLAUDE_CONFIG_DIR=\(shellQuote(directory.path))",
          "CLAUDE_SECURESTORAGE_CONFIG_DIR=\(shellQuote(directory.path))",
-         "claude"]
+         executable == "claude" ? executable : shellQuote(executable)] + arguments.map(shellQuote)
     }
-    var launchCommand: String { launchParts.joined(separator: " ") }
+    /// A project's command enters the project first and replaces the shell with the CLI, so the CLI is the process the
+    /// terminal shows and its exit status is the terminal's.
+    func launchCommand(executable: String = "claude", arguments: [String] = []) -> String {
+        let command = launchParts(executable: executable, arguments: arguments).joined(separator: " ")
+        guard let projectRoot else { return command }
+        return "cd \(shellQuote(projectRoot)) && exec \(command)"
+    }
+    var launchCommand: String { launchCommand() }
     /// The same command broken at argument boundaries for reading; the clipboard gets the single-line form.
-    var launchCommandDisplay: String { launchParts.joined(separator: " \\\n  ") }
+    var launchCommandDisplay: String { launchParts(executable: "claude", arguments: []).joined(separator: " \\\n  ") }
 }
 func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }

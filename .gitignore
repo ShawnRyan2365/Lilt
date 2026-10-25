@@ -17,6 +17,7 @@ credentials.json
 oauth-account.json
 *.p12
 *.mobileprovision
+*.lilt-credential-export
 
 # Runtime, experiments and diagnostics
 work/

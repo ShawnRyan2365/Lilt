@@ -98,6 +98,7 @@ struct SetupCard: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private enum Step: Int, CaseIterable { case takeover, account, choose }
     private var step: Step? {
+        if !model.managesDefaultLogin, !model.projectCatalog.projects.isEmpty { return nil }
         if !model.managesDefaultLogin { return .takeover }
         if model.accounts.isEmpty { return .account }
         return model.active == nil ? .choose : nil
@@ -119,9 +120,13 @@ struct SetupCard: View {
     @ViewBuilder private func content(_ step: Step) -> some View {
         switch step {
         case .takeover:
-            stage("terminal", "接管 Claude Code 默认登录", "之后在任何终端直接运行 claude，用的都是这里选中的账号") {
-                Button("接管…") { orcaActive = OrcaProbe.managesDefaultLogin(); confirming = true }
-                    .buttonStyle(.lilt(.primary, size: .large)).disabled(model.busy)
+            stage("terminal", "选择 Claude Code 使用方式", "接管默认登录让所有终端共享接力；按项目隔离则各自固定账号") {
+                HStack(spacing: 8) {
+                    Button("接管默认登录…") { orcaActive = OrcaProbe.managesDefaultLogin(); confirming = true }
+                        .buttonStyle(.lilt(.primary, size: .large)).disabled(model.busy)
+                    Button("按项目隔离") { model.selectedPage = .projects }
+                        .buttonStyle(.lilt(.secondary, size: .large))
+                }
                 if model.accounts.isEmpty { Button("先看看演示") { model.startDemo() }.buttonStyle(.lilt(.ghost, size: .small)) }
             }
         case .account:
@@ -273,6 +278,7 @@ struct ScopeView: View {
 }
 struct SettingsView: View {
     @Bindable var model: AppModel
+    @State private var transfer: CredentialTransferRequest?
     private var fiveHourThreshold: Binding<Double> { Binding(get: { model.thresholds.fiveHour }, set: { model.setFiveHourThreshold($0) }) }
     private var sevenDayThreshold: Binding<Double> { Binding(get: { model.thresholds.sevenDay }, set: { model.setSevenDayThreshold($0) }) }
     private var shortcut: Binding<UInt32> {
@@ -283,7 +289,7 @@ struct SettingsView: View {
             Section {
                 thresholdRow("5 小时阈值", fiveHourThreshold)
                 thresholdRow("7 天阈值", sevenDayThreshold)
-            } footer: { Text("默认都是 1%，可设 0–20%。任一窗口的剩余额度到了它的阈值就换号；用得快时，按消耗速度最多再提前 10 个百分点。未知额度不作为可用候选。") }
+            } footer: { Text("默认都是 1%，可设 0–20%。任一窗口剩余到阈值就换号；高并发下按实际消耗速度和接力耗时提前，不再固定封顶 10 点。未知额度不作为可用候选。") }
             Section {
                 LabeledContent("先用快重置的周额度") {
                     LiquidToggle(label: "先用快重置的周额度", isOn: Binding(get: { model.soonerWeekly }, set: { model.setSoonerWeekly($0) }), width: 44)
@@ -299,6 +305,17 @@ struct SettingsView: View {
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
             } footer: { Text("在任何应用里按下，打开或收起菜单栏面板。Lilt 无法得知其他应用是否占用了同一组合；按下没有反应时请换一个。") }
             Section {
+                Button("加密导出账号库…") {
+                    if let url = CredentialTransferPanels.exportURL() { transfer = CredentialTransferRequest(mode: .export, url: url) }
+                }
+                .disabled(model.demo || model.accounts.isEmpty || model.busy || model.loggingIn)
+                Button("导入账号库…") {
+                    if let url = CredentialTransferPanels.importURL() { transfer = CredentialTransferRequest(mode: .import, url: url) }
+                }
+                .disabled(model.demo || model.busy || model.loggingIn)
+            } header: { Text("账号迁移") }
+            footer: { Text("口令加密的一次性迁移，不是云同步。导出文件含可登录凭据；导入只新增、默认停用并关闭自动接力，不改变当前 Claude 登录。") }
+            Section {
                 LabeledContent("版本", value: "\(AppBuild.version) · 研究预览版")
                 LabeledContent("自动检查更新") {
                     LiquidToggle(label: "自动检查更新", isOn: Binding(get: { model.autoUpdateCheck }, set: { model.setAutoUpdateCheck($0) }), width: 44)
@@ -310,7 +327,9 @@ struct SettingsView: View {
                     Text("运行中的 CLI 是否即时换号、刷新竞争、多会话及跨账号缓存尚待验证。")
                 }
             }
-        }.formStyle(.grouped).tint(Tokens.accentTint)
+        }
+        .formStyle(.grouped).tint(Tokens.accentTint)
+        .sheet(item: $transfer) { CredentialTransferView(model: model, request: $0) }
     }
     private func thresholdRow(_ title: String, _ value: Binding<Double>) -> some View {
         LabeledContent(title) {
@@ -379,18 +398,19 @@ struct MenuPanel: View {
             HStack {
                 let blocker = model.autoRelay ? nil : model.relayBlocker
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("自动接力").font(Typo.label)
+                    Text("默认登录 · 自动接力").font(Typo.label)
                     if let explanation = model.relayExplanation ?? blocker {
                         Text(explanation).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3).help(explanation)
                     }
                 }
                 .help(model.handOffRule)
                 Spacer()
-                LiquidToggle(label: "自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }), width: 44)
+                LiquidToggle(label: "默认登录自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }), width: 44)
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")
             }
             HStack(spacing: 2) {
                 Button("管理账号") { model.selectedPage = .accounts; openMain() }.buttonStyle(.lilt(.ghost, size: .small))
+                Button("项目") { model.selectedPage = .projects; openMain() }.buttonStyle(.lilt(.ghost, size: .small))
                 Spacer()
                 Button { refreshSpin += 1; if let id = model.active?.id { Task { await model.refresh(id, manually: true) } } } label: {
                     Image(systemName: "arrow.clockwise").symbolEffect(.rotate, value: reduceMotion ? 0 : refreshSpin)

@@ -13,7 +13,7 @@ struct MainView: View {
     @State private var refreshSpin = 0
     @Namespace private var inUse
     /// First-run steps are still open. The demo has nothing to set up.
-    private var setupPending: Bool { !model.demo && (!model.managesDefaultLogin || !model.setupComplete) }
+    private var setupPending: Bool { !model.demo && model.projectCatalog.projects.isEmpty && (!model.managesDefaultLogin || !model.setupComplete) }
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
@@ -23,6 +23,7 @@ struct MainView: View {
                     switch model.selectedPage {
                     case .overview: overview
                     case .accounts: accountsPage
+                    case .projects: ProjectsView(model: model)
                     case .scope: ScopeView(model: model)
                     case .diagnostics: diagnostics
                     }
@@ -163,7 +164,10 @@ struct MainView: View {
     }
     private var runnerTrack: some View {
         RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, disabled: model.busy,
-                    onSelect: { id in Task { await model.apply(id) } },
+                    onSelect: { id in
+                        if model.projectCatalog.reservedAccountIDs.contains(id) { model.selectedPage = .projects }
+                        else { Task { await model.apply(id) } }
+                    },
                     onAdd: model.canAdd ? { model.requestAdd() } : nil) { runner in
             accountMenu(runner.id)
         }
@@ -172,12 +176,13 @@ struct MainView: View {
     @ViewBuilder private func accountMenu(_ id: UUID) -> some View {
         if let account = model.accounts.first(where: { $0.id == id }) {
             let active = id == model.library.activeID
+            let reserved = model.projectCatalog.reservedAccountIDs.contains(id)
             Button("刷新额度") { Task { await model.refresh(id, manually: true) } }
             Button("修改备注") { rename = account.label; renameID = id }
-            Button(account.enabled ? "停用" : "启用") { model.update(id) { $0.enabled.toggle() } }
+            Button(account.enabled ? "停用" : "启用") { model.setEnabled(!account.enabled, id: id) }
             Divider()
             Button("重新授权 / 替换 Token") { model.requestAdd(replacing: id) }.disabled(!model.canAdd)
-            Button(active ? "删除（需先切换到其他账号）" : "删除…", role: .destructive) { deleteAccount = account }.disabled(active)
+            Button(active ? "删除（需先切换到其他账号）" : reserved ? "删除（需先解绑项目）" : "删除…", role: .destructive) { deleteAccount = account }.disabled(active || reserved)
         }
     }
     private var relay: some View {
@@ -185,9 +190,9 @@ struct MainView: View {
         let blocker = model.autoRelay ? nil : model.relayBlocker
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("自动接力").font(Typo.label)
+                Text("默认登录 · 自动接力").font(Typo.label)
                 Spacer()
-                LiquidToggle(label: "自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }))
+                LiquidToggle(label: "默认登录自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }))
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")
             }
             Text(model.relayExplanation ?? blocker ?? model.handOffRule)
@@ -221,7 +226,7 @@ struct MainView: View {
                 HStack(alignment: .top, spacing: 12) {
                     Text(model.autoSort
                          ? "从上到下是接力顺序：7 天额度先重置的在前，同一天重置的剩余多的在前。换号时先挑 5 小时额度最空的账号，一样空的按这个顺序，用到阈值再换。关闭后恢复你拖好的顺序。"
-                         : "从上到下是接力顺序，可以拖动调整；换号时先挑 5 小时额度最空的账号，一样空的按这个顺序。备注只用于本机识别，本版不做账号去重。")
+                         : "从上到下是接力顺序，可以拖动调整；换号时先挑 5 小时额度最空的账号，一样空的按这个顺序。项目专用账号不参与默认自动接力；备注只用于本机识别。")
                         .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
                     Text("自动排序").font(Typo.caption).foregroundStyle(Tokens.muted)

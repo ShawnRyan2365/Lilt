@@ -5,11 +5,11 @@ cd "$(dirname "$0")/.."
 # Multi-arch builds need Xcode's build system; a plain local build only needs Command Line Tools.
 if [ "${UNIVERSAL:-0}" = 1 ]; then
   DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}" \
-    swift build -c release --product Lilt --arch arm64 --arch x86_64
-  BIN=.build/apple/Products/Release/Lilt
+    swift build -c release --product LiltApp --arch arm64 --arch x86_64
+  BIN=.build/apple/Products/Release/LiltApp
 else
-  swift build -c release --product Lilt
-  BIN=.build/release/Lilt
+  swift build -c release --product LiltApp
+  BIN=.build/release/LiltApp
 fi
 APP="$PWD/build/Lilt.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/zh-Hans.lproj"
@@ -30,8 +30,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
-<key>CFBundleShortVersionString</key><string>0.2.5</string>
-<key>CFBundleVersion</key><string>18</string>
+<key>CFBundleShortVersionString</key><string>0.3.0</string>
+<key>CFBundleVersion</key><string>19</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

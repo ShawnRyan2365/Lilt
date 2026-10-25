@@ -90,11 +90,32 @@ func testStatusLine() throws {
     let input = Data(#"{"session_id":"not-saved","rate_limits":{"five_hour":{"used_percentage":42,"resets_at":2000000000}}}"#.utf8)
     let output = try LiveUsageBridge.handle(store: store, input: input)
     expect(output == input, "status line did not preserve original output: got \(output.count) bytes, expected \(input.count)")
-    expect(LiveUsageBridge.latest(store: store)?.fiveHour?.used == 42, "status line reading")
+    let files = try FileManager.default.contentsOfDirectory(atPath: store.paths.runtimeScope.spool.path).filter { $0.hasSuffix(".json") }
+    expect(files.count == 1, "one event file per report")
+    let kept = try String(contentsOf: store.paths.runtimeScope.spool.appendingPathComponent(files[0]), encoding: .utf8)
+    expect(!kept.contains("session_id") && !kept.contains("not-saved"), "only rate limits are kept")
+    let batch = LiveUsageBridge.drain(store: store)
+    expect(batch.events.count == 1 && batch.events[0].snapshot.fiveHour?.used == 42 && !batch.hasGaps, "status line reading")
+    // Five sessions reporting at once: every event arrives, none overwrites another.
+    DispatchQueue.concurrentPerform(iterations: 5) { session in
+        for round in 0..<8 {
+            let used = [61, 74, 57, 73, 68][(session + round) % 5]
+            let event = Data(#"{"rate_limits":{"five_hour":{"used_percentage":\#(used),"resets_at":2000000000}}}"#.utf8)
+            _ = try? LiveUsageBridge.handle(store: store, input: event)
+        }
+    }
+    let concurrent = LiveUsageBridge.drain(store: store)
+    expect(concurrent.events.count == 40 && !concurrent.hasGaps, "concurrent events lost: \(concurrent.events.count)")
+    expect(concurrent.events.map { $0.snapshot.fiveHour!.used }.max() == 74, "high-water mark")
+    // A session on another configuration directory does not report for the default login.
+    setenv("CLAUDE_CONFIG_DIR", root.appendingPathComponent("elsewhere").path, 1)
+    _ = try LiveUsageBridge.handle(store: store, input: input)
+    unsetenv("CLAUDE_CONFIG_DIR")
+    expect(LiveUsageBridge.drain(store: store).events.isEmpty, "foreign configuration reported for the default login")
     try LiveUsageBridge.uninstall(store: store)
     let restored = try JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.settings)) as! [String: Any]
     expect((restored["statusLine"] as! [String: Any])["command"] as? String == "cat", "status line restore")
-    expect(LiveUsageBridge.latest(store: store) == nil, "status line cleanup")
+    expect(!FileManager.default.fileExists(atPath: store.paths.runtimeScope.spool.path), "status line cleanup")
 }
 
 func testRefreshRecovery() async throws {
@@ -176,6 +197,8 @@ func testAutomaticRelay() async throws {
     expect(stopped.preferences.autoRelayStopReason != nil, "safety stop reason missing")
 }
 
+// The checks must not depend on the shell that runs them: a configuration directory set there would change scopes.
+for key in ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"] { unsetenv(key) }
 expect(SHA256.hex(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256")
 expect(SHA256.hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "SHA-256 empty")
 try testSecureRuntime()
@@ -183,4 +206,9 @@ try testStatusLine()
 try await testRefreshRecovery()
 try await testFreshServerTakeover()
 try await testAutomaticRelay()
-print("LiltBackendChecks: PASS (7 groups: digest, secure runtime, API preservation, status line, refresh recovery, fresh server, automatic relay)")
+try await testProjects()
+try await testObservationIsNotBlocked()
+try await testRelayRunsOnce()
+try await testTransfer()
+try await testProjectAccountsAreNotRenewed()
+print("LiltBackendChecks: PASS (12 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

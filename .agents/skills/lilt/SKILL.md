@@ -24,11 +24,14 @@ Lilt 管理本机多个 Claude Pro/Max 账号、5 小时/7 天额度、手动切
 - 缺失或过期额度是未知，不是充足或耗尽。默认阈值为剩余 ≤1%。
 - 同一凭据作用域中的多个 CLI 可能一起切换，不承诺进程级独立账号。
 - 缓存连续性与会话连续性分别验证；没有真实数据时不声称跨账号缓存共享或节省比例。
+- 项目固定账号：每个项目一个独立配置目录，只影响从项目入口（macOS“启动项目”、`lilt run --project`）启动的 CLI；项目账号不参与默认自动接力，到阈值只提示。不改写已运行进程的环境，不强退 Orca/终端，也不声称已迁移。启动失败绝不回退到普通 `claude`。
+- 账号迁移只做口令加密的一次性导出/导入：口令只从终端或安全输入框读取；导入只新增、默认停用并关闭自动接力，不写运行时、不覆盖已有账号；输出只有数量。导出文件与口令都能使用账号，不要放进 Git、日志或诊断。
 
 ## 代码结构
 
-- `Sources/LiltCore/`：额度、阈值、候选排序、提前量、接力、OAuth 文档与安全文件等纯规则。
-- `Sources/Lilt/`：macOS SwiftUI、AppModel、macOS 钥匙串/文件 RuntimeScope 和更新器。
+- `Sources/LiltCore/`：额度、阈值、候选排序、提前量、接力、逐事件 spool、项目绑定规则、导入事务、OAuth 文档与安全文件等纯规则（只依赖 Foundation）。
+- `Sources/LiltTransfer/`：口令加密归档（scrypt + AES-GCM），唯一依赖 swift-crypto 的模块。
+- `Sources/Lilt/`：macOS SwiftUI、AppModel、macOS 钥匙串/文件 RuntimeScope（默认、旧 dedicated、项目）、项目页、迁移和更新器。SwiftPM 产品名为 `LiltApp`。
 - `Sources/LiltBackend/`：XDG 存储、文件 RuntimeScope、Claude 目录锁、OAuth 服务、HeadlessEngine、状态栏、Unix socket 与 systemd。
 - `Sources/LiltCLI/`：单个 `lilt` 可执行文件及其 `daemon` 子命令。
 - `Tests/LiltCoreTests/`、`Tests/LiltBackendTests/`、`Tests/LiltModelTests/`：虚构数据检查。
@@ -87,6 +90,12 @@ lilt auto once
 lilt config set five-hour-threshold <0-20>
 lilt config set seven-day-threshold <0-20>
 lilt statusline on|off
+lilt project bind|rebind <目录> <账号> [--allow-shared]
+lilt project list|status [目录]
+lilt project unbind <目录>
+lilt run --project <目录> [-- <claude 参数>]
+lilt export <新文件>
+lilt import <归档>
 lilt release
 lilt service install|uninstall|status
 lilt daemon

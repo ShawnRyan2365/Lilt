@@ -140,6 +140,9 @@ public struct RelayPolicy: Sendable {
     /// When true, a healthy active account may hand off to one whose 7-day window resets sooner.
     /// Off by default. Reaching the threshold ignores this and keeps the user's order.
     public var soonerWeekly: Bool
+    /// What each window must still have after the expected reaction time. This comes from `UsagePace`; it is not
+    /// a second exhaustion threshold and defaults to zero for callers without a pace history.
+    public var requiredMargin: Thresholds
     /// How long before expiry a target account's access token is renewed.
     /// Claude Code refreshes on its own about five minutes ahead. Ten minutes is twice that buffer,
     /// so a token written into the scope is not already inside the CLI's refresh window.
@@ -163,9 +166,27 @@ public struct RelayPolicy: Sendable {
     /// How many points above the threshold the account in use is close enough that the accounts which would take over
     /// are read ahead, so the hand-off finds the next one ready.
     public static let preparationMargin: Double = 15
-    public init(threshold: Thresholds = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil, soonerWeekly: Bool = false) {
+    /// Preparation reads the account a hand-off would take plus one fallback, never every account; the hand-off itself
+    /// still reads up to `handOffReads` when a fresh answer changes the order.
+    public static let preparationReads = 2
+    /// Without a measured pace, preparation renews a candidate's reading only once it is this old, as before 0.3:
+    /// an account that idles near its threshold for hours must not have its candidates read every two minutes.
+    public static let idlePreparationAge: TimeInterval = 300
+    /// However far off the next reset, a paused hand-off looks again at least this often, so an account the user
+    /// enables meanwhile is not left waiting for hours.
+    public static let maximumRetryWait: TimeInterval = 900
+    public init(threshold: Thresholds = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil,
+                soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) {
         self.threshold = threshold; self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
-        self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly
+        self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly; self.requiredMargin = requiredMargin
+    }
+    /// Whether a candidate's reading should be renewed now, ahead of the hand-off, so that it is still within
+    /// `confirmLifetime` when the hand-off comes and the hand-off does not have to read it first. With a measured pace
+    /// that is the case once the account in use would reach its threshold within `confirmLifetime`; without one, the
+    /// account in use only has to be within `preparationMargin` points, and the reading `idlePreparationAge` old.
+    public static func preparationRead(age: TimeInterval, secondsToThreshold: TimeInterval?, nearThreshold: Bool) -> Bool {
+        if let seconds = secondsToThreshold, seconds <= confirmLifetime { return age + seconds > confirmLifetime }
+        return nearThreshold && age >= idlePreparationAge
     }
     /// The id to pass as `leftRecently`, or nil once the cooldown has elapsed or the clock is skewed.
     public static func coolingDown(_ account: UUID?, since leftAt: Date?, at now: Date) -> UUID? {
@@ -173,6 +194,34 @@ public struct RelayPolicy: Sendable {
         let age = now.timeIntervalSince(leftAt)
         guard age >= 0, age < departureCooldown else { return nil }
         return account
+    }
+    private var candidateThresholds: Thresholds {
+        Thresholds(fiveHour: threshold.fiveHour + requiredMargin.fiveHour,
+                   sevenDay: threshold.sevenDay + requiredMargin.sevenDay)
+    }
+    /// Something only the user can change keeps the account out: waiting does not help.
+    private func barredForGood(_ candidate: Account) -> Bool {
+        !candidate.enabled || candidate.refreshRejected == true || candidate.usageCapability == .unavailable
+            || candidate.hotSwitchCapability == .unavailable || (candidate.hotSwitchCapability == .unknown && !allowUnverifiedHotSwitch)
+    }
+    /// When a paused hand-off should look again: at the first moment one of `candidates` may qualify. That is the reset
+    /// of a window that keeps it out, the end of its backoff or of the cooldown after leaving it, and `ordinary` from
+    /// now for anything a fresh reading could change (unknown or stale quota, too little margin). Never sooner than five
+    /// seconds, never later than `maximumRetryWait`. A reset is a time to read again, not proof that quota came back.
+    public func retryAt(_ candidates: [Account], at now: Date, ordinary: TimeInterval, backoffUntil: (UUID) -> Date?,
+                        cooldownEnds: Date?) -> Date {
+        var times: [Date] = []
+        for candidate in candidates where !barredForGood(candidate) {
+            if candidate.id == leftRecently, let cooldownEnds, cooldownEnds > now { times.append(cooldownEnds); continue }
+            if let until = backoffUntil(candidate.id), until > now { times.append(until); continue }
+            if let usage = candidate.usage, usage.remainsExhausted(threshold: threshold, at: now) {
+                times.append(nextReset(of: [candidate], at: now).map { $0.addingTimeInterval(5) } ?? now.addingTimeInterval(ordinary))
+                continue
+            }
+            times.append(now.addingTimeInterval(ordinary))
+        }
+        let chosen = times.min() ?? now.addingTimeInterval(ordinary)
+        return min(now.addingTimeInterval(Self.maximumRetryWait), max(now.addingTimeInterval(5), chosen))
     }
     /// What keeps an account from taking over whatever its quota, or nil when nothing does.
     private func barrier(for candidate: Account, at now: Date) -> String? {
@@ -185,7 +234,7 @@ public struct RelayPolicy: Sendable {
         return nil
     }
     /// Why an account cannot take the baton right now, or nil when it can. Unknown quota is a reason, never a pass,
-    /// and so is a reading older than `confirmLifetime`.
+    /// and so is a reading older than `confirmLifetime` or one without the predicted reaction-time margin.
     public func obstacle(for candidate: Account, at now: Date) -> String? {
         if let barrier = barrier(for: candidate, at: now) { return barrier }
         guard let usage = candidate.usage else { return "额度未知" }
@@ -193,6 +242,7 @@ public struct RelayPolicy: Sendable {
         if usage.remainsExhausted(threshold: threshold, at: now) { return "额度不足或不完整" }
         guard usage.isFresh(at: now, lifetime: Self.confirmLifetime) else { return "额度未确认" }
         if !usage.available(threshold: threshold, at: now, lifetime: Self.confirmLifetime) { return "额度不足或不完整" }
+        if !usage.available(threshold: candidateThresholds, at: now, lifetime: Self.confirmLifetime) { return "预测余量不足" }
         // Only an account that would otherwise qualify says it just left. Anyone else keeps their own reason.
         if candidate.id == leftRecently { return "刚刚离开" }
         return nil
@@ -214,13 +264,9 @@ public struct RelayPolicy: Sendable {
             .compactMap { window, limit in usage.lastKnownRemaining(window, at: now).map { $0 - limit } }.min()
         return max(0, left ?? 0)
     }
-    /// The accounts a hand-off from `active` would go to, best first. Hand-offs used to take the first account in relay
-    /// order above the threshold. On 2026-10-22 that meant accounts with 10–14% left: each was used up within a minute,
-    /// and four hand-offs ran in three minutes while five accounts sat almost unused. The emptiest 5-hour window now
-    /// comes first, judged by each account's last reading however old, since an idle account's quota only changes when
-    /// a window resets. Within `roomTier` points the relay order decides. Accounts without a usable reading follow, in
-    /// relay order. Left out are accounts that cannot take over whatever their quota, the one just left, and those whose
-    /// reading leaves a window no further above its threshold than `active` is.
+    /// Last readings set the order, however old they are; confirmation and the predicted margin decide who can actually
+    /// take over. Within `roomTier` points the relay order decides. Unknown accounts follow in relay order so they can
+    /// be checked, while accounts that cannot improve on the active account are left out.
     public func handOffOrder(_ candidates: [Account], leaving active: Account?, at now: Date) -> [Account] {
         let floor = floor(leaving: active, at: now)
         var known: [(tier: Int, position: Int, account: Account)] = [], unknown: [Account] = []
@@ -228,7 +274,8 @@ public struct RelayPolicy: Sendable {
         where candidate.id != active?.id && candidate.id != leftRecently && barrier(for: candidate, at: now) == nil {
             guard let usage = candidate.usage, let five = Self.expected(usage.fiveHour, of: usage, at: now),
                   let week = Self.expected(usage.sevenDay, of: usage, at: now) else { unknown.append(candidate); continue }
-            guard min(five - threshold.fiveHour, week - threshold.sevenDay) > floor + 0.000001 else { continue }
+            guard five - threshold.fiveHour > max(floor, requiredMargin.fiveHour) + 0.000001,
+                  week - threshold.sevenDay > max(floor, requiredMargin.sevenDay) + 0.000001 else { continue }
             known.append((Int((100 - five) / Self.roomTier), position, candidate))
         }
         return known.sorted { ($0.tier, $0.position) < ($1.tier, $1.position) }.map(\.account) + unknown

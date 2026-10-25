@@ -11,7 +11,8 @@ enum StatusLineBridge {
     private static var script: URL { Disk.file("statusline.sh") }
     private static var chain: URL { Disk.file("statusline-chain.sh") }
     private static var previous: URL { Disk.file("statusline-previous.json") }
-    private static var record: URL { Disk.file("live-usage.json") }
+    private static var legacyRecord: URL { Disk.file("live-usage.json") }
+    static var spoolDirectory: URL { Disk.file("live-usage-spool") }
     private static var label: URL { Disk.file("statusline-label.txt") }
     /// A copy of the settings file as it was before Lilt first touched it, kept for good.
     static var backup: URL { Disk.file("claude-settings-before-lilt.json") }
@@ -70,13 +71,13 @@ enum StatusLineBridge {
             if settings.isEmpty, kept?["fileExisted"] as? Bool == false { try? FileManager.default.removeItem(at: settingsFile) }
             else { try writeSettings(settings) }
         }
-        for file in [chain, previous, record, label, script] { try? FileManager.default.removeItem(at: file) }
+        for file in [chain, previous, legacyRecord, label, script] { try? FileManager.default.removeItem(at: file) }
+        try? FileManager.default.removeItem(at: spoolDirectory)
     }
 
-    /// The latest reading a session reported, or nil.
-    static func latest() -> UsageSnapshot? {
-        guard let data = try? Data(contentsOf: record) else { return nil }
-        return UsageParser.parseStatusLine(data)
+    /// Every event the default login's sessions reported since the last call (see `LiveUsageSpool`).
+    static func drain() -> LiveUsageBatch {
+        LiveUsageSpool.drain(spoolDirectory, scope: LiveUsageEvent.defaultScope)
     }
 
     /// What the status line shows when there was none before Lilt's: the account in use.
@@ -85,26 +86,46 @@ enum StatusLineBridge {
     }
 
     private static func writeScript() throws {
-        let text = #"""
+        let condition = #"[ -z "${CLAUDE_CONFIG_DIR-}" ] || [ "${CLAUDE_CONFIG_DIR%/}" = "$HOME/.claude" ]"#
+        try Disk.write(Data(script(root: Disk.root.path, spool: spoolDirectory.path, scope: LiveUsageEvent.defaultScope,
+                                   condition: condition, chain: chain.path, label: label.path).utf8), to: script)
+    }
+
+    /// The status line script for one scope. It keeps only `rate_limits`, writes each report as a file of its own
+    /// (a hidden temporary file renamed into place, so concurrent sessions never overwrite one another), drops the
+    /// oldest beyond `LiveUsageSpool.maximumEvents` and marks that as a gap, then hands the unchanged input to the
+    /// status line that was there before. `condition` limits recording to sessions on this scope's configuration.
+    static func script(root: String, spool: String, scope: String, condition: String, chain: String, label: String) -> String {
+        let limit = LiveUsageSpool.maximumEvents
+        return #"""
         #!/bin/sh
-        # Installed by Lilt. After every response Claude Code gives its status line the session's rate limits; this keeps
-        # only those for Lilt, then runs the status line that was set up before Lilt with the same input, so the terminal
-        # shows what it showed before. Turning off live quota in Lilt puts the previous status line back.
-        dir="$HOME/Library/Application Support/Lilt"
+        # Installed by Lilt. Keeps the quota windows of each report and nothing else of the session.
+        spool=\#(shellQuote(spool))
         input=$(cat)
-        if [ -z "${CLAUDE_CONFIG_DIR-}" ] && [ -d "$dir" ]; then
+        if { \#(condition); } && [ -d \#(shellQuote(root)) ]; then
           limits=$(printf '%s' "$input" | /usr/bin/plutil -extract rate_limits json -o - - 2>/dev/null)
           if [ -n "$limits" ]; then
-            tmp="$dir/.live-usage.$$"
-            (umask 077; printf '{"at":%s,"rate_limits":%s}\n' "$(date +%s)" "$limits" > "$tmp") && mv -f "$tmp" "$dir/live-usage.json"
+            (umask 077; mkdir -p "$spool")
+            id=$(/usr/bin/uuidgen)
+            now=$(/bin/date +%s)
+            tmp="$spool/.$id.tmp"
+            if (umask 077; printf '{"id":"%s","scope":"%s","at":%s,"rate_limits":%s}\n' "$id" \#(shellQuote(scope)) "$now" "$limits" > "$tmp") && /bin/mv -f "$tmp" "$spool/$now-$$-$id.json"; then
+              count=$(/bin/ls -1 "$spool" | /usr/bin/grep -c '\.json$')
+              if [ "$count" -gt \#(limit) ] && /bin/mkdir "$spool/.lock" 2>/dev/null; then
+                /bin/ls -1 "$spool" | /usr/bin/grep '\.json$' | /usr/bin/sort | /usr/bin/head -n "$((count - \#(limit)))" | while IFS= read -r old; do /bin/rm -f "$spool/$old"; done
+                : > "$spool/.gap"
+                /bin/rmdir "$spool/.lock"
+              fi
+            else
+              /bin/rm -f "$tmp"; : > "$spool/.gap" 2>/dev/null
+            fi
           fi
         fi
-        if [ -f "$dir/statusline-chain.sh" ]; then
-          printf '%s' "$input" | /bin/sh "$dir/statusline-chain.sh"
-        elif [ -f "$dir/statusline-label.txt" ]; then
-          cat "$dir/statusline-label.txt"
+        if [ -f \#(shellQuote(chain)) ]; then
+          printf '%s' "$input" | /bin/sh \#(shellQuote(chain))
+        elif [ -f \#(shellQuote(label)) ]; then
+          /bin/cat \#(shellQuote(label))
         fi
-        """#
-        try Disk.write(Data((text + "\n").utf8), to: script)
+        """# + "\n"
     }
 }

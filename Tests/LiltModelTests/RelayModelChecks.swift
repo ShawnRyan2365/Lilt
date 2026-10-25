@@ -93,7 +93,12 @@ import LiltCore
         try fileRuntimeChecks()
         try runtimeChecks()
         try keychainCommandChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, manual retry vs server 429, the signal file for running CLIs, a threshold per window. No live credentials or requests.")
+        try await observationChecks()
+        try await relayOnceChecks()
+        try await projectChecks()
+        try await projectModelChecks()
+        try transferStoreChecks()
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, manual retry vs server 429, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import. No live credentials or requests.")
     }
 }
 
@@ -394,16 +399,21 @@ import LiltCore
     model.busy = true
     await model.refresh(active.id, manually: true)
     precondition(model.status == "正在切换账号，完成后即可刷新")
+    // A read out for another account no longer holds this one up: reads of one account share one answer, and
+    // reads of different accounts only start two seconds apart.
     model.busy = false; model.loading = true
     await model.refresh(active.id, manually: true)
-    precondition(model.status == "正在读取额度，请稍候")
+    precondition(calls == 6 && model.status == "额度已更新", "A read of another account held this one up")
     model.loading = false
 
     failures = [UsageFailure.rateLimited(120)]
     await model.refresh(active.id, manually: true)
-    precondition(calls == 6)
+    precondition(calls == 7)
     await model.refresh(active.id, manually: true)
-    precondition(calls == 6 && model.status.contains("稍后再查"), "A server 429 still blocks a manual retry")
+    precondition(calls == 7 && model.status.contains("稍后再查"), "A server 429 still blocks a manual retry")
+    // Nor can a read for another account get past it.
+    await model.refresh(spare.id, manually: true)
+    precondition(calls == 7, "A server 429 paused one account only")
 }
 
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up

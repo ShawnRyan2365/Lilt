@@ -8,6 +8,19 @@ public final class NoRedirect: NSObject, URLSessionTaskDelegate, @unchecked Send
     public func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }
 
+/// Debug builds started with `LILT_OFFLINE=1` send nothing: every account request fails at once as a network
+/// failure. The end-to-end checks use it so that no fixture token ever reaches an official host. Release builds
+/// ignore it; their checks run in a container without a network instead.
+enum OfflineChecks {
+    static var active: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["LILT_OFFLINE"] == "1"
+        #else
+        false
+        #endif
+    }
+}
+
 public protocol UsageFetching: Sendable {
     func fetch(_ credential: Credential) async throws -> UsageSnapshot
 }
@@ -16,6 +29,7 @@ public struct UsageClient: UsageFetching {
     public func fetch(_ credential: Credential) async throws -> UsageSnapshot {
         try credential.validate()
         if credential.accessExpired { throw UsageFailure.accessExpired }
+        if OfflineChecks.active { throw UsageFailure.network }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20; config.urlCache = nil
         let session = URLSession(configuration: config, delegate: NoRedirect(), delegateQueue: nil)
@@ -55,6 +69,7 @@ public struct TokenRenewer: TokenRenewing {
     public init() {}
     public func renew(_ credential: Credential) async throws -> Credential {
         guard let refresh = OAuthDocument.refreshToken(credential.data) else { throw RenewalFailure.rejected }
+        if OfflineChecks.active { throw RenewalFailure.network }
         var body: [String: Any] = ["grant_type": "refresh_token", "refresh_token": refresh, "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"]
         let scopes = OAuthDocument.scopes(credential.data)
         if !scopes.isEmpty { body["scope"] = scopes.joined(separator: " ") }
@@ -87,7 +102,7 @@ public protocol IdentityFetching: Sendable {
 public struct IdentityClient: IdentityFetching {
     public init() {}
     public func fetch(_ credential: Credential) async -> Data? {
-        guard let token = credential.token, !credential.accessExpired else { return nil }
+        guard let token = credential.token, !credential.accessExpired, !OfflineChecks.active else { return nil }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10; config.urlCache = nil
         let session = URLSession(configuration: config, delegate: NoRedirect(), delegateQueue: nil)

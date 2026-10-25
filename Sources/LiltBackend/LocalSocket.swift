@@ -16,6 +16,12 @@ public struct DaemonRequest: Codable, Sendable {
     public var identity: Data?
     public var enabled: Bool?
     public var amount: Double?
+    public var rootPath: String?
+    public var allowShared: Bool?
+    /// Only for export and import. The socket is the user's own (0600 in a 0700 directory), like a setup-token sent
+    /// with `add`; neither is ever logged or kept.
+    public var passphrase: String?
+    public var archive: Data?
 
     public init(
         action: String,
@@ -24,7 +30,11 @@ public struct DaemonRequest: Codable, Sendable {
         credential: Data? = nil,
         identity: Data? = nil,
         enabled: Bool? = nil,
-        amount: Double? = nil
+        amount: Double? = nil,
+        rootPath: String? = nil,
+        allowShared: Bool? = nil,
+        passphrase: String? = nil,
+        archive: Data? = nil
     ) {
         self.action = action
         self.id = id
@@ -33,6 +43,10 @@ public struct DaemonRequest: Codable, Sendable {
         self.identity = identity
         self.enabled = enabled
         self.amount = amount
+        self.rootPath = rootPath
+        self.allowShared = allowShared
+        self.passphrase = passphrase
+        self.archive = archive
     }
 }
 
@@ -47,6 +61,8 @@ public struct DaemonStatus: Codable, Sendable {
     public var lastEvent: String?
     public var appliedPending: Bool
     public var apiModeDetected: Bool
+    /// At least one session on the default login reported the account switched to. Not every session.
+    public var sessionConfirmed: Bool
 
     public init(
         running: Bool = true,
@@ -58,7 +74,8 @@ public struct DaemonStatus: Codable, Sendable {
         statusLineIssue: String? = nil,
         lastEvent: String? = nil,
         appliedPending: Bool = false,
-        apiModeDetected: Bool = false
+        apiModeDetected: Bool = false,
+        sessionConfirmed: Bool = false
     ) {
         self.running = running
         self.message = message
@@ -70,6 +87,7 @@ public struct DaemonStatus: Codable, Sendable {
         self.lastEvent = lastEvent
         self.appliedPending = appliedPending
         self.apiModeDetected = apiModeDetected
+        self.sessionConfirmed = sessionConfirmed
     }
 }
 
@@ -78,12 +96,24 @@ public struct DaemonResponse: Codable, Sendable {
     public var error: String?
     public var library: Library?
     public var status: DaemonStatus?
+    public var projects: [ProjectBinding]?
+    public var project: ProjectBinding?
+    public var launchPlan: ProjectLaunchPlan?
+    public var archive: Data?
+    public var transfer: TransferSummary?
 
-    public init(ok: Bool, error: String? = nil, library: Library? = nil, status: DaemonStatus? = nil) {
+    public init(ok: Bool, error: String? = nil, library: Library? = nil, status: DaemonStatus? = nil,
+                projects: [ProjectBinding]? = nil, project: ProjectBinding? = nil, launchPlan: ProjectLaunchPlan? = nil,
+                archive: Data? = nil, transfer: TransferSummary? = nil) {
         self.ok = ok
         self.error = error
         self.library = library
         self.status = status
+        self.projects = projects
+        self.project = project
+        self.launchPlan = launchPlan
+        self.archive = archive
+        self.transfer = transfer
     }
 }
 

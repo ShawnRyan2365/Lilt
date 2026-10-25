@@ -27,7 +27,7 @@ struct RootView: View {
 
 #if DEBUG
 enum DebugLaunch {
-    /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PANEL=1 / LILT_SETTINGS=1 (that view inside the window), LILT_PAGE=overview|accounts|scope|diagnostics, LILT_RELAY=1,
+    /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PANEL=1 / LILT_SETTINGS=1 (that view inside the window), LILT_PAGE=overview|accounts|projects|scope|diagnostics, LILT_RELAY=1,
     /// LILT_SIMULATE=1 (demo quota reaches the threshold), LILT_SIMULATE_AFTER=<seconds> (the same, later),
     /// LILT_PENDING=1 (shows the "applied, not yet verified" notice),
     /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>,

@@ -458,8 +458,8 @@ final class RelayTests {
         expectEqual(live.nextReset(of: [both, soon, spare], at: now), now.addingTimeInterval(7200))
         expectEqual(live.nextReset(of: [spare], at: now), nil)
     }
-    /// A hand-off starts ahead of the threshold when the pace of spending would carry the account past it within a
-    /// minute, never more than ten points early, and only on readings of the same window far enough apart.
+    /// A hand-off starts ahead of the threshold when the pace of spending would carry the account past it within the
+    /// reaction time, as early as that pace requires, and only on readings of the same window far enough apart.
     func testPaceStartsTheHandOffAhead() {
         func reading(_ remaining: Double, ago: TimeInterval, resetsIn: TimeInterval = 3600) -> UsageSnapshot {
             UsageSnapshot(fiveHour: UsageWindow(used: 100 - remaining, resetsAt: now.addingTimeInterval(resetsIn)),
@@ -474,9 +474,13 @@ final class RelayTests {
         expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 10)], threshold: 5, at: now, lifetime: 300))
         expectFalse(UsagePace.nearing(latest, after: [reading(40, ago: 60, resetsIn: 3600 - 18000)], threshold: 5, at: now, lifetime: 300))
         expectFalse(UsagePace.nearing(latest, after: [], threshold: 5, at: now, lifetime: 300))
-        // However fast, at most ten points early.
-        expectFalse(UsagePace.nearing(reading(16, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
-        expect(UsagePace.nearing(reading(15, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        // There is no fixed cap: 44 points in the last minute is 44 more in the next, so 16% left is already late.
+        // Until 0.2.5 the hand-off started at most ten points early and came too late for bursts like this.
+        expect(UsagePace.nearing(reading(16, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        expect(UsagePace.projectedMargin(reading(16, ago: 0), after: [reading(60, ago: 60)], at: now, lifetime: 300).fiveHour > 40)
+        // A measured hand-off that took longer widens the margin in proportion.
+        let slow = UsagePace.projectedMargin(latest, after: [reading(12, ago: 60)], at: now, lifetime: 300, reactionTime: 120)
+        expectEqual(slow.fiveHour.rounded(), 8)
         // A point rounded up between two recent readings is no burst.
         expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 590), reading(9, ago: 40)], threshold: 5, at: now, lifetime: 300))
         // A burst after a quiet stretch counts at its own pace: three points in the last 40 seconds, whatever the
@@ -618,7 +622,17 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try suite.testUpdateFeedOffersOnlyAMatchingNewerRelease()
         suite.testUpdateInstallBoundaries()
         try storageChecks()
-        print("PASS: 29 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries")
+        let concurrency = ConcurrencyChecks()
+        concurrency.testBurstChannel()
+        concurrency.testCandidateMarginCoversPaceAndSwitchCost()
+        concurrency.testPreparationTiming()
+        concurrency.testRetryAtTheEarliestApplicableTime()
+        try concurrency.testSpoolKeepsEveryEventAndTheHighWaterMark()
+        concurrency.testFoldRules()
+        try concurrency.testProjectRules()
+        try concurrency.testImportPlanAndTransaction()
+        try credentialTransferChecks()
+        print("PASS: 38 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive")
     }
 }
 

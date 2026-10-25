@@ -344,11 +344,13 @@ struct AccountRow: View {
     var onRename: () -> Void
     var onDelete: () -> Void
     private var active: Bool { account.id == model.displayedActiveID }
+    private var projectCount: Int { model.projectCatalog.projects.filter { $0.accountID == account.id }.count }
     // A quota read in the background does not block a switch: `apply` waits for it to finish.
     private var canSwitch: Bool { !active && account.enabled && !model.busy }
     private var capabilities: String {
         let usage = account.usageCapability == .verified ? "可读取额度" : account.usageCapability == .unavailable ? "额度权限不足" : "额度待验证"
-        return [account.kind.title, usage, model.demo ? "演示能力" : "热切换待验证"].joined(separator: " · ")
+        let scope = projectCount > 0 ? "固定 \(projectCount) 个项目" : model.demo ? "演示能力" : "热切换待验证"
+        return [account.kind.title, usage, scope].joined(separator: " · ")
     }
     var body: some View {
         let summary = QuotaSummary(snapshot: account.usage, thresholds: model.thresholds, now: max(model.clock, .now))
@@ -361,6 +363,7 @@ struct AccountRow: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(account.label).font(Typo.label).lineLimit(1)
+                        if projectCount > 0 { Pill(text: "项目专用") }
                         if !account.enabled { Pill(text: "已停用") }
                         // An old reading stays on screen, receded, and says how old it is.
                         if summary.stale, let age = summary.state?.text { Pill(text: age) }
@@ -381,6 +384,8 @@ struct AccountRow: View {
                     Pill(text: "使用中", style: .ink)
                         .matchedGeometryEffect(id: "in-use", in: selection)
                         .accessibilityHidden(true)
+                } else if projectCount > 0 {
+                    Pill(text: "项目专用").help("在项目页更换或解绑后，才能用于默认登录")
                 } else {
                     Button("切换") { Task { await model.apply(account.id) } }
                         .buttonStyle(.lilt(.secondary, size: .small)).disabled(!canSwitch)
@@ -392,12 +397,12 @@ struct AccountRow: View {
             Menu {
                 Button("刷新额度") { Task { await model.refresh(account.id, manually: true) } }
                 Button("修改备注", action: onRename)
-                Button(account.enabled ? "停用" : "启用") { model.update(account.id) { $0.enabled.toggle() } }
+                Button(account.enabled ? "停用" : "启用") { model.setEnabled(!account.enabled, id: account.id) }
                 Button("上移") { model.move(account.id, by: -1) }.disabled(model.autoSort || index == 0)
                 Button("下移") { model.move(account.id, by: 1) }.disabled(model.autoSort || index == model.accounts.count - 1)
                 Divider()
                 Button("重新授权 / 替换 Token") { model.requestAdd(replacing: account.id) }.disabled(!model.canAdd)
-                Button(active ? "删除（需先切换到其他账号）" : "删除…", role: .destructive, action: onDelete).disabled(active)
+                Button(active ? "删除（需先切换到其他账号）" : projectCount > 0 ? "删除（需先解绑项目）" : "删除…", role: .destructive, action: onDelete).disabled(active || projectCount > 0)
             } label: {
                 Image(systemName: "ellipsis").font(.system(size: 13, weight: .medium)).foregroundStyle(Tokens.ink)
                     .frame(width: AccountColumns.menu, height: 30).contentShape(Circle())

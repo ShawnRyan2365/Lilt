@@ -50,6 +50,12 @@ struct Notice: Equatable {
 @MainActor @Observable
 final class AppModel {
     var library = Library()
+    /// Projects with an account of their own (see `ProjectBinding`). Kept in `projects.json`, apart from the accounts.
+    private(set) var projectCatalog = ProjectCatalog()
+    /// Projects with an operation under way: bind, rebind, unbind or launch. Their buttons wait.
+    private(set) var projectBusy: Set<UUID> = []
+    /// `projects.json` could not be read or trusted. Projects are left as they are on disk and none is launched.
+    private(set) var projectsAvailable = true
     var demo = false
     var loading = false
     var busy = false
@@ -99,16 +105,34 @@ final class AppModel {
     /// The usage endpoint limits everything sent from this Mac, so a 429 for one account pauses them all (ORCA does
     /// the same). Readings already on screen stay there meanwhile.
     private(set) var usagePausedUntil: Date?
-    private var lastUsageRequest = Date.distantPast
+    /// Requests for one account share one answer (`refreshes`); requests of any account start two seconds apart.
+    private let spacing = RequestSpacing()
+    private var refreshes: [UUID: Task<Void, Never>] = [:]
+    /// Status line events went missing for these accounts; their next pass asks the endpoint whatever the cadence.
+    private var forcePoll: Set<UUID> = []
     /// Live quota from Claude Code's status line (see `StatusLineBridge`).
     var liveUsageEnabled: Bool { library.preferences.liveUsage != false }
     private(set) var statusLineIssue: String?
+    private var reportedLiveGap = false
     private var lastSwitchAt = Date.distantPast
     private var lastFailureLogged: (text: String, at: Date)?
-    private var liveStamp: Date?
     private var lastStatusLineCheck = Date.distantPast
     private var lastStatusLineRepair = Date.distantPast
     private var latch = RelayLatch()
+    /// One automatic hand-off at a time, from trigger through the reads to the write. A newer reading that arrives
+    /// meanwhile asks for another pass (`relayAgain`) instead of starting a second operation. Turning relay off, a
+    /// switch by hand or another account taking over bumps `relayGeneration`, which ends the running one.
+    private var relayRunning = false
+    private var relayAgain = false
+    private var relayGeneration = 0
+    private var noCandidateFailures = 0
+    /// How long the last hand-off took from trigger to written login (see `UsagePace.reactionTime`).
+    private var relayReactionTime = UsagePace.lead
+    /// What the last switch was seen to cost (see `UsagePace.switchAllowance`), and the reading it is measured from.
+    private var switchAllowance: Thresholds = 0
+    private var pendingJump: (account: UUID, confirmed: UsageSnapshot)?
+    /// A session reported quota of the account just switched to. That is one session; others may not have followed.
+    private(set) var sessionConfirmed = false
     /// Who automatic relay just left, and when. `RelayPolicy.coolingDown` decides whether that still blocks them.
     private var departedID: UUID?
     private var departedAt: Date?
@@ -133,14 +157,28 @@ final class AppModel {
     private var unsaved: Library?
     private var saving = false
     private var monitor: Task<Void, Never>?
+    private var liveMonitor: Task<Void, Never>?
     private var usageFetch: (Credential) async throws -> UsageSnapshot = { try await UsageClient().fetch($0) }
+    /// Where a project's login goes. Regression checks replace it with in-memory credential stores.
+    private var projectRuntime: (ProjectBinding) -> RuntimeScope = { RuntimeScope(project: $0) }
+    private var requestGap: TimeInterval = 2
+    /// The profile endpoint, asked only when a scope's own records cannot say whose login it holds. Regression checks
+    /// replace it so that no fixture token ever leaves the machine.
+    private var identityFetch: (Credential) async -> Data? = { await IdentityClient().fetch($0) }
     let updater = Updater()
-    enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", scope = "接入", diagnostics = "诊断"
-        var symbol: String { switch self { case .overview: "square.grid.2x2"; case .accounts: "person.2"; case .scope: "terminal"; case .diagnostics: "waveform.path.ecg" } }
+    enum Page: String, CaseIterable { case overview = "概览", accounts = "账号", projects = "项目", scope = "接入", diagnostics = "诊断"
+        var symbol: String {
+            switch self {
+            case .overview: "square.grid.2x2"; case .accounts: "person.2"; case .projects: "folder"; case .scope: "terminal"; case .diagnostics: "waveform.path.ecg"
+            }
+        }
     }
     init() {
         retryClock = { .now }
+        // An account import a crash interrupted is finished or undone before the library is read.
+        do { try AccountVaultTransfer.recover() } catch { message = (error as? ImportFailure)?.message ?? "上次导入的现场无法自动收尾，请检查后再导入。" }
         do { library = try Disk.load() } catch { storageAvailable = false; message = "账号资料无法读取，已停止写入。请先检查本地数据；不会以空列表覆盖。" }
+        loadProjects()
         // Being told to wait, or a dropped connection, is not a lasting problem with an account; earlier versions kept it as one.
         let passing: Set<String> = ["额度接口限流，已按服务端要求延后重试。", UsageFailure.rateLimited(0).message, UsageFailure.network.message]
         for index in library.accounts.indices where library.accounts[index].issue.map(passing.contains) == true { library.accounts[index].issue = nil }
@@ -155,16 +193,19 @@ final class AppModel {
         Task { version = await CLILogin.version() }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
-                // A pass every 15 seconds, or within 3 of a session reporting quota while the account in use is close
-                // to the threshold: a busy session can spend a few points in 15 seconds.
-                for _ in 0..<5 {
-                    try? await Task.sleep(for: .seconds(3))
-                    guard let self else { return }
-                    if await self.liveReadingWaiting() { break }
-                }
+                try? await Task.sleep(for: .seconds(15))
                 guard let self else { return }
                 self.updater.checkIfDue(enabled: self.autoUpdateCheck)
                 await self.tick()
+            }
+        }
+        // Status line events are taken in every second, on their own: a usage request, a switch or a stalled
+        // keychain in the 15-second pass never delays them.
+        liveMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.ingestLiveUsage()
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
@@ -177,11 +218,15 @@ final class AppModel {
     }
     /// A live model whose scope is an in-memory fixture, for regression checks of how the scope is watched. Lilt's own
     /// files still go under `Disk.root`, so the caller must point the home directory at a fixture first.
-    init(fixture library: Library, runtime: RuntimeScope, usageFetch: ((Credential) async throws -> UsageSnapshot)? = nil) {
+    init(fixture library: Library, runtime: RuntimeScope, usageFetch: ((Credential) async throws -> UsageSnapshot)? = nil,
+         projects: ProjectCatalog = ProjectCatalog(), projectRuntime: ((ProjectBinding) -> RuntimeScope)? = nil) {
         retryClock = { .now }
         self.library = library
         fixtureRuntime = runtime
+        projectCatalog = projects
         if let usageFetch { self.usageFetch = usageFetch }
+        if let projectRuntime { self.projectRuntime = projectRuntime }
+        identityFetch = { _ in nil }
         restoreRelayPreference()
     }
     private func restoreRelayPreference() {
@@ -296,12 +341,15 @@ final class AppModel {
         guard let active else { return "先选一个账号" }
         // Without a reading for the account in use there is nothing to tell Lilt when to hand off.
         if active.usageCapability == .unavailable { return "当前账号读不到额度" }
-        if !accounts.contains(where: { $0.id != active.id && $0.enabled && $0.usageCapability != .unavailable }) { return "还需要一个能读额度的备用账号" }
+        // Accounts fixed to a project never take over the default login, so they do not count as spares.
+        if !accounts.contains(where: { $0.id != active.id && !projectCatalog.reservedAccountIDs.contains($0.id) && $0.enabled && $0.usageCapability != .unavailable }) { return "还需要一个能读额度的备用账号（项目专用账号不算）" }
         return nil
     }
     /// Turning it on is the user's standing consent for Lilt to write the next account's credentials into the scope at the threshold.
     func setAutoRelay(_ on: Bool) {
         if on, let relayBlocker { status = relayBlocker; return }
+        relayGeneration += 1
+        noCandidateFailures = 0
         autoRelay = on
         relayPause = nil; relayRetryAt = nil
         if on { latch = RelayLatch() }
@@ -310,6 +358,7 @@ final class AppModel {
     }
     /// Relay stopped itself. The saved switch goes off too, so a relaunch does not quietly resume it.
     func stopRelay(because reason: String) {
+        relayGeneration += 1
         autoRelay = false
         relayRetryAt = nil
         relayPause = reason; status = "自动接力已停止：\(reason)"; lastEvent = reason
@@ -383,6 +432,14 @@ final class AppModel {
         guard let index = library.accounts.firstIndex(where: { $0.id == id }) else { return }
         change(&library.accounts[index]); save()
     }
+    /// Turning an account off says which projects can no longer start; turning one on lets a paused hand-off look again
+    /// at once rather than at its retry time.
+    func setEnabled(_ enabled: Bool, id: UUID) {
+        update(id) { $0.enabled = enabled }
+        if enabled { relayRetryAt = nil; return }
+        let bound = projectCatalog.projects(using: id)
+        if !bound.isEmpty { message = "已停用。固定给它的 \(bound.count) 个项目在重新启用或换绑前无法启动。" }
+    }
     /// Manual moves only apply to the user's own order; while sorting is on the list is not theirs to arrange.
     func move(_ id: UUID, by offset: Int) {
         guard !busy, !autoSort, let index = library.accounts.firstIndex(where: { $0.id == id }) else { return }
@@ -398,6 +455,10 @@ final class AppModel {
     func remove(_ id: UUID) {
         guard !busy else { return }
         guard library.activeID != id else { message = "此账号正在使用。请先切换到另一个账号，再删除本地记录。"; return }
+        let bound = projectCatalog.projects(using: id)
+        guard bound.isEmpty else {
+            message = "这个账号固定给了 \(bound.count) 个项目（\(bound.map(\.name).joined(separator: "、"))）。先在项目页换绑或解绑，再删除。"; return
+        }
         do {
             if !demo { try AccountVault.delete(account: id.uuidString) }
             if !demo { try? AccountVault.delete(account: Keychain.identityAccount(id)) }
@@ -418,7 +479,14 @@ final class AppModel {
     /// A new credential for the account in use belongs in the scope too; otherwise Lilt and the CLI would hold
     /// two different logins under one name without anyone being told.
     private func syncScope(afterReplacing id: UUID?) async {
-        guard let id, id == library.activeID, !demo, library.preferences.scopeEnabled else { return }
+        guard let id, !demo else { return }
+        // A new login for an account fixed to projects goes into their scopes too, or they would keep the old one.
+        if let account = accounts.first(where: { $0.id == id }) {
+            for project in projectCatalog.projects(using: id) where project.phase != .preparing {
+                do { try await syncProject(project, target: account, reauthorized: true) } catch { failProject(project.id, error) }
+            }
+        }
+        guard id == library.activeID, library.preferences.scopeEnabled else { return }
         // Whatever the scope held for this account is superseded by what the user just saved.
         let runtime = self.runtime
         await exclusively { await IOQueue.perform { if (try? runtime.check()) == nil { try? runtime.rebaseline() } } }
@@ -509,7 +577,9 @@ final class AppModel {
         let renewal: Task<Credential, Error>
         if let running = renewals[id] { renewal = running } else {
             let stored = try await credential(for: id)
-            guard !demo, id != library.activeID, stored.refreshable, stored.expires(within: RelayPolicy.renewalLead) else { return stored }
+            // An account in a project's scope is renewed by that project's CLI, like the one in the default login.
+            guard !demo, id != library.activeID, !projectCatalog.reservedAccountIDs.contains(id), stored.refreshable,
+                  stored.expires(within: RelayPolicy.renewalLead) else { return stored }
             if let running = renewals[id] { renewal = running } else {
                 renewal = Task {
                     let fresh = try await TokenRenewer().renew(stored)
@@ -549,6 +619,11 @@ final class AppModel {
             scopeRetryAt = .now.addingTimeInterval(delay)
         }
         return settled
+    }
+    /// Checks the default login now, whatever retry wait a failed read left, for a caller that must know it is in order.
+    func confirmScope() async -> Bool {
+        scopeRetryAt = .distantPast
+        return await reconcileScope() && !dualConflict && scopeIssue == nil
     }
     /// `reconcileScope` for a caller already running exclusively.
     private func reconcileScopeHeld() async -> Bool {
@@ -642,7 +717,7 @@ final class AppModel {
                                              runtimeIdentity: .init(oauthAccount: theirs))
         if verdict == .unverifiable || verdict == .foreign, mine.account != nil, found.refreshable {
             // The config file can be stale; the server's answer for this very token cannot.
-            guard let asked = await IdentityClient().fetch(found) else { return nil }
+            guard let asked = await identityFetch(found) else { return nil }
             verdict = OAuthDocument.readBack(stored: stored, runtime: found.data, storedIdentity: mine, runtimeIdentity: .init(oauthAccount: asked))
         }
         guard verdict == .adopt || verdict == .unchanged else { return verdict }
@@ -677,20 +752,32 @@ final class AppModel {
             if manually { status = "正在切换账号，完成后即可刷新" }
             return
         }
-        if loading {
-            if manually { status = "正在读取额度，请稍候" }
-            return
+        // A request already out for this account answers this one too. A manual refresh that joined an automatic one
+        // held back by the ordinary backoff asks once more; nothing asks past a 429.
+        if let running = refreshes[id] {
+            await running.value
+            if refreshes[id] == running { refreshes[id] = nil; loading = !refreshes.isEmpty }
+            guard manually, let next = backoffs[id]?.nextAttempt, next > .now, refreshes[id] == nil else { return }
         }
         if let until = usagePausedUntil, until > .now { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续"; return }
         if !manually, let next = backoffs[id]?.nextAttempt, next > .now {
             status = "接口退避中，\(Self.wait(until: next))后可重试"; return
         }
-        loading = true
-        defer { loading = false }
-        // Requests stay a couple of seconds apart, even when several accounts are due at once.
-        let gap = Date.now.timeIntervalSince(lastUsageRequest)
-        if gap < 2 { try? await Task.sleep(for: .seconds(2 - gap)) }
-        lastUsageRequest = .now
+        let task = Task { await self.performRefresh(id) }
+        refreshes[id] = task; loading = true
+        await task.value
+        // Every waiter reaches this cleanup; only the task still registered may remove itself.
+        if refreshes[id] == task { refreshes[id] = nil; loading = !refreshes.isEmpty }
+    }
+
+    private func performRefresh(_ id: UUID) async {
+        await spacing.reserve(gap: requestGap)
+        // While this request waited for its slot, another may have been told to wait.
+        if let until = usagePausedUntil, until > .now { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续"; return }
+        // A project's CLI may have renewed this account's login; the stored copy could be expired or spent.
+        if let project = projectCatalog.projects.first(where: { $0.accountID == id && $0.phase == .ready }), !projectBusy.contains(project.id) {
+            try? await syncProject(project, target: nil)
+        }
         var asked: Credential?
         do {
             let credential = try await renewedCredential(for: id)
@@ -703,8 +790,8 @@ final class AppModel {
             if failures[id] != nil { failures[id] = nil }
             if status != "额度已更新" { status = "额度已更新" }
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
-            if credential.refreshable, !AccountVault.hasFile(account: Keychain.identityAccount(id)),
-               let record = await IdentityClient().fetch(credential), await isCurrent(credential, for: id) {
+            let identityMissing = await IOQueue.perform { !AccountVault.hasFile(account: Keychain.identityAccount(id)) }
+            if credential.refreshable && identityMissing, let record = await IdentityClient().fetch(credential), await isCurrent(credential, for: id) {
                 _ = try? await IOQueue.run { try AccountVault.write(record, account: Keychain.identityAccount(id)) }
             }
         } catch let failure as ScopeUnreadable {
@@ -745,7 +832,16 @@ final class AppModel {
         // the scope (`exclusively`), which is all the waiting was for.
         guard !busy, storageAvailable, let target = accounts.first(where: { $0.id == id }), target.enabled else { return false }
         if automatically, apiModeDetected || keepsAPIMode { return false }
+        // The default login does not take an account fixed to a project, by hand or by relay. Re-applying the account
+        // already in it (after a new login, say) is not a switch and stays allowed.
+        if projectCatalog.reservedAccountIDs.contains(id), id != library.activeID {
+            if !automatically { message = "“\(target.label)”已固定给项目，默认登录不能使用它。先在项目页换绑或解绑。"; selectedPage = .projects }
+            return false
+        }
         if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先接管 Claude Code 默认登录。"; return false }
+        // A manual choice invalidates any relay operation still confirming candidates. A scope write already in progress
+        // is never interrupted; its transaction still settles by the usual rules.
+        if !automatically { relayGeneration += 1 }
         busy = true
         defer { busy = false }
         if !automatically, !demo { status = "正在切换到“\(target.label)”…" }
@@ -775,7 +871,8 @@ final class AppModel {
                 }
                 guard wrote else { return false }
             }
-            library.activeID = id; appliedPending = !demo; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
+            library.activeID = id; appliedPending = !demo; sessionConfirmed = false; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
+            noCandidateFailures = 0
             apiModeDetected = false; library.preferences.keepAPIMode = nil
             library.preferences.autoRelayStopReason = nil; save()
             if !demo {
@@ -836,7 +933,7 @@ final class AppModel {
     }
     /// The user's own check in the CLI. Lilt records it and does not present it as independent verification.
     func confirmApplied() {
-        appliedPending = false
+        appliedPending = false; sessionConfirmed = false
     }
     /// Take over the official keychain login. A file-only fallback is imported and normalized to the keychain signal.
     func takeOverDefaultLogin() async {
@@ -972,31 +1069,71 @@ final class AppModel {
         lastStatusLineRepair = .now
         connectStatusLine()
     }
-    /// The latest reading a Claude Code session handed its status line, if it is about the account in use.
-    private func ingestLiveUsage() async {
-        guard !demo, managesDefaultLogin, liveUsageEnabled, !dualConflict, scopeIssue == nil,
-              let live = await IOQueue.perform({ StatusLineBridge.latest() }) else { return }
-        if liveUsageSampledAt != live.sampledAt { liveUsageSampledAt = live.sampledAt }
-        guard let active, live.sampledAt != liveStamp else { return }
-        liveStamp = live.sampledAt
-        let now = Date.now
-        // A session that has not picked the new login up yet still reports the previous account; its readings are
-        // older than the switch, or its windows reset at other times than this account's.
-        guard live.sampledAt > lastSwitchAt, now.timeIntervalSince(live.sampledAt) < 600,
-              let known = active.usage, live.sampledAt > known.sampledAt, live.sharesWindows(with: known, at: now) else { return }
-        // An idle session reports what it saw at its own last request; a lower figure than Lilt has is older, not news.
-        let reading = live.keepingHigher(than: known)
-        update(active.id) { $0.usage = reading; $0.usageCapability = .verified; $0.issue = nil }
-        if failures[active.id] != nil { failures[active.id] = nil }
-        notePace(reading, for: active.id)
-        // A session reporting this account's quota after the switch is using the new login, so the note that Lilt cannot
-        // see whether sessions followed has nothing left to say. Sessions still on the previous account are not counted.
-        if appliedPending { appliedPending = false }
+    private static let liveGapText = "部分状态栏额度事件丢失或无法解析；缺失部分按未知处理，已改为主动查询。"
+    /// Takes in every status line event since the last call, for the default login and each project, beside the I/O
+    /// queue: a keychain call, a usage request or a switch never holds it up. A login proven to be someone else's
+    /// keeps readings off the default login's account; one that merely did not read does not.
+    func ingestLiveUsage() async {
+        guard !demo, storageAvailable else { return }
+        let watchDefault = managesDefaultLogin && liveUsageEnabled
+        let projects = projectCatalog.projects.filter { $0.phase == .ready }
+        let defaultSpool = StatusLineBridge.spoolDirectory
+        let spools = projects.map { ($0.id, ProjectStatusLineBridge.spool($0), $0.eventScope) }
+        let (batch, projectBatches) = await Task.detached(priority: .userInitiated) { () -> (LiveUsageBatch?, [UUID: LiveUsageBatch]) in
+            let batch = watchDefault ? LiveUsageSpool.drain(defaultSpool, scope: LiveUsageEvent.defaultScope) : nil
+            var each: [UUID: LiveUsageBatch] = [:]
+            for (id, spool, scope) in spools { each[id] = LiveUsageSpool.drain(spool, scope: scope) }
+            return (batch, each)
+        }.value
+        var accepted = false
+        if let batch {
+            if batch.hasGaps, let active { forcePoll.insert(active.id) }
+            if batch.hasGaps {
+                if statusLineIssue == nil { statusLineIssue = Self.liveGapText }
+                logFailure("live-gap", nil)
+            }
+            else if statusLineIssue == Self.liveGapText { statusLineIssue = nil }
+            if let latest = batch.events.last?.snapshot.sampledAt, liveUsageSampledAt.map({ latest > $0 }) ?? true { liveUsageSampledAt = latest }
+            if !dualConflict, scopeIssue == nil, !apiModeDetected, let current = active {
+                let readings = LiveUsageFold.readings(batch.events, scope: LiveUsageEvent.defaultScope, known: current.usage, since: lastSwitchAt, at: .now)
+                if let last = readings.last {
+                    update(current.id) { $0.usage = last; $0.usageCapability = .verified; $0.issue = nil }
+                    if failures[current.id] != nil { failures[current.id] = nil }
+                    for reading in readings { notePace(reading, for: current.id) }
+                    // One session reported the account switched to. That proves one session, not all of them: the note
+                    // stays until the user dismisses it, and says only this much.
+                    if appliedPending, !sessionConfirmed { sessionConfirmed = true }
+                    accepted = true
+                }
+            }
+        }
+        var projectsChanged = false
+        for project in projects {
+            guard let batch = projectBatches[project.id] else { continue }
+            if batch.hasGaps { forcePoll.insert(project.accountID) }
+            guard let account = library.accounts.first(where: { $0.id == project.accountID }) else { continue }
+            let readings = LiveUsageFold.readings(batch.events, scope: project.eventScope, known: account.usage, since: project.updatedAt, at: .now)
+            guard let last = readings.last else { continue }
+            update(account.id) { $0.usage = last; $0.usageCapability = .verified; $0.issue = nil }
+            if project.appliedPending, let index = projectCatalog.projects.firstIndex(where: { $0.id == project.id }) {
+                projectCatalog.projects[index].appliedPending = false; projectsChanged = true
+            }
+        }
+        if projectsChanged { saveProjects() }
+        if accepted {
+            Task { await self.relay() }
+            Task { await self.prepareHandOff() }
+        }
     }
     private func notePace(_ reading: UsageSnapshot, for id: UUID) {
         if paceAccount != id { paceAccount = id; paceReadings = [] }
         paceReadings.removeAll { $0.sampledAt >= reading.sampledAt || reading.sampledAt.timeIntervalSince($0.sampledAt) > UsagePace.span }
         paceReadings.append(reading)
+        // The first reading after taking over says what the switch cost; it is kept as margin, not as pace.
+        if let jump = pendingJump, jump.account == id, reading.sampledAt > lastSwitchAt {
+            switchAllowance = UsagePace.switchAllowance(confirmed: jump.confirmed, first: reading)
+            pendingJump = nil
+        }
     }
     /// Stop managing the default login. It keeps whatever account is in it; nothing is logged out.
     func releaseDefaultLogin() {
@@ -1050,85 +1187,100 @@ final class AppModel {
         if autoRelay { await relay() } else { status = "演示额度已到阈值，开启自动接力可查看结果" }
     }
     func relay() async {
-        guard autoRelay, !busy, !loading, let active, let snapshot = active.usage else { return }
-        guard storageAvailable, library.preferences.scopeEnabled || demo, !dualConflict, scopeIssue == nil,
+        guard !relayRunning else { relayAgain = true; return }
+        relayRunning = true
+        defer { relayRunning = false }
+        repeat { relayAgain = false; await relayOnce() } while relayAgain
+    }
+    private func relayOnce() async {
+        guard autoRelay, !busy, let active, let snapshot = active.usage else { return }
+        guard storageAvailable, library.preferences.scopeEnabled || demo, !dualConflict, scopeIssue == nil, scopeUnreadable == nil,
               !apiModeDetected, !keepsAPIMode else { return }
-        // A status-line reading is already the session's own report, and the endpoint is not asked again
-        // for five minutes. The hand-off has to be allowed to start from that reading for the whole five
-        // minutes. An endpoint reading is only acted on while it is still the just-queried minute.
-        let lifetime: TimeInterval = (!demo && snapshot.source == UsageParser.statusLineSource) ? 300 : 60
-        let triggered = snapshot.exhausted(threshold: thresholds, at: .now, lifetime: lifetime)
+        let generation = relayGeneration, started = ContinuousClock.now
+        let triggered = snapshot.exhausted(threshold: thresholds, at: .now, lifetime: lifetime(of: snapshot))
         // At the pace the account is being spent it would pass the threshold before the next readings and the hand-off
         // are through, and a session that runs into the limit stops mid-task. Starting now keeps it running.
         let ahead = !demo && !triggered && paceAccount == active.id
-            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime)
+            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: snapshot), reactionTime: relayReactionTime)
         let due = triggered || ahead
         // The weekly preference may move before the threshold, but only off a fresh reading of the account in use.
         // Once a hand-off is due that preference stays out of the decision.
         let early = library.preferences.soonerWeekly == true && !due && snapshot.isFresh(at: .now)
         guard due || early else {
-            if snapshot.available(threshold: thresholds, at: .now), relayPause != nil || relayRetryAt != nil { relayPause = nil; relayRetryAt = nil }
+            if snapshot.available(threshold: thresholds, at: .now), relayPause != nil || relayRetryAt != nil {
+                relayPause = nil; relayRetryAt = nil; noCandidateFailures = 0
+            }
             return
         }
         // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
         // give up on relaying.
         if !demo, let until = usagePausedUntil, until > .now {
-            if triggered { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
+            if due { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
             return
         }
         if let relayRetryAt, relayRetryAt > retryClock() { return }
-        let policy = relayPolicy(soonerWeekly: early)
+        let policy = relayPolicy(soonerWeekly: early, requiredMargin: early || demo ? 0 : candidateMargin(active))
         if !demo {
             if due {
-                // The baton goes to the emptiest account, and that account is read right before unless it was read in
-                // the last two minutes (`RelayPolicy.confirmLifetime`). When the reading shows less room than Lilt knew
-                // of, the order changes and the account now in front is read instead, up to `handOffReads` of them.
-                // An account whose read fails is passed over for this hand-off.
+                // The baton goes to the emptiest account, read right before unless read in the last two minutes
+                // (`RelayPolicy.confirmLifetime`). When a reading shows less room than Lilt knew of, the order changes and
+                // the account now in front is read instead, up to `handOffReads`. New readings of the account in use keep
+                // arriving meanwhile; only another account taking over or a user action ends this run.
                 var asked = Set<UUID>()
-                while asked.count < RelayPolicy.handOffReads,
+                while asked.count < RelayPolicy.handOffReads, relayOperationValid(generation, active: active.id),
                       let next = policy.nextRead(relayCandidates(policy, besides: active.id), leaving: self.active, asked: asked, readable: readable, at: .now) {
                     asked.insert(next.id)
                     await refresh(next.id)
                     if let until = usagePausedUntil, until > .now { break }
                 }
             } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > .now {
-                // Only a stored weekly reset that is already earlier can justify a read. Unknown resets stay out,
-                // and a recent check is not repeated on the 15-second monitor.
-                for candidate in relayCandidates(policy, besides: active.id) {
+                // Only a stored weekly reset that is already earlier can justify a read, and only a couple of them.
+                var reads = 0
+                for candidate in relayCandidates(policy, besides: active.id) where reads < RelayPolicy.preparationReads {
                     guard let reset = candidate.usage?.sevenDay?.resetsAt, reset > .now, reset < activeReset else { continue }
                     if policy.obstacle(for: candidate, at: .now) == nil { continue }
-                    // Five minutes matches the ordinary relay watch, so opting in does not poll on every monitor tick.
-                    if Date.now.timeIntervalSince(candidate.lastChecked ?? .distantPast) < 300 { continue }
-                    await refresh(candidate.id)
+                    if Date.now.timeIntervalSince(candidate.lastChecked ?? .distantPast) < RelayPolicy.confirmLifetime { continue }
+                    reads += 1; await refresh(candidate.id)
                 }
             }
-            // The readings above took time; the user may have switched or turned relay off meanwhile.
-            // A newer reading of the same account is a different event and is left for the next pass.
-            guard autoRelay, self.active?.id == active.id, self.active?.usage?.sampledAt == snapshot.sampledAt else { return }
+            guard relayOperationValid(generation, active: active.id) else { return }
             // A candidate query can start a global backoff after the check above.
             if let until = usagePausedUntil, until > .now {
-                if triggered { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
+                if due { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
                 return
             }
         }
-        switch policy.decide(active: self.active, candidates: accounts, at: .now, holdActiveReading: !demo && triggered, ahead: ahead) {
+        // Decided on the newest reading of the account in use: readings that arrived during the reads are taken into
+        // account, rather than making the hand-off give up and start over each time one comes in.
+        guard let current = self.active, let latest = current.usage else { return }
+        let aheadNow = !demo && !triggered && paceAccount == current.id
+            && UsagePace.nearing(latest, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: latest), reactionTime: relayReactionTime)
+        switch policy.decide(active: current, candidates: relayCandidates(policy, besides: current.id), at: .now,
+                             holdActiveReading: !demo && triggered, ahead: aheadNow) {
         case .select(let id):
-            // Claim only once a candidate is actually chosen. Claiming before the other accounts were
-            // read used up the event whenever that reading took longer than the freshness window:
-            // the decision then came back as "wait" and this exact sample could never trigger again.
-            guard latch.claim(account: active.id, snapshot: snapshot) else { return }
+            // Claim only once a candidate is actually chosen. A failed operation that never touched the scope gives it back.
+            guard latch.claim(account: current.id, snapshot: latest) else { return }
+            noCandidateFailures = 0
             let name = accounts.first { $0.id == id }?.label ?? ""
-            if await apply(id, automatically: true) {
-                departedID = active.id; departedAt = .now
-                if !demo { lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)" }
-            } else if autoRelay, demo || !runtime.transactionPending {
-                // The hand-off never started, so this reading may try again on the next pass rather than wait for a new one.
-                latch.release(account: active.id, snapshot: snapshot)
+            let confirmed = accounts.first { $0.id == id }?.usage
+            let confirming = (ContinuousClock.now - started).seconds, writing = ContinuousClock.now
+            let applied = await apply(id, automatically: true)
+            if applied {
+                departedID = current.id; departedAt = .now
+                if !demo {
+                    relayReactionTime = UsagePace.reactionTime(measured: (ContinuousClock.now - started).seconds)
+                    SwitchLog.record("auto-timing", detail: relayTiming(paced: !triggered, readingAge: Date.now.timeIntervalSince(latest.sampledAt),
+                                                                        confirm: confirming, write: (ContinuousClock.now - writing).seconds))
+                    pendingJump = confirmed.map { (id, $0) }
+                    lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)"
+                }
+            } else if autoRelay, generation == relayGeneration, demo || !runtime.transactionPending {
+                latch.release(account: current.id, snapshot: latest)
             }
         case .pause(let reason):
-            // An early look that finds nobody must not stop relay: the account in use still has room.
-            guard triggered else { break }
-            let others = accounts.filter { $0.id != active.id }
+            guard due else { break }
+            noCandidateFailures += 1
+            let others = accounts.filter { $0.id != current.id && !projectCatalog.reservedAccountIDs.contains($0.id) }
             let blocked = others.compactMap { account in policy.obstacle(for: account, at: .now).map { (account.label, $0) } }
             // With many accounts, one line per account is a wall of text that mostly repeats one reason.
             let detail: String
@@ -1138,24 +1290,46 @@ final class AppModel {
                 detail = Dictionary(grouping: blocked, by: \.1).sorted { ($0.value.count, $1.key) > ($1.value.count, $0.key) }
                     .map { "\($0.value.count) 个账号\($0.key)" }.joined(separator: "，")
             }
-            // Try again when the first of them gets its quota back, rather than up to two minutes after it.
+            // Look again when the first of them may qualify: a reset, the end of a backoff or a cooldown, or after a
+            // short, growing wait for anything a fresh reading could change. Not after a fixed two minutes.
+            let ordinary = min(120, 15 * pow(2, Double(min(noCandidateFailures - 1, 3))))
+            let retry = policy.retryAt(others, at: retryClock(), ordinary: ordinary, backoffUntil: { self.backoffs[$0]?.nextAttempt },
+                                       cooldownEnds: departedAt?.addingTimeInterval(RelayPolicy.departureCooldown))
             let reset = policy.nextReset(of: others, at: .now)
-            let wait = reset.map { min(120, max(5, $0.timeIntervalSinceNow + 5)) } ?? 120
-            let next = reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时自动换上。" } ?? "保持开启，稍后自动重查。"
+            let next = reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时重新确认。" } ?? "保持开启，稍后自动重查。"
             let sentence = detail.hasSuffix("。") ? detail : detail + "。"
-            waitForRelay(because: sentence + next, until: retryClock().addingTimeInterval(wait))
+            waitForRelay(because: sentence + next, until: retry)
         case .wait: break
         }
     }
-    /// Who may take over from the account in use, in relay order. A rejected refresh token stays out until the user
-    /// authorizes again, and the account just left is not read in order to come back to it.
-    private func relayCandidates(_ policy: RelayPolicy, besides activeID: UUID) -> [Account] {
-        accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true && $0.id != policy.leftRecently }
+    private func lifetime(of snapshot: UsageSnapshot) -> TimeInterval {
+        // A status-line reading is the session's own report, and the endpoint is not asked again while sessions keep
+        // reporting. The hand-off may start from one for five minutes; an endpoint reading only while it is a minute old.
+        (!demo && snapshot.source == UsageParser.statusLineSource) ? 300 : 60
     }
-    private func relayPolicy(soonerWeekly: Bool = false) -> RelayPolicy {
+    private func relayOperationValid(_ generation: Int, active id: UUID) -> Bool {
+        autoRelay && generation == relayGeneration && !busy && active?.id == id && storageAvailable && !dualConflict &&
+        scopeIssue == nil && scopeUnreadable == nil && !apiModeDetected && !keepsAPIMode
+    }
+    /// What an account taking over from `active` must have above its threshold (see `UsagePace.candidateMargin`).
+    private func candidateMargin(_ active: Account) -> Thresholds {
+        var pace: Thresholds = 0
+        if paceAccount == active.id, let usage = active.usage {
+            pace = UsagePace.projectedMargin(usage, after: paceReadings, at: .now, lifetime: lifetime(of: usage), reactionTime: relayReactionTime)
+        }
+        return UsagePace.candidateMargin(pace: pace, allowance: switchAllowance)
+    }
+    /// Who may take over from the account in use, in relay order. A rejected refresh token stays out until the user
+    /// authorizes again, the account just left is not read in order to come back to it, and accounts fixed to a
+    /// project never serve the default login.
+    private func relayCandidates(_ policy: RelayPolicy, besides activeID: UUID) -> [Account] {
+        accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true
+            && $0.id != policy.leftRecently && !projectCatalog.reservedAccountIDs.contains($0.id) }
+    }
+    private func relayPolicy(soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) -> RelayPolicy {
         RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: !demo,
                     leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
-                    soonerWeekly: soonerWeekly)
+                    soonerWeekly: soonerWeekly, requiredMargin: requiredMargin)
     }
     /// The account is not in a backoff; asking now would only be refused.
     private func readable(_ id: UUID) -> Bool { (backoffs[id]?.nextAttempt ?? .distantPast) <= .now }
@@ -1167,26 +1341,22 @@ final class AppModel {
             usage.lastKnownRemaining(window, at: .now).map { $0 <= limit + RelayPolicy.preparationMargin } ?? false
         }
     }
-    /// A session has reported quota that the monitor has not taken in yet, and the account in use is close enough to
-    /// the threshold that waiting for the next ordinary pass could carry it past.
-    private func liveReadingWaiting() async -> Bool {
-        guard autoRelay, !demo, !busy, !loading, managesDefaultLogin, liveUsageEnabled, scopeIssue == nil, scopeUnreadable == nil,
-              nearThreshold else { return false }
-        // Read beside the I/O queue rather than on it: a keychain call waiting there has nothing to do with this file.
-        guard let sampled = await Task.detached(priority: .userInitiated, operation: { StatusLineBridge.latest()?.sampledAt }).value else { return false }
-        return sampled != liveStamp
-    }
-    /// While the account in use is close to the threshold, read ahead the account a hand-off would go to first, so that
-    /// what Lilt knows of it is at most five minutes old and the hand-off rarely finds it changed. When the read shows
-    /// less room, the next pass reads whichever account is in front then. Passes come every few seconds near the
-    /// threshold, so reads are at least 15 seconds apart.
+    /// Reads ahead the account a hand-off would take, and one fallback, so that one of them is still confirmed when the
+    /// hand-off comes and it does not have to be read first (see `RelayPolicy.preparationRead`). At most every 15 seconds.
     private func prepareHandOff() async {
-        guard autoRelay, !demo, !busy, !loading, nearThreshold, let active, (usagePausedUntil ?? .distantPast) <= .now,
+        guard autoRelay, !demo, !busy, !relayRunning, let active, let usage = active.usage, (usagePausedUntil ?? .distantPast) <= .now,
               (relayRetryAt ?? .distantPast) <= retryClock(), Date.now.timeIntervalSince(preparedAt) >= 15 else { return }
-        let policy = relayPolicy()
-        guard let next = policy.handOffOrder(relayCandidates(policy, besides: active.id), leaving: active, at: .now).first(where: { readable($0.id) }),
-              Date.now.timeIntervalSince(next.usage?.sampledAt ?? .distantPast) >= 300 else { return }
-        preparedAt = .now; await refresh(next.id)
+        let seconds = paceAccount == active.id
+            ? UsagePace.secondsToThreshold(usage, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: usage)) : nil
+        let policy = relayPolicy(requiredMargin: candidateMargin(active))
+        let near = nearThreshold
+        let due = policy.handOffOrder(relayCandidates(policy, besides: active.id), leaving: active, at: .now).filter { readable($0.id) }
+            .prefix(RelayPolicy.preparationReads).filter {
+                RelayPolicy.preparationRead(age: Date.now.timeIntervalSince($0.usage?.sampledAt ?? .distantPast), secondsToThreshold: seconds, nearThreshold: near)
+            }
+        guard !due.isEmpty else { return }
+        preparedAt = .now
+        for candidate in due { await refresh(candidate.id) }
     }
     /// Someone is likely reading or spending quota right now: a terminal or editor is frontmost, or Lilt itself is on screen.
     private var watching: Bool {
@@ -1196,32 +1366,34 @@ final class AppModel {
     }
     private func tick() async {
         // Everything on screen that depends on time reads `clock`, and with sorting on so does the order of every
-        // account, so each change redraws the whole window. Near the threshold passes come every 3 seconds; the
-        // figures that depend on time change by the minute, so the clock moves at most every 15 seconds.
+        // account, so each change redraws the whole window. The figures that depend on time change by the minute, so
+        // the clock moves at most every 15 seconds.
         if Date.now.timeIntervalSince(clock) >= 15 || Date.now < clock { clock = .now }
-        guard !busy, !loading else { return }
+        // A switch in progress has the scope; reads that are out (`loading`) no longer hold the pass up.
+        guard !busy else { return }
         if demo { touchDemoSamples(); await relay(); return }
-        // A pass woken early by a status line reading skips the scope check when one passed moments ago. Keychain checks
-        // start a process, and an automatic hand-off checks the selected storage again before writing.
+        // A scope that did not read, or holds something to look at, only stops writing; quota is still read. A pass
+        // right after a check skips it: keychain checks start a process, and a hand-off checks again before writing.
+        var writable = true
         if Date.now.timeIntervalSince(scopeCheckedAt) >= 10 {
-            guard await reconcileScope() else { return }
-            scopeCheckedAt = .now
+            writable = await reconcileScope()
+            if writable { scopeCheckedAt = .now }
         }
         await checkStatusLine()
-        await ingestLiveUsage()
-        guard let active else { return }
-        // Readings from a working session arrive with every response; the endpoint is only asked when none has come
-        // for five minutes (ORCA waits the same).
-        if let usage = active.usage, usage.source == UsageParser.statusLineSource, Date.now.timeIntervalSince(usage.sampledAt) < 300 {
-            await relay(); await prepareHandOff(); return
+        if let active {
+            // Readings from working sessions arrive with every response, and while they do the endpoint is not asked.
+            // With relay on and none in the last minute, the account in use is asked every 30 seconds, every 15 near
+            // the threshold, and a 429 pauses that (`usagePausedUntil`). With relay off it is 5 minutes while a
+            // terminal is in front and 15 otherwise, as ORCA does.
+            let window: TimeInterval = autoRelay ? 60 : 300
+            let fresh = active.usage.map { $0.source == UsageParser.statusLineSource && Date.now.timeIntervalSince($0.sampledAt) < window } ?? false
+            let interval: Double = autoRelay ? (nearThreshold ? 15 : 30) : (watching ? 300 : 900)
+            if forcePoll.remove(active.id) != nil || (!fresh && Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= interval) {
+                await refresh(active.id)
+            }
         }
-        // ORCA asks every 15 minutes, and only while its window is in front. With relay on Lilt has to keep watching
-        // in the background, but no faster than the endpoint puts up with: every 2 minutes when the account is close
-        // to the threshold, every 5 while relay is on or a terminal is in front, every 15 otherwise.
-        let interval: Double = autoRelay ? (nearThreshold ? 120 : 300) : (watching ? 300 : 900)
-        if Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= interval { await refresh(active.id) }
-        await relay()
-        await prepareHandOff()
+        await pollProjects()
+        if writable { await relay(); await prepareHandOff() }
     }
     func notice(at now: Date = .now) -> Notice? {
         if !storageAvailable { return Notice(symbol: "externaldrive.badge.exclamationmark", text: "本地数据不可用，已停止写入", detail: "检查 ~/Library/Application Support/Lilt 的权限后重新打开 Lilt。", warning: true) }
@@ -1263,7 +1435,13 @@ final class AppModel {
         if let relayPause { return Notice(symbol: "pause.circle", text: autoRelay ? "自动接力等待中" : "自动接力已停止", detail: relayPause, warning: true, action: autoRelay ? .refreshAll : .openScope) }
         // Not a problem to fix: the switch is done on Lilt's side. What Lilt cannot see is whether a CLI that was
         // already running has picked the new login up, so it says so once and leaves it at that.
-        if appliedPending { return Notice(symbol: "checkmark.circle", text: "已切换到“\(active.label)”", detail: scopeTarget == .system ? "新开的终端运行 claude 就是这个账号。已经在运行的会话有没有跟着换，Lilt 看不到；想确认就在里面运行 /status。" : "登录已写入 Lilt 作用域。正在运行的 CLI 有没有跟着换，Lilt 看不到；想确认就在 CLI 里运行 /status。", action: .confirmApplied) }
+        if appliedPending {
+            let detail = sessionConfirmed
+                ? "至少一个会话已报告这个账号的额度。其他同时运行的会话是否都已跟上，Lilt 看不到；想确认就在里面运行 /status。"
+                : scopeTarget == .system ? "新开的终端运行 claude 就是这个账号。已经在运行的会话有没有跟着换，Lilt 看不到；想确认就在里面运行 /status。"
+                                         : "登录已写入 Lilt 作用域。正在运行的 CLI 有没有跟着换，Lilt 看不到；想确认就在 CLI 里运行 /status。"
+            return Notice(symbol: "checkmark.circle", text: "已切换到“\(active.label)”", detail: detail, action: .confirmApplied)
+        }
         // Readings are a few minutes apart by design; only one that has not been renewed for over half an hour is worth a word.
         if let usage = active.usage, now.timeIntervalSince(usage.sampledAt) > 1800 {
             let paused = (usagePausedUntil ?? .distantPast) > now
@@ -1336,5 +1514,253 @@ final class AppModel {
         // Fixed fields only: no nicknames, account IDs, paths, CLI output, or server error bodies.
         let text = "\(AppBuild.description)\nBuild: \(AppBuild.timestamp)\nSource: \(AppBuild.revision)\nmacOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nCLI: \(version)\nAccounts: \(accounts.count)\nScope enabled: \(library.preferences.scopeEnabled)\nScope target: \(scopeTarget.rawValue)\nRuntime storage: keychain\nDual login conflict: \(dualConflict ? "present" : "none")\nMode: \(demo ? "demo" : "live")\nNative Liquid Glass: enabled\nHot switch: NOT VALIDATED\nAutomatic live relay: available, hot switch not validated\nCache continuity: UNKNOWN\n"
         do { try Data(text.utf8).write(to: url, options: .atomic); status = "已导出脱敏诊断" } catch { message = "诊断文件保存失败。" }
+    }
+}
+
+// MARK: - Projects with an account of their own
+
+extension AppModel {
+    /// Reads `projects.json`. A file that cannot be read or names one directory twice is left as it is, and no project
+    /// is launched or changed until it is fixed: it could otherwise hand one project's account to another.
+    private func loadProjects() {
+        guard storageAvailable else { return }
+        do {
+            let catalog = try Disk.loadProjects()
+            if let problem = catalog.problem { projectsAvailable = false; message = "projects.json：\(problem)项目保持原样，暂不启动。"; return }
+            projectCatalog = catalog
+        } catch { projectsAvailable = false; message = "项目绑定无法读取；项目保持原样，暂不启动。" }
+    }
+    private func saveProjects() {
+        guard !demo, storageAvailable, projectsAvailable, projectCatalog.problem == nil else { return }
+        let catalog = projectCatalog
+        do { try IOQueue.sync { try Disk.saveProjects(catalog) } } catch { message = "项目绑定保存失败，请检查本地存储。" }
+    }
+    private func failProject(_ id: UUID, _ error: Error) {
+        guard let index = projectCatalog.projects.firstIndex(where: { $0.id == id }) else { return }
+        projectCatalog.projects[index].phase = .conflict
+        projectCatalog.projects[index].issue = Self.projectReason(error)
+        projectCatalog.projects[index].updatedAt = .now
+        saveProjects()
+    }
+    static func projectReason(_ error: Error) -> String {
+        if error is DualRuntimeConflict { return "项目配置里钥匙串与文件中的登录不一致；没有改动。" }
+        return reason(error) ?? "项目登录无法处理，没有改动。"
+    }
+    private func claimProject(_ id: UUID) throws {
+        guard projectBusy.insert(id).inserted else { throw AppFailure("这个项目正在处理另一个操作，请稍后再试。") }
+    }
+
+    /// What `scope` holds relative to `account`'s stored login, taking it in when it is the same login renewed. The
+    /// default login's state is never touched: a project's trouble stays the project's.
+    private func projectReadBack(_ account: Account, in scope: RuntimeScope) async throws -> OAuthDocument.ReadBack {
+        let id = account.id
+        let found = try await IOQueue.run { () throws -> (Data, Credential, Data?, Data?)? in
+            guard let stored = try AccountVault.read(account: id.uuidString), let held = try scope.currentCredential(),
+                  (try? held.validate()) != nil else { return nil }
+            return (stored, held, try AccountVault.read(account: Keychain.identityAccount(id)), scope.readIdentity())
+        }
+        guard let (stored, held, mine, theirs) = found else { return .unverifiable }
+        let storedIdentity = OAuthDocument.Identity(oauthAccount: mine)
+        var verdict = OAuthDocument.readBack(stored: stored, runtime: held.data, storedIdentity: storedIdentity, runtimeIdentity: .init(oauthAccount: theirs))
+        if verdict == .unverifiable || verdict == .foreign, storedIdentity.account != nil, held.refreshable, let asked = await identityFetch(held) {
+            verdict = OAuthDocument.readBack(stored: stored, runtime: held.data, storedIdentity: storedIdentity, runtimeIdentity: .init(oauthAccount: asked))
+        }
+        guard verdict == .adopt || verdict == .unchanged else { return verdict }
+        let adopt = verdict == .adopt
+        try await IOQueue.run {
+            if adopt { try AccountVault.write(held.data, account: id.uuidString) }
+            try scope.rebaseline()
+        }
+        if adopt { update(id) { $0.expiresAt = held.expiresAt; $0.issue = nil; $0.refreshRejected = nil } }
+        return verdict
+    }
+
+    /// Brings a project's scope in line with its binding. First what the scope holds is accounted for: a login the
+    /// project's CLI renewed is taken in when it provably is the same login (`projectReadBack`), while a login nobody
+    /// can account for, a switch left halfway or two different logins in keychain and file stop everything without
+    /// writing. Then `target`'s login is written, unless the scope already holds it, in which case nothing is written
+    /// at all. `holder` is the account the binding says is there; `reauthorized` means the user just signed `target`
+    /// in again, so the project's older copy of that same account is replaced rather than read back over the new one.
+    /// Only this project's directory and keychain item are touched, never the default login.
+    func syncProject(_ binding: ProjectBinding, target: Account?, holder: UUID? = nil, reauthorized: Bool = false) async throws {
+        let scope = projectRuntime(binding)
+        let holder = holder ?? projectCatalog.binding(id: binding.id)?.accountID
+        let ids = library.accounts.map(\.id)
+        if await IOQueue.perform({ scope.transactionPending }) {
+            let settled = try await IOQueue.run { () throws -> Bool in
+                guard let held = try scope.currentCredential() else { return false }
+                for id in ids where AccountVault.hasFile(account: id.uuidString) {
+                    if try AccountVault.read(account: id.uuidString) == held.data { try scope.settle(); return true }
+                }
+                return false
+            }
+            guard settled else { throw AppFailure("项目有未完成的切换，且其中的登录不属于已知账号；没有改动。") }
+        }
+        if await IOQueue.perform({ (try? scope.check()) == nil }) {
+            if let held = try await IOQueue.run({ try scope.currentCredential() }) {
+                if reauthorized, let target {
+                    let id = target.id
+                    let (theirs, mine) = await IOQueue.perform { (scope.readIdentity(), (try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil) }
+                    let a = OAuthDocument.Identity(oauthAccount: theirs).account, b = OAuthDocument.Identity(oauthAccount: mine).account
+                    guard a == nil || b == nil || a == b else { throw AppFailure("项目配置里是另一个账号的登录；没有覆盖。") }
+                    try await IOQueue.run { try scope.rebaseline() }
+                } else {
+                    let exact = try await IOQueue.run { () throws -> UUID? in
+                        for id in ids where AccountVault.hasFile(account: id.uuidString) {
+                            if try AccountVault.read(account: id.uuidString) == held.data { return id }
+                        }
+                        return nil
+                    }
+                    let named = OAuthDocument.Identity(oauthAccount: await IOQueue.perform { scope.readIdentity() }).account
+                    let byName = named.flatMap { name in library.accounts.first { OAuthDocument.Identity(oauthAccount: identity(for: $0.id)).account == name }?.id }
+                    guard let ownerID = exact ?? byName ?? holder, let owner = library.accounts.first(where: { $0.id == ownerID }) else {
+                        throw AppFailure("项目配置里已有无法确认归属的登录；Lilt 不会覆盖它。")
+                    }
+                    switch try await projectReadBack(owner, in: scope) {
+                    case .adopt, .unchanged: break
+                    case .unverifiable, .foreign: throw AppFailure("项目里的登录无法证明仍属于“\(owner.label)”；没有覆盖。")
+                    }
+                }
+            } else {
+                try await IOQueue.run { try scope.rebaseline() }
+            }
+        }
+        guard let target else { return }
+        // A renewal of the target under way finishes first, or its old refresh token would go into the scope.
+        if let renewal = renewals[target.id] { _ = try? await renewal.value }
+        let login = try await credential(for: target.id)
+        let id = target.id, label = target.label
+        try await IOQueue.run {
+            if try scope.currentCredential()?.data != login.data {
+                try scope.apply(login, replacingExternalState: false)
+                try? scope.writeIdentity((try? AccountVault.read(account: Keychain.identityAccount(id))) ?? nil)
+            }
+        }
+        if liveUsageEnabled {
+            do { try await IOQueue.run { try ProjectStatusLineBridge.install(binding, accountLabel: label) } }
+            catch { statusLineIssue = Self.reason(error) ?? "项目状态栏没有接上；额度会按时查询。" }
+        }
+    }
+
+    /// Fixes `accountID` to the project at `root`. Returns false and says why when nothing was bound.
+    func bindProject(root: String, accountID: UUID, allowShared: Bool) async -> Bool {
+        guard !demo, storageAvailable, projectsAvailable else { message = "当前无法修改项目绑定。"; return false }
+        do {
+            let (normalized, name) = try ProjectSupport.validate(root: root)
+            let account = library.accounts.first { $0.id == accountID }
+            if let problem = ProjectRules.bindingProblem(root: normalized, account: account, catalog: projectCatalog,
+                                                         defaultLoginAccount: managesDefaultLogin ? library.activeID : nil, allowShared: allowShared) {
+                throw AppFailure(problem)
+            }
+            var binding = ProjectBinding(name: name, rootPath: normalized, accountID: accountID, phase: .preparing, appliedPending: true)
+            try claimProject(binding.id)
+            defer { projectBusy.remove(binding.id) }
+            relayGeneration += 1
+            projectCatalog.projects.append(binding); saveProjects()
+            do {
+                try await syncProject(binding, target: account)
+                guard let index = projectCatalog.projects.firstIndex(where: { $0.id == binding.id }) else { throw AppFailure("项目绑定在准备期间被移除。") }
+                binding.phase = .ready; binding.issue = nil; binding.updatedAt = .now
+                projectCatalog.projects[index] = binding; saveProjects()
+                status = "已绑定“\(name)”；默认登录没有改动"
+                if !(account?.usage?.isFresh(at: .now, lifetime: 300) ?? false) { Task { await self.refresh(accountID) } }
+                return true
+            } catch { failProject(binding.id, error); throw error }
+        } catch { message = Self.projectReason(error); return false }
+    }
+
+    /// Changes the project's account. CLIs already running on this project follow it, as they follow the default
+    /// login; other projects and the default login are not touched.
+    func rebindProject(_ id: UUID, accountID: UUID, allowShared: Bool) async -> Bool {
+        guard !demo, storageAvailable, projectsAvailable, var binding = projectCatalog.binding(id: id) else { message = "当前无法修改项目绑定。"; return false }
+        do {
+            guard FileManager.default.fileExists(atPath: binding.rootPath) else { throw AppFailure("项目目录已不存在；请解绑后在新位置重新绑定。") }
+            if let problem = ProjectRules.repositoryProblem(root: binding.rootPath) { throw AppFailure(problem) }
+            let account = library.accounts.first { $0.id == accountID }
+            if let problem = ProjectRules.bindingProblem(root: binding.rootPath, account: account, catalog: projectCatalog,
+                                                         defaultLoginAccount: managesDefaultLogin ? library.activeID : nil,
+                                                         allowShared: allowShared, replacing: id) {
+                throw AppFailure(problem)
+            }
+            try claimProject(id)
+            defer { projectBusy.remove(id) }
+            let previous = binding.accountID
+            binding.accountID = accountID; binding.phase = .preparing; binding.appliedPending = true; binding.issue = nil; binding.updatedAt = .now
+            guard let index = projectCatalog.projects.firstIndex(where: { $0.id == id }) else { throw AppFailure("项目绑定已变化，请重试。") }
+            projectCatalog.projects[index] = binding; saveProjects()
+            do {
+                try await syncProject(binding, target: account, holder: previous)
+                guard let index = projectCatalog.projects.firstIndex(where: { $0.id == id }) else { throw AppFailure("项目绑定在准备期间被移除。") }
+                binding.phase = .ready; binding.issue = nil; binding.updatedAt = .now
+                projectCatalog.projects[index] = binding; saveProjects()
+                status = "已更换“\(binding.name)”的账号；这个项目里正在运行的 CLI 会一起换到它"
+                if !(account?.usage?.isFresh(at: .now, lifetime: 300) ?? false) { Task { await self.refresh(accountID) } }
+                return true
+            } catch { failProject(id, error); throw error }
+        } catch { message = Self.projectReason(error); return false }
+    }
+
+    /// Stops managing the project. Its configuration, login and session history stay where they are, and binding the
+    /// same directory again finds them; the project's status line goes back to what it was.
+    func unbindProject(_ id: UUID) {
+        guard !demo, projectsAvailable, let binding = projectCatalog.binding(id: id), !projectBusy.contains(id) else { return }
+        projectCatalog.projects.removeAll { $0.id == id }
+        saveProjects()
+        Task { await IOQueue.perform { try? ProjectStatusLineBridge.uninstall(binding) } }
+        status = "已解绑“\(binding.name)”；项目配置和登录保留，账号可重新用于默认登录"
+    }
+
+    /// Everything a launch needs, checked, and the command that starts the official CLI on the project's own
+    /// configuration. The scope is written only when it does not hold the bound login yet. Nothing falls back to the
+    /// default login.
+    func projectLaunchPlan(_ id: UUID, executable: String? = nil) async throws -> ProjectLaunchPlan {
+        guard projectsAvailable, let binding = projectCatalog.binding(id: id) else { throw AppFailure("项目绑定已不存在。") }
+        guard FileManager.default.fileExists(atPath: binding.rootPath) else { throw AppFailure("项目目录已不存在；目录移动后需要在新位置重新绑定。") }
+        let account = library.accounts.first { $0.id == binding.accountID }
+        if let problem = ProjectRules.launchProblem(binding, account: account) { throw AppFailure(problem) }
+        if let problem = ProjectRules.repositoryProblem(root: binding.rootPath) { throw AppFailure(problem) }
+        try claimProject(id)
+        defer { projectBusy.remove(id) }
+        let scope = projectRuntime(binding)
+        do {
+            try await syncProject(binding, target: account)
+            guard try await IOQueue.run({ try scope.hasAPIOverride() }) == false else {
+                throw AppFailure("项目配置含 API 或供应商覆盖；固定订阅账号不会覆盖它。")
+            }
+        } catch { failProject(id, error); throw error }
+        return try ProjectSupport.launchPlan(for: binding, runtime: scope, executable: executable ?? CLILogin.executable?.path)
+    }
+
+    /// Opens Terminal on the project with the official CLI.
+    func launchProject(_ id: UUID) async {
+        do {
+            let plan = try await projectLaunchPlan(id)
+            try await ProjectSupport.openTerminal(plan)
+            status = "已在终端启动项目"
+        } catch { message = Self.projectReason(error) }
+    }
+
+    /// The same command for the user's own terminal or editor. It holds paths, never a secret.
+    func copyProjectLaunchCommand(_ id: UUID) async {
+        do {
+            let plan = try await projectLaunchPlan(id)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(plan.command, forType: .string)
+            status = "已复制启动命令"
+        } catch { message = Self.projectReason(error) }
+    }
+
+    /// Project accounts never relay, so they are read only to show where they stand: when sessions have not reported
+    /// for a while, at the idle pace, or at once after events went missing.
+    private func pollProjects() async {
+        var reads = 0
+        for project in projectCatalog.projects where project.phase == .ready && reads < 2 {
+            guard let account = library.accounts.first(where: { $0.id == project.accountID }), account.enabled,
+                  account.usageCapability != .unavailable else { continue }
+            let fresh = account.usage.map { Date.now.timeIntervalSince($0.sampledAt) < 300 } ?? false
+            if forcePoll.remove(account.id) != nil || (!fresh && Date.now.timeIntervalSince(account.lastChecked ?? .distantPast) >= 900) {
+                reads += 1; await refresh(account.id)
+            }
+        }
     }
 }
