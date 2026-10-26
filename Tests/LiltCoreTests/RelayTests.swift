@@ -199,6 +199,32 @@ final class RelayTests {
         expectEqual(backoff.nextAttempt, now.addingTimeInterval(120))
         backoff.fail(.authentication, at: now); expectAtLeast(backoff.nextAttempt.timeIntervalSince(now), 900)
         backoff.succeed(); expectEqual(backoff.failures, 0)
+        backoff.fail(.rateLimited(0), at: now)
+        expectEqual(backoff.nextAttempt, now.addingTimeInterval(300))
+        var bounded = Backoff(); bounded.fail(.rateLimited(86400), at: now)
+        expectEqual(bounded.nextAttempt, now.addingTimeInterval(4500))
+    }
+    func testUsagePollingKeepsAlternatesAndResetsMoving() {
+        var active = Account(label: "Active", kind: .oauth)
+        active.lastChecked = now
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(29)))
+        expect(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(30)))
+        expect(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: true, watching: true, at: now.addingTimeInterval(15)))
+        var alternate = Account(label: "Alternate", kind: .oauth)
+        alternate.lastChecked = now
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: true, at: now.addingTimeInterval(299)))
+        expect(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: true, at: now.addingTimeInterval(300)))
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(599)))
+        expect(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(600)))
+        alternate.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(10)), sampledAt: now)
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(14)))
+        expect(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(15)))
+        active.usage = UsageSnapshot(fiveHour: UsageWindow(used: 20), sampledAt: now, source: UsageParser.statusLineSource)
+        active.lastChecked = now.addingTimeInterval(-3600)
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(59)))
+        expect(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(60)))
+        alternate.enabled = false
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: true, at: now.addingTimeInterval(3600)))
     }
     func testParserRejectsMalformedAndBooleanUsage() throws {
         for json in ["{}", "{\"five_hour\":{\"utilization\":true}}", "{\"five_hour\":{\"utilization\":101}}", "{\"five_hour\":{\"utilization\":1,\"resets_at\":\"bad\"}}"] {
@@ -606,6 +632,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testStatusLineReadingsAreParsedAndMatchedToTheirAccount()
         suite.testDuplicateEventClaimedOnce()
         suite.testRetryAfterAndAuthentication()
+        suite.testUsagePollingKeepsAlternatesAndResetsMoving()
         try suite.testParserRejectsMalformedAndBooleanUsage()
         suite.testRenewalLeadIsTwiceTheCLIBuffer()
         try suite.testRejectedRefreshLeavesAutomaticRelayUntilReauthorized()
@@ -632,7 +659,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try concurrency.testProjectRules()
         try concurrency.testImportPlanAndTransaction()
         try credentialTransferChecks()
-        print("PASS: 38 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive")
+        print("PASS: 39 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive")
     }
 }
 

@@ -129,11 +129,15 @@ func testRefreshRecovery() async throws {
     await Task.yield()
     await engine.refresh(aID)
     await engine.refresh(aID, manually: true)
+    let previousCheck = await engine.account(aID)?.lastChecked
     await usage.reset([a.token!: [.network, nil], b.token!: [.rateLimited(120), nil]])
     await engine.refresh(aID)
     await engine.refresh(aID)
     let automaticCalls = await usage.calls
     expect(automaticCalls == 1, "automatic refresh ignored ordinary backoff: calls=\(automaticCalls)")
+    let failedState = await engine.snapshot()
+    expect(failedState.0.accounts[0].lastChecked == previousCheck && failedState.0.accounts[0].issue == UsageFailure.network.message,
+           "failed request advanced the last successful reading")
     await engine.refresh(aID, manually: true)
     let manualCalls = await usage.calls
     expect(manualCalls == 2, "manual refresh did not override ordinary backoff: calls=\(manualCalls)")
@@ -144,6 +148,32 @@ func testRefreshRecovery() async throws {
     await engine.refresh(bID, manually: true)
     let limitedCalls = await usage.calls
     expect(limitedCalls == 3, "manual refresh bypassed server 429")
+    await engine.refresh(aID, manually: true)
+    let independentCalls = await usage.calls
+    expect(independentCalls == 4, "one account's 429 paused every account")
+}
+
+func testAlternatePolling() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
+    let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+    let a = credential("poll-a"), b = credential("poll-b")
+    let snapshot = UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    let usage = ScriptedUsage(snapshot: snapshot, scripts: [:])
+    let clock = Clock()
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), now: { clock.value }, requestGap: 0)
+    _ = try await engine.add(a, identity: identity("poll-a"), label: "A", kind: .oauth)
+    _ = try await engine.takeOver(label: nil)
+    _ = try await engine.add(b, identity: identity("poll-b"), label: "B", kind: .oauth)
+    await engine.refreshAll()
+    await usage.reset([:])
+    clock.value = clock.value.addingTimeInterval(599)
+    await engine.tick()
+    var calls = await usage.calls
+    expect(calls == 0, "alternate refreshed before its cadence: \(calls)")
+    clock.value = clock.value.addingTimeInterval(1)
+    await engine.tick()
+    calls = await usage.calls
+    expect(calls == 1, "alternate was left stale at its scheduled poll: \(calls)")
 }
 
 func testFreshServerTakeover() async throws {
@@ -204,6 +234,7 @@ expect(SHA256.hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
 try testSecureRuntime()
 try testStatusLine()
 try await testRefreshRecovery()
+try await testAlternatePolling()
 try await testFreshServerTakeover()
 try await testAutomaticRelay()
 try await testProjects()
@@ -211,4 +242,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (12 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (13 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, alternate polling, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

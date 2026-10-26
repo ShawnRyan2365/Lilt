@@ -402,7 +402,10 @@ public struct Backoff: Sendable {
     public mutating func fail(_ error: UsageFailure, at now: Date) {
         failures += 1
         var delay = min(900, 15 * pow(2, Double(min(failures - 1, 6))))
-        if case .rateLimited(let server) = error { delay = max(delay, server) }
+        if case .rateLimited(let server) = error {
+            let requested = server == 0 ? 300 : min(4500, max(0, server))
+            delay = max(delay, requested)
+        }
         if error == .authentication || error == .permission || error == .accessExpired { delay = max(delay, 900) }
         nextAttempt = now.addingTimeInterval(delay)
     }

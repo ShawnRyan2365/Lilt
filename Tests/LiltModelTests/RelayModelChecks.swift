@@ -365,6 +365,7 @@ import LiltCore
     library.preferences.autoRelay = true; library.preferences.liveUsage = false
     let login = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-refresh-access", "refreshToken": "fixture-refresh-token"]])
     try AccountVault.write(login, account: active.id.uuidString)
+    try AccountVault.write(login, account: spare.id.uuidString)
     var keychainCalls = 0
     let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
         keychainCalls += 1
@@ -388,9 +389,11 @@ import LiltCore
     await model.refresh(active.id)
     precondition(calls == 3, "A temporary local failure creates no authentication backoff")
 
+    let lastSuccessfulCheck = model.active?.lastChecked
     failures = [UsageFailure.network]
     await model.refresh(active.id)
-    precondition(calls == 4)
+    precondition(calls == 4 && model.active?.lastChecked == lastSuccessfulCheck && model.active?.issue == UsageFailure.network.message,
+                 "A failed request must not look like a fresh reading")
     await model.refresh(active.id)
     precondition(calls == 4, "Automatic reads respect an ordinary backoff")
     await model.refresh(active.id, manually: true)
@@ -410,10 +413,9 @@ import LiltCore
     await model.refresh(active.id, manually: true)
     precondition(calls == 7)
     await model.refresh(active.id, manually: true)
-    precondition(calls == 7 && model.status.contains("稍后再查"), "A server 429 still blocks a manual retry")
-    // Nor can a read for another account get past it.
+    precondition(calls == 7 && model.status.contains("重试"), "A server 429 still blocks a manual retry")
     await model.refresh(spare.id, manually: true)
-    precondition(calls == 7, "A server 429 paused one account only")
+    precondition(calls == 8 && model.status == "额度已更新", "One account's 429 must not pause another account")
 }
 
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up

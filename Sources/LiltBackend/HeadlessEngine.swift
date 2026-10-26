@@ -29,7 +29,7 @@ public actor HeadlessEngine {
     private var refreshTasks: [UUID: Task<Void, Never>] = [:]
     private var renewalTasks: [UUID: Task<Credential, Error>] = [:]
     private var tickTask: Task<Void, Never>?
-    private var usagePausedUntil: Date?
+    private var usageFailures: [UUID: UsageFailure] = [:]
     private var latch = RelayLatch()
     private var departedID: UUID?
     private var departedAt: Date?
@@ -377,14 +377,21 @@ public actor HeadlessEngine {
         guard let active = library.activeID else { throw BackendFailure("没有当前账号。") }
         _ = try await apply(active, automatically: false); scopeIssue = nil
     }
-    /// Requests for one account share one answer. A manual refresh that joined an automatic one which was held back
-    /// by the ordinary backoff asks once more; nothing ever asks past a 429.
+    private func isRateLimited(_ id: UUID) -> Bool {
+        if case .rateLimited = usageFailures[id] { return true }
+        return false
+    }
+    /// Requests for one account share one answer. Manual refresh may override an ordinary backoff, never a 429.
     public func refresh(_ id: UUID, manually: Bool = false) async {
         if switching { if manually { message = "正在切换账号，完成后即可刷新" }; return }
         if let running = refreshTasks[id] {
             await running.value
             if refreshTasks[id] == running { refreshTasks[id] = nil }
-            guard manually, let next = backoffs[id]?.nextAttempt, next > now(), refreshTasks[id] == nil else { return }
+            guard manually, let next = backoffs[id]?.nextAttempt, next > now(), !isRateLimited(id), refreshTasks[id] == nil else { return }
+        }
+        if let next = backoffs[id]?.nextAttempt, next > now(), !manually || isRateLimited(id) {
+            if manually { message = "额度暂未更新，请稍后再试。" }
+            return
         }
         let task = Task { await self.performRefresh(id, manually: manually) }
         refreshTasks[id] = task; await task.value
@@ -392,11 +399,11 @@ public actor HeadlessEngine {
     }
     private func performRefresh(_ id: UUID, manually: Bool) async {
         guard library.accounts.contains(where: { $0.id == id }) else { return }
-        if let until = usagePausedUntil, until > now() { if manually { message = "额度接口要求稍后再查，请稍后再试。" }; return }
-        if !manually, let next = backoffs[id]?.nextAttempt, next > now() { return }
         await spacing.reserve(gap: requestGap)
-        // While this request waited for its slot, another may have been told to wait.
-        if let until = usagePausedUntil, until > now() { if manually { message = "额度接口要求稍后再查，请稍后再试。" }; return }
+        if let next = backoffs[id]?.nextAttempt, next > now(), isRateLimited(id) {
+            if manually { message = "额度暂未更新，请稍后再试。" }
+            return
+        }
         // A project's CLI may have renewed this account's login; the stored copy could be expired or spent.
         if let project = projects.projects.first(where: { $0.accountID == id && $0.phase == .ready }), !projectBusy.contains(project.id) {
             try? await syncProject(project, target: nil)
@@ -408,7 +415,7 @@ public actor HeadlessEngine {
             guard library.accounts.contains(where: { $0.id == id }), current(credential, id: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = self.now(); $0.issue = nil }
             if id == library.activeID { notePace(snapshot, id: id) }
-            backoffs[id]?.succeed(); message = "额度已更新"
+            backoffs[id]?.succeed(); usageFailures[id] = nil; message = "额度已更新"
             if credential.refreshable, !(try store.readSecret(id.uuidString + ".identity") != nil),
                let record = await identityClient.fetch(credential), current(credential, id: id) {
                 try store.writeSecret(id.uuidString + ".identity", data: record)
@@ -418,11 +425,10 @@ public actor HeadlessEngine {
         catch {
             if let asked, !current(asked, id: id) { return }
             let failure = error as? UsageFailure ?? .network
-            backoffs[id, default: Backoff()].fail(failure, at: now())
-            if case .rateLimited(let seconds) = failure { usagePausedUntil = now().addingTimeInterval(max(60, seconds)) }
-            let passing = failure == .network || { if case .rateLimited = failure { true } else { false } }()
-            let hasReading = library.accounts.first { $0.id == id }?.usage != nil
-            update(id) { if !(passing && hasReading) { $0.issue = failure.message }; $0.lastChecked = self.now(); if failure == .permission { $0.usageCapability = .unavailable } }
+            backoffs[id, default: Backoff()].fail(failure, at: now()); usageFailures[id] = failure
+            // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
+            update(id) { $0.issue = failure.message; if failure == .permission { $0.usageCapability = .unavailable } }
+            message = "额度暂未更新，保留上次读数。"
         }
     }
     public func refreshAll() async { for account in library.accounts where account.enabled { await refresh(account.id, manually: true) } }
@@ -560,7 +566,7 @@ public actor HeadlessEngine {
     /// the hand-off comes (see `RelayPolicy.preparationRead`).
     private func prepareHandOff() async {
         guard library.preferences.autoRelay == true, !switching, !relayRunning, let active, let usage = active.usage,
-              (usagePausedUntil ?? .distantPast) <= now(), (relayRetryAt ?? .distantPast) <= now(), now().timeIntervalSince(preparedAt) >= 15 else { return }
+              (relayRetryAt ?? .distantPast) <= now(), now().timeIntervalSince(preparedAt) >= 15 else { return }
         let seconds = paceAccount == active.id ? UsagePace.secondsToThreshold(usage, after: paceReadings, threshold: thresholds, at: now(), lifetime: lifetime(of: usage)) : nil
         let policy = policy(requiredMargin: candidateMargin(active))
         let due = policy.handOffOrder(relayCandidates(policy, besides: active.id), leaving: active, at: now()).filter { readable($0.id) }
@@ -594,7 +600,6 @@ public actor HeadlessEngine {
             if snapshot.available(threshold: thresholds, at: now()) { relayPause = nil; relayRetryAt = nil; noCandidateFailures = 0 }
             return
         }
-        if let until = usagePausedUntil, until > now() { if due { relayPause = "额度接口限流，恢复后自动重试。"; relayRetryAt = until }; return }
         if let relayRetryAt, relayRetryAt > now() { return }
         let policy = policy(soonerWeekly: early, requiredMargin: early ? 0 : candidateMargin(active))
         if due {
@@ -602,7 +607,6 @@ public actor HeadlessEngine {
             while asked.count < RelayPolicy.handOffReads, relayValid(generation, active: active.id),
                   let next = policy.nextRead(relayCandidates(policy, besides: active.id), leaving: self.active, asked: asked, readable: { self.readable($0) }, at: now()) {
                 asked.insert(next.id); await refresh(next.id)
-                if let until = usagePausedUntil, until > now() { break }
             }
         } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > now() {
             var reads = 0
@@ -614,7 +618,6 @@ public actor HeadlessEngine {
             }
         }
         guard relayValid(generation, active: active.id) else { return }
-        if let until = usagePausedUntil, until > now() { if due { relayPause = "额度接口限流，恢复后自动重试。"; relayRetryAt = until }; return }
         // Decided on the newest reading of the account in use: readings that kept arriving during the reads are
         // taken into account rather than making the hand-off give up and start over.
         guard let current = self.active, let latest = current.usage else { return }
@@ -661,6 +664,21 @@ public actor HeadlessEngine {
     private func finishTick(_ task: Task<Void, Never>) {
         if tickTask == task { tickTask = nil }
     }
+    private func pollUsage() async {
+        if let active {
+            if forcePoll.remove(active.id) != nil || UsagePolling.due(active, active: true, autoRelay: library.preferences.autoRelay == true, nearThreshold: nearThreshold, watching: false, at: now()) {
+                await refresh(active.id)
+            }
+        }
+        let alternates = UsagePolling.refreshOrder(globalRelayCandidates().filter { $0.id != library.activeID })
+        var reads = 0
+        for account in alternates where reads < UsagePolling.alternatesPerPass {
+            if forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: library.preferences.autoRelay == true, nearThreshold: false, watching: false, at: now()) {
+                reads += 1
+                await refresh(account.id)
+            }
+        }
+    }
     public func tick() async {
         guard !switching else { return }
         do { projects = try projectStore.load() }
@@ -669,13 +687,7 @@ public actor HeadlessEngine {
         let writable = await reconcile()
         checkStatusLine()
         await observe()
-        if let active {
-            let fresh = active.usage.map { $0.source == UsageParser.statusLineSource && now().timeIntervalSince($0.sampledAt) < (library.preferences.autoRelay == true ? 60 : 300) } ?? false
-            let interval: TimeInterval = library.preferences.autoRelay == true ? (nearThreshold ? 15 : 30) : 900
-            if forcePoll.remove(active.id) != nil || (!fresh && now().timeIntervalSince(active.lastChecked ?? .distantPast) >= interval) {
-                await refresh(active.id)
-            }
-        }
+        await pollUsage()
         await pollProjects()
         if writable { await relay(); await prepareHandOff() }
     }

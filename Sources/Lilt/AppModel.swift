@@ -102,9 +102,7 @@ final class AppModel {
     private var savedAPIMode = false
     private var backoffs: [UUID: Backoff] = [:]
     private var failures: [UUID: UsageFailure] = [:]
-    /// The usage endpoint limits everything sent from this Mac, so a 429 for one account pauses them all (ORCA does
-    /// the same). Readings already on screen stay there meanwhile.
-    private(set) var usagePausedUntil: Date?
+    /// A 429 pauses only the account whose request was limited. Other accounts keep their own cadence and last readings.
     /// Requests for one account share one answer (`refreshes`); requests of any account start two seconds apart.
     private let spacing = RequestSpacing()
     private var refreshes: [UUID: Task<Void, Never>] = [:]
@@ -746,22 +744,29 @@ final class AppModel {
         let seconds = max(0, date.timeIntervalSince(now))
         return seconds < 60 ? "约 \(Int(seconds.rounded(.up))) 秒" : "约 \(Int((seconds / 60).rounded(.up))) 分钟"
     }
+    private func isRateLimited(_ id: UUID) -> Bool {
+        if case .rateLimited = failures[id] { return true }
+        return false
+    }
+    func usageRetryText(_ id: UUID, at now: Date = .now) -> String? {
+        guard let next = backoffs[id]?.nextAttempt, next > now else { return nil }
+        return "\(Self.wait(until: next, from: now))后重试"
+    }
     func refresh(_ id: UUID, manually: Bool = false) async {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
         if busy {
             if manually { status = "正在切换账号，完成后即可刷新" }
             return
         }
-        // A request already out for this account answers this one too. A manual refresh that joined an automatic one
-        // held back by the ordinary backoff asks once more; nothing asks past a 429.
+        // A request already out for this account answers this one too. Manual refresh may override an ordinary
+        // backoff, never this account's own server 429. It never waits for another account's backoff.
         if let running = refreshes[id] {
             await running.value
             if refreshes[id] == running { refreshes[id] = nil; loading = !refreshes.isEmpty }
-            guard manually, let next = backoffs[id]?.nextAttempt, next > .now, refreshes[id] == nil else { return }
+            guard manually, let next = backoffs[id]?.nextAttempt, next > .now, !isRateLimited(id), refreshes[id] == nil else { return }
         }
-        if let until = usagePausedUntil, until > .now { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续"; return }
-        if !manually, let next = backoffs[id]?.nextAttempt, next > .now {
-            status = "接口退避中，\(Self.wait(until: next))后可重试"; return
+        if let next = backoffs[id]?.nextAttempt, next > .now, !manually || isRateLimited(id) {
+            status = "额度暂未更新，\(Self.wait(until: next))后重试"; return
         }
         let task = Task { await self.performRefresh(id) }
         refreshes[id] = task; loading = true
@@ -772,8 +777,9 @@ final class AppModel {
 
     private func performRefresh(_ id: UUID) async {
         await spacing.reserve(gap: requestGap)
-        // While this request waited for its slot, another may have been told to wait.
-        if let until = usagePausedUntil, until > .now { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续"; return }
+        if let next = backoffs[id]?.nextAttempt, next > .now, isRateLimited(id) {
+            status = "额度暂未更新，\(Self.wait(until: next))后重试"; return
+        }
         // A project's CLI may have renewed this account's login; the stored copy could be expired or spent.
         if let project = projectCatalog.projects.first(where: { $0.accountID == id && $0.phase == .ready }), !projectBusy.contains(project.id) {
             try? await syncProject(project, target: nil)
@@ -803,14 +809,9 @@ final class AppModel {
             if let asked, await !isCurrent(asked, for: id) { return }
             let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
-            if case .rateLimited(let seconds) = failure { usagePausedUntil = Date.now.addingTimeInterval(max(60, seconds)) }
-            // Being told to wait, or a dropped connection, says nothing about the account: the last reading stays
-            // on screen, as in ORCA, and nothing is flagged. Only an account with nothing to show says why.
-            let passing: Bool
-            switch failure { case .rateLimited, .network: passing = true; default: passing = false }
-            let hasReading = accounts.first { $0.id == id }?.usage != nil
-            update(id) { if !(passing && hasReading) { $0.issue = failure.message }; $0.lastChecked = .now; if failure == .permission { $0.usageCapability = .unavailable } }
-            if case .rateLimited = failure, let until = usagePausedUntil { status = "额度接口要求稍后再查，\(Self.wait(until: until))后继续；先显示上次读数" }
+            // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
+            update(id) { $0.issue = failure.message; if failure == .permission { $0.usageCapability = .unavailable } }
+            if let retry = usageRetryText(id) { status = "额度暂未更新，\(retry)；保留上次读数" }
             else { status = failure.message }
         }
     }
@@ -819,11 +820,10 @@ final class AppModel {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
         for account in accounts where account.enabled { await refresh(account.id, manually: true) }
     }
-    /// The panel just opened or the window came forward: what is on screen should not be a minute old.
+    /// The panel just opened or the window came forward: refresh the active account promptly and any idle accounts due.
     func refreshIfStale() async {
-        guard !demo, let active, backoffs[active.id]?.nextAttempt ?? .distantPast <= .now, (usagePausedUntil ?? .distantPast) <= .now,
-              Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= 120 else { return }
-        await refresh(active.id)
+        guard !demo else { return }
+        await pollUsage(activeStaleness: 120)
     }
     @discardableResult
     func apply(_ id: UUID, automatically: Bool = false) async -> Bool {
@@ -1212,12 +1212,6 @@ final class AppModel {
             }
             return
         }
-        // While the endpoint has asked Lilt to wait, the other accounts cannot be read; wait with it rather than
-        // give up on relaying.
-        if !demo, let until = usagePausedUntil, until > .now {
-            if due { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
-            return
-        }
         if let relayRetryAt, relayRetryAt > retryClock() { return }
         let policy = relayPolicy(soonerWeekly: early, requiredMargin: early || demo ? 0 : candidateMargin(active))
         if !demo {
@@ -1231,7 +1225,6 @@ final class AppModel {
                       let next = policy.nextRead(relayCandidates(policy, besides: active.id), leaving: self.active, asked: asked, readable: readable, at: .now) {
                     asked.insert(next.id)
                     await refresh(next.id)
-                    if let until = usagePausedUntil, until > .now { break }
                 }
             } else if let activeReset = snapshot.sevenDay?.resetsAt, activeReset > .now {
                 // Only a stored weekly reset that is already earlier can justify a read, and only a couple of them.
@@ -1244,11 +1237,6 @@ final class AppModel {
                 }
             }
             guard relayOperationValid(generation, active: active.id) else { return }
-            // A candidate query can start a global backoff after the check above.
-            if let until = usagePausedUntil, until > .now {
-                if due { waitForRelay(because: "额度接口要求稍后再查，恢复后自动重试。", until: until) }
-                return
-            }
         }
         // Decided on the newest reading of the account in use: readings that arrived during the reads are taken into
         // account, rather than making the hand-off give up and start over each time one comes in.
@@ -1344,7 +1332,7 @@ final class AppModel {
     /// Reads ahead the account a hand-off would take, and one fallback, so that one of them is still confirmed when the
     /// hand-off comes and it does not have to be read first (see `RelayPolicy.preparationRead`). At most every 15 seconds.
     private func prepareHandOff() async {
-        guard autoRelay, !demo, !busy, !relayRunning, let active, let usage = active.usage, (usagePausedUntil ?? .distantPast) <= .now,
+        guard autoRelay, !demo, !busy, !relayRunning, let active, let usage = active.usage,
               (relayRetryAt ?? .distantPast) <= retryClock(), Date.now.timeIntervalSince(preparedAt) >= 15 else { return }
         let seconds = paceAccount == active.id
             ? UsagePace.secondsToThreshold(usage, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: usage)) : nil
@@ -1364,6 +1352,23 @@ final class AppModel {
         let foreground = (NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "").lowercased()
         return ["terminal", "iterm", "warp", "orca", "ghostty", "kitty", "alacritty", "wezterm", "hyper", "tabby", "vscode", "cursor", "zed"].contains { foreground.contains($0) }
     }
+    private func pollUsage(activeStaleness: TimeInterval? = nil) async {
+        if let active {
+            let stale = activeStaleness.map { Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= $0 } ?? false
+            if forcePoll.remove(active.id) != nil || stale || UsagePolling.due(active, active: true, autoRelay: autoRelay, nearThreshold: nearThreshold, watching: watching, at: .now) {
+                await refresh(active.id)
+            }
+        }
+        let reserved = projectCatalog.reservedAccountIDs
+        let alternates = UsagePolling.refreshOrder(accounts.filter { $0.id != library.activeID && !reserved.contains($0.id) })
+        var reads = 0
+        for account in alternates where reads < UsagePolling.alternatesPerPass {
+            if forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: autoRelay, nearThreshold: false, watching: watching, at: .now) {
+                reads += 1
+                await refresh(account.id)
+            }
+        }
+    }
     private func tick() async {
         // Everything on screen that depends on time reads `clock`, and with sorting on so does the order of every
         // account, so each change redraws the whole window. The figures that depend on time change by the minute, so
@@ -1380,18 +1385,7 @@ final class AppModel {
             if writable { scopeCheckedAt = .now }
         }
         await checkStatusLine()
-        if let active {
-            // Readings from working sessions arrive with every response, and while they do the endpoint is not asked.
-            // With relay on and none in the last minute, the account in use is asked every 30 seconds, every 15 near
-            // the threshold, and a 429 pauses that (`usagePausedUntil`). With relay off it is 5 minutes while a
-            // terminal is in front and 15 otherwise, as ORCA does.
-            let window: TimeInterval = autoRelay ? 60 : 300
-            let fresh = active.usage.map { $0.source == UsageParser.statusLineSource && Date.now.timeIntervalSince($0.sampledAt) < window } ?? false
-            let interval: Double = autoRelay ? (nearThreshold ? 15 : 30) : (watching ? 300 : 900)
-            if forcePoll.remove(active.id) != nil || (!fresh && Date.now.timeIntervalSince(active.lastChecked ?? .distantPast) >= interval) {
-                await refresh(active.id)
-            }
-        }
+        await pollUsage()
         await pollProjects()
         if writable { await relay(); await prepareHandOff() }
     }
@@ -1444,10 +1438,8 @@ final class AppModel {
         }
         // Readings are a few minutes apart by design; only one that has not been renewed for over half an hour is worth a word.
         if let usage = active.usage, now.timeIntervalSince(usage.sampledAt) > 1800 {
-            let paused = (usagePausedUntil ?? .distantPast) > now
             return Notice(symbol: "clock", text: "额度是\(Wording.age(usage.sampledAt, now: now).replacingOccurrences(of: "更新", with: ""))的读数",
-                          detail: paused ? "额度接口要求稍后再查，\(Self.wait(until: usagePausedUntil!, from: now))后自动继续。" : "接力前会重新读取。",
-                          action: paused ? nil : .refresh(active.id))
+                          detail: "接力前会重新读取。", action: .refresh(active.id))
         }
         return nil
     }

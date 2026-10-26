@@ -373,6 +373,9 @@ struct AccountRow: View {
                         Label(issue, systemImage: "exclamationmark.circle").font(Typo.caption).foregroundStyle(Tone.danger.text)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    if let retry = model.usageRetryText(account.id) {
+                        Text("保留上次读数 · \(retry)").font(Typo.caption).foregroundStyle(Tokens.muted)
+                    }
                 }
                 Spacer(minLength: 8)
                 cells(summary)
