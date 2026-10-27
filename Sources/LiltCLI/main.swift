@@ -10,7 +10,7 @@ import Glibc
 import Musl
 #endif
 
-let version = "0.3.1"
+let version = "0.3.2"
 let paths = BackendPaths()
 let client = LocalSocketClient(paths: paths)
 
@@ -50,6 +50,7 @@ func printStatus(_ response: DaemonResponse) {
     guard let status = response.status else { return }
     if status.appliedPending { print("凭据已应用，等待会话验证：还没有会话报告新账号的额度。") }
     else if status.sessionConfirmed { print("至少一个会话已报告新账号的额度；其他并发会话是否已接续，Lilt 看不到。") }
+    if let retry = status.usageRetryAt { print("全部额度查询暂停至 \(retry.formatted(date: .omitted, time: .standard))，保留上次读数。") }
     for text in [status.message, status.relayPause, status.scopeIssue, status.scopeUnreadable, status.statusLineIssue, status.lastEvent] {
         if let text, !text.isEmpty { print(text) }
     }

@@ -55,6 +55,7 @@ public struct DaemonStatus: Codable, Sendable {
     public var message: String?
     public var relayPause: String?
     public var relayRetryAt: Date?
+    public var usageRetryAt: Date?
     public var scopeIssue: String?
     public var scopeUnreadable: String?
     public var statusLineIssue: String?
@@ -69,6 +70,7 @@ public struct DaemonStatus: Codable, Sendable {
         message: String? = nil,
         relayPause: String? = nil,
         relayRetryAt: Date? = nil,
+        usageRetryAt: Date? = nil,
         scopeIssue: String? = nil,
         scopeUnreadable: String? = nil,
         statusLineIssue: String? = nil,
@@ -81,6 +83,7 @@ public struct DaemonStatus: Codable, Sendable {
         self.message = message
         self.relayPause = relayPause
         self.relayRetryAt = relayRetryAt
+        self.usageRetryAt = usageRetryAt
         self.scopeIssue = scopeIssue
         self.scopeUnreadable = scopeUnreadable
         self.statusLineIssue = statusLineIssue

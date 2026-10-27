@@ -5,11 +5,17 @@ public enum UsagePolling {
     public static let idleActiveInterval: TimeInterval = 900
     public static let alternateInterval: TimeInterval = 300
     public static let idleAlternateInterval: TimeInterval = 600
+    public static let relayActiveInterval: TimeInterval = 180
+    public static let relayUrgentInterval: TimeInterval = 60
     public static let resetSlack: TimeInterval = 5
     public static let alternatesPerPass = 2
 
-    public static func interval(active: Bool, autoRelay: Bool, nearThreshold: Bool, watching: Bool) -> TimeInterval {
-        if autoRelay, active { return nearThreshold ? 15 : 30 }
+    public static func paceLifetime(of usage: UsageSnapshot) -> TimeInterval {
+        usage.source == UsageParser.statusLineSource ? 300 : relayActiveInterval
+    }
+
+    public static func interval(active: Bool, autoRelay: Bool, urgent: Bool, watching: Bool) -> TimeInterval {
+        if autoRelay, active { return urgent ? relayUrgentInterval : relayActiveInterval }
         if active { return watching ? activeInterval : idleActiveInterval }
         return watching ? alternateInterval : idleAlternateInterval
     }
@@ -21,7 +27,7 @@ public enum UsagePolling {
         }
     }
 
-    public static func due(_ account: Account, active: Bool, autoRelay: Bool, nearThreshold: Bool, watching: Bool, at now: Date) -> Bool {
+    public static func due(_ account: Account, active: Bool, autoRelay: Bool, urgent: Bool, watching: Bool, at now: Date) -> Bool {
         guard account.enabled, account.usageCapability != .unavailable else { return false }
         if resetNeedsRefresh(account.usage, lastChecked: account.lastChecked, at: now) { return true }
         if active, let usage = account.usage, usage.source == UsageParser.statusLineSource {
@@ -29,7 +35,7 @@ public enum UsagePolling {
             if now.timeIntervalSince(usage.sampledAt) < liveWindow { return false }
         }
         let age = now.timeIntervalSince(account.lastChecked ?? .distantPast)
-        return age < 0 || age >= interval(active: active, autoRelay: autoRelay, nearThreshold: nearThreshold, watching: watching)
+        return age < 0 || age >= interval(active: active, autoRelay: autoRelay, urgent: urgent, watching: watching)
     }
 
     public static func refreshOrder(_ accounts: [Account]) -> [Account] {

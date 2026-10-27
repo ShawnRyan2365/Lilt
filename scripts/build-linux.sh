@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-VERSION=${VERSION:-0.3.1}
+VERSION=${VERSION:-0.3.2}
 # SCRATCH lets a container build beside a macOS checkout without sharing its .build directory.
 SCRATCH=${SCRATCH:-.build}
 for pair in aarch64:arm64 x86_64:x86-64; do

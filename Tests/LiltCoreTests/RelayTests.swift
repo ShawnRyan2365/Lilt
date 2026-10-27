@@ -207,24 +207,32 @@ final class RelayTests {
     func testUsagePollingKeepsAlternatesAndResetsMoving() {
         var active = Account(label: "Active", kind: .oauth)
         active.lastChecked = now
-        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(29)))
-        expect(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(30)))
-        expect(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: true, watching: true, at: now.addingTimeInterval(15)))
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(179)))
+        expect(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(180)))
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, urgent: true, watching: true, at: now.addingTimeInterval(59)))
+        expect(UsagePolling.due(active, active: true, autoRelay: true, urgent: true, watching: true, at: now.addingTimeInterval(60)))
         var alternate = Account(label: "Alternate", kind: .oauth)
         alternate.lastChecked = now
-        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: true, at: now.addingTimeInterval(299)))
-        expect(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: true, at: now.addingTimeInterval(300)))
-        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(599)))
-        expect(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(600)))
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: true, at: now.addingTimeInterval(299)))
+        expect(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: true, at: now.addingTimeInterval(300)))
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: false, at: now.addingTimeInterval(599)))
+        expect(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: false, at: now.addingTimeInterval(600)))
         alternate.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(10)), sampledAt: now)
-        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(14)))
-        expect(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: false, at: now.addingTimeInterval(15)))
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: false, at: now.addingTimeInterval(14)))
+        expect(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: false, at: now.addingTimeInterval(15)))
         active.usage = UsageSnapshot(fiveHour: UsageWindow(used: 20), sampledAt: now, source: UsageParser.statusLineSource)
         active.lastChecked = now.addingTimeInterval(-3600)
-        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(59)))
-        expect(UsagePolling.due(active, active: true, autoRelay: true, nearThreshold: false, watching: true, at: now.addingTimeInterval(60)))
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(59)))
+        expect(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(60)))
+        let earlier = UsageSnapshot(fiveHour: UsageWindow(used: 90), sampledAt: now.addingTimeInterval(-240))
+        let latest = UsageSnapshot(fiveHour: UsageWindow(used: 98.8), sampledAt: now.addingTimeInterval(-120))
+        expectEqual(UsagePolling.paceLifetime(of: latest), 180)
+        let seconds = UsagePace.secondsToThreshold(latest, after: [earlier, latest], threshold: 1, at: now,
+                                                   lifetime: UsagePolling.paceLifetime(of: latest))
+        expect(seconds != nil && seconds! <= RelayPolicy.confirmLifetime)
+        expectEqual(UsagePolling.paceLifetime(of: active.usage!), 300)
         alternate.enabled = false
-        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, nearThreshold: false, watching: true, at: now.addingTimeInterval(3600)))
+        expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: true, at: now.addingTimeInterval(3600)))
     }
     func testParserRejectsMalformedAndBooleanUsage() throws {
         for json in ["{}", "{\"five_hour\":{\"utilization\":true}}", "{\"five_hour\":{\"utilization\":101}}", "{\"five_hour\":{\"utilization\":1,\"resets_at\":\"bad\"}}"] {

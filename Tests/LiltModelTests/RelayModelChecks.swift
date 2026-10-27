@@ -98,7 +98,7 @@ import LiltCore
         try await projectChecks()
         try await projectModelChecks()
         try transferStoreChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, manual retry vs server 429, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs global server 429 and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import. No live credentials or requests.")
     }
 }
 
@@ -350,7 +350,7 @@ import LiltCore
 }
 
 /// Quota reads use the account's own stored login, not the scope's keychain or lock. Temporary local failures do not
-/// become authentication failures; a person can retry through an ordinary backoff, but not through a server 429.
+/// become authentication failures; a person can retry through an ordinary backoff, but a server 429 pauses every account.
 @MainActor func refreshRecoveryChecks() async throws {
     let home = FileManager.default.homeDirectoryForCurrentUser
     precondition(home.path.contains("/work/"))
@@ -415,7 +415,15 @@ import LiltCore
     await model.refresh(active.id, manually: true)
     precondition(calls == 7 && model.status.contains("重试"), "A server 429 still blocks a manual retry")
     await model.refresh(spare.id, manually: true)
-    precondition(calls == 8 && model.status == "额度已更新", "One account's 429 must not pause another account")
+    precondition(calls == 7 && model.status.contains("限流"), "One account's 429 pauses every account, even for a manual retry")
+    await model.refresh(spare.id)
+    precondition(calls == 7, "Automatic candidate reads stop during the global 429 cooldown")
+    precondition(model.notice()?.detail?.contains("全部额度查询") == true)
+
+    model.library.accounts[0].usage = UsageSnapshot(fiveHour: UsageWindow(used: 100), sevenDay: UsageWindow(used: 20))
+    await model.relay()
+    precondition(model.active?.id == active.id && model.autoRelay && model.relayPause?.contains("限流") == true,
+                 "A global 429 holds relay instead of switching on an old candidate reading")
 }
 
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up

@@ -119,11 +119,13 @@ func testStatusLine() throws {
 }
 
 func testRefreshRecovery() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
     let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
     let a = credential("refresh-a"), b = credential("refresh-b")
     let snapshot = UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
     let usage = ScriptedUsage(snapshot: snapshot, scripts: [a.token!: [.network, nil], b.token!: [.rateLimited(120), nil]])
-    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), requestGap: 0)
+    let clock = Clock()
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), now: { clock.value }, requestGap: 0)
     let aID = try await engine.add(a, identity: identity("refresh-a"), label: "A", kind: .oauth)
     _ = try await engine.takeOver(label: nil)
     await Task.yield()
@@ -150,7 +152,13 @@ func testRefreshRecovery() async throws {
     expect(limitedCalls == 3, "manual refresh bypassed server 429")
     await engine.refresh(aID, manually: true)
     let independentCalls = await usage.calls
-    expect(independentCalls == 4, "one account's 429 paused every account")
+    expect(independentCalls == 3, "one account's 429 did not pause every account")
+    let limitedState = await engine.snapshot()
+    expect(limitedState.1.usageRetryAt == clock.value.addingTimeInterval(120), "daemon did not publish the global retry time")
+    clock.value = clock.value.addingTimeInterval(121)
+    await engine.refresh(aID, manually: true)
+    let recoveredCalls = await usage.calls
+    expect(recoveredCalls == 4, "queries did not recover after the global cooldown")
 }
 
 func testAlternatePolling() async throws {
