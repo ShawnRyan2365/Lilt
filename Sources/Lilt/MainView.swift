@@ -76,9 +76,15 @@ struct MainView: View {
         } message: { Text("仅删除 Lilt 保存的资料；不会向官方撤销授权。") }
         .confirmationDialog("\(model.scopeName)里的登录不是 Lilt 写的那一份", isPresented: $model.confirmingAdopt, titleVisibility: .visible) {
             Button("仍是“\(model.active?.label ?? "")”，采纳它") { model.adoptScopeCredential() }
+            if model.managesDefaultLogin {
+                // A `/login` to another account is the usual cause; keep that login as its own account.
+                Button("是另一个账号，存进 Lilt 并使用它") {
+                    Task { if let failure = await model.saveCurrentLogin(label: "") { model.message = failure } }
+                }
+            }
             Button("不是，改回“\(model.active?.label ?? "")”") { model.reclaimScope() }
             Button("取消", role: .cancel) {}
-        } message: { Text("在终端运行 claude 后用 /status 看当前是谁。采纳：把现在的登录存为这个账号的，替换原来保存的那份。改回：用 Lilt 保存的那份覆盖现在的登录。") }
+        } message: { Text("在终端运行 claude 后用 /status 看当前是谁。采纳：把现在的登录存为这个账号的，替换原来保存的那份。存进 Lilt：终端里登的是别的账号时选它，Lilt 先向官方确认是谁，再存成那个账号。改回：用 Lilt 保存的那份覆盖现在的登录。") }
         .confirmationDialog("检测到两份不同的登录", isPresented: $model.confirmingDual, titleVisibility: .visible) {
             Button("保留钥匙串登录") { model.resolveDualConflict(useFile: false) }
             Button("保留文件登录（可能切换账号）") { model.resolveDualConflict(useFile: true) }

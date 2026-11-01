@@ -2,19 +2,29 @@ import SwiftUI
 import LiltCore
 
 struct AddAccountView: View {
+    /// How the login is obtained. Saving the current login is a way in, not a kind of account: what it saves is a
+    /// browser login or a long-lived token like any other.
+    private enum Method: CaseIterable {
+        case browser, token, current
+        var title: String {
+            switch self { case .browser: AuthKind.oauth.title; case .token: AuthKind.setupToken.title; case .current: "当前登录" }
+        }
+    }
     @Bindable var model: AppModel
     let request: AddRequest
     @Environment(\.dismiss) private var dismiss
-    @State private var kind: AuthKind
+    @State private var method: Method
     @State private var label = ""
     @State private var token = ""
     @State private var code = ""
     @State private var saving = false
     @State private var failure: String?
     init(model: AppModel, request: AddRequest) {
-        _model = Bindable(model); self.request = request; _kind = State(initialValue: request.kind)
+        _model = Bindable(model); self.request = request; _method = State(initialValue: request.current && request.replacing == nil ? .current : request.kind == .oauth ? .browser : .token)
     }
     private var target: Account? { request.replacing.flatMap { id in model.accounts.first { $0.id == id } } }
+    /// Updating one account's authorization asks for a new login of it; whatever happens to be current is another matter.
+    private var methods: [Method] { target == nil ? Method.allCases : [.browser, .token] }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 12) {
@@ -24,30 +34,48 @@ struct AddAccountView: View {
                     if let target { Text("“\(target.label)” · 备注保持不变").font(Typo.caption).foregroundStyle(Tokens.muted) }
                 }
             }
-            Picker("授权方式", selection: $kind) { ForEach(AuthKind.allCases, id: \.self) { Text($0.title).tag($0) } }
-                .pickerStyle(.segmented).labelsHidden().disabled(model.loggingIn)
-            if kind == .oauth {
+            Picker("授权方式", selection: $method) { ForEach(methods, id: \.self) { Text($0.title).tag($0) } }
+                .pickerStyle(.segmented).labelsHidden().disabled(model.loggingIn || saving)
+            switch method {
+            case .browser:
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("在浏览器里用官方 Claude Code 登录，凭据只保存在这台 Mac 上，仅当前用户可读。")
+                    Text("用官方 Claude Code 登录。先拿到授权链接，再选在哪个浏览器打开；凭据只保存在这台 Mac 上，仅当前用户可读。")
                         .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
                     if model.loggingIn {
-                        HStack(spacing: 8) { ProgressView().controlSize(.small); Text("等待浏览器授权，最多 3 分钟…").font(Typo.caption) }
+                        if let link = model.loginLink {
+                            LoginLinkBox(link: link)
+                            Text("登录要保存的那个账号，授权后网页会给一串授权码，粘贴到下面。最多等 3 分钟。")
+                                .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            HStack(spacing: 8) { ProgressView().controlSize(.small); Text("正在向官方 CLI 要授权链接…").font(Typo.caption) }
+                        }
                         HStack(spacing: 8) {
-                            SecureField("如浏览器给了授权码，在此输入", text: $code).textFieldStyle(.roundedBorder).onSubmit(submitCode)
+                            SecureField("粘贴网页给的授权码", text: $code).textFieldStyle(.roundedBorder).onSubmit(submitCode)
                             Button("提交", action: submitCode).buttonStyle(.lilt(.secondary, size: .small)).disabled(code.isEmpty)
                         }
                     }
                 }
-            } else {
+            case .current:
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("把这台 Mac 上 Claude Code 正在用的登录存进 Lilt，就是终端里 \(Text("/\u{2060}login").font(.system(size: 12, design: .monospaced)).foregroundStyle(Tokens.ink)) 登进去的那个账号。")
+                        .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+                    if model.managesDefaultLogin {
+                        Text("Lilt 正在管理默认登录：保存后它就是正在使用的账号。Lilt 里已有的同一个账号只更新授权，不重复添加。")
+                            .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        InlineNote(text: "Lilt 还没接管默认登录，存进来的是一份副本，和终端共用同一个续期凭据。以后哪边先续期，另一边就要重新登录。想避免，先接管默认登录。")
+                    }
+                }
+            case .token:
                 VStack(alignment: .leading, spacing: 8) {
                     SecureField("粘贴 OAuth Token", text: $token).textFieldStyle(.roundedBorder)
                     Text("在终端运行 \(Text("claude setup-token").font(.system(size: 11, design: .monospaced)).foregroundStyle(Tokens.ink)) 获取。长效 Token 的额度查询和热切换可能受限，保存不代表验证通过。")
                         .font(Typo.caption).foregroundStyle(Tokens.muted).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if target == nil { TextField("备注（可选），例如：日常创作", text: $label).textFieldStyle(.roundedBorder).disabled(model.loggingIn) }
+            if target == nil { TextField("备注（可选），例如：日常创作", text: $label).textFieldStyle(.roundedBorder).disabled(model.loggingIn || saving) }
             // Swapping a full login for a long-lived token is a downgrade; say what is lost before it happens.
-            if let target, target.kind == .oauth, kind == .setupToken {
+            if let target, target.kind == .oauth, method == .token {
                 InlineNote(text: "“\(target.label)”现在是浏览器登录。换成长效 Token 后，它将看不到额度，也不能参与自动接力。")
             }
             if let failure { InlineNote(text: failure) }
@@ -56,17 +84,20 @@ struct AddAccountView: View {
                 Spacer()
                 Button(model.loggingIn ? "取消授权" : "取消") { model.login.cancel(); if !model.loggingIn { token = ""; dismiss() } }
                     .buttonStyle(.lilt(.ghost)).keyboardShortcut(.cancelAction)
-                Button(kind == .oauth ? "打开浏览器" : "保存 Token") {
+                Button(method == .browser ? "获取授权链接" : method == .token ? "保存 Token" : "保存当前登录") {
                     saving = true; failure = nil
                     Task {
-                        let error = kind == .oauth ? await model.browserLogin(label: label, replacing: request.replacing)
-                                                   : await model.addToken(label: label, token: token, replacing: request.replacing)
+                        let error = switch method {
+                        case .browser: await model.browserLogin(label: label, replacing: request.replacing)
+                        case .token: await model.addToken(label: label, token: token, replacing: request.replacing)
+                        case .current: await model.saveCurrentLogin(label: label)
+                        }
                         token = ""; code = ""; saving = false
                         if let error { failure = error } else { dismiss() }
                     }
                 }
                 .buttonStyle(.lilt(.primary)).keyboardShortcut(.defaultAction)
-                .disabled(saving || model.loggingIn || (kind == .setupToken && token.isEmpty) || !model.canAdd)
+                .disabled(saving || model.loggingIn || (method == .token && token.isEmpty) || !model.canAdd)
             }
         }
         .padding(24).frame(width: 440).tint(Tokens.accentTint)
@@ -76,6 +107,30 @@ struct AddAccountView: View {
     private func submitCode() {
         guard !code.isEmpty else { return }
         model.login.submitCode(code); code = ""
+    }
+}
+/// The sign-in link the official CLI printed, with the two things to do with it: open it here, or copy it into a
+/// browser that is signed in to the account wanted. The link is only shown; nothing writes it down.
+private struct LoginLinkBox: View {
+    let link: URL
+    @State private var copied = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(link.absoluteString)
+                .font(.system(size: 11, design: .monospaced)).foregroundStyle(Tokens.ink)
+                .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 8) {
+                Button("在默认浏览器打开") { NSWorkspace.shared.open(link) }.buttonStyle(.lilt(.primary, size: .small))
+                Button(copied ? "已拷贝" : "拷贝链接") {
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(link.absoluteString, forType: .string)
+                    copied = true
+                }
+                .buttonStyle(.lilt(.secondary, size: .small))
+                Spacer()
+            }
+        }
+        .padding(10).background(Tokens.fill, in: RoundedRectangle(cornerRadius: Radius.field, style: .continuous))
     }
 }
 extension View {

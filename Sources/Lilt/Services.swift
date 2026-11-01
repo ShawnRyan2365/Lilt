@@ -151,8 +151,18 @@ final class CLILogin {
     }
     func submitCode(_ code: String) { try? input?.fileHandleForWriting.write(contentsOf: Data((code + "\n").utf8)) }
     func cancel() { cancelled = true; if process?.isRunning == true { process?.terminate() } }
+    /// What the CLI has printed so far, kept only in memory until the sign-in link has been found in it.
+    private final class Output: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        func append(_ chunk: Data) { lock.withLock { if data.count < 65_536 { data.append(chunk) } } }
+        var text: String { lock.withLock { String(decoding: data, as: UTF8.self) } }
+        func clear() { lock.withLock { data = Data() } }
+    }
     /// The login and, when the CLI recorded it, whose login it is (`oauthAccount` from the temporary config).
-    func login() async throws -> (credential: Credential, identity: Data?) {
+    /// `onLink` receives the sign-in link the CLI prints. The CLI is asked not to open a browser itself, so the user
+    /// chooses where the link is opened: the default browser, or another one already signed in to the wanted account.
+    func login(onLink: @escaping @MainActor (URL) -> Void) async throws -> (credential: Credential, identity: Data?) {
         guard process == nil, let executable = Self.executable else { throw AppFailure("未找到官方 Claude Code CLI，或授权已在进行。") }
         cancelled = false
         let temp = Disk.root.appendingPathComponent("login-\(UUID().uuidString)")
@@ -170,15 +180,21 @@ final class CLILogin {
         env["CLAUDE_CONFIG_DIR"] = temp.path
         env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = temp.path
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        // The CLI opens its sign-in page with $BROWSER when set; a command that does nothing leaves that to the user.
+        // (Claude Code 2.1.316, read from its code.) A CLI that ignores it still opens the default browser as before.
+        env["BROWSER"] = "/usr/bin/true"
         p.environment = env; p.currentDirectoryURL = temp
         p.standardInput = stdin; p.standardOutput = stdout; p.standardError = stdout
-        // Drain and discard CLI output: never log OAuth URLs, codes, or credentials.
-        stdout.fileHandleForReading.readabilityHandler = { handle in _ = handle.availableData }
-        defer { stdout.fileHandleForReading.readabilityHandler = nil }
+        // CLI output is read only for the sign-in link and never logged: it can carry OAuth URLs and codes.
+        let output = Output()
+        stdout.fileHandleForReading.readabilityHandler = { handle in output.append(handle.availableData) }
+        defer { stdout.fileHandleForReading.readabilityHandler = nil; output.clear() }
+        var linked = false
         process = p; input = stdin
         do { try p.run() } catch { throw AppFailure("无法启动官方登录命令。") }
         let deadline = Date.now.addingTimeInterval(180)
         while p.isRunning {
+            if !linked, let link = LoginLink.find(in: output.text) { linked = true; output.clear(); onLink(link) }
             if Date.now >= deadline { cancel() }
             if Date.now.timeIntervalSince(deadline) > 2 { kill(p.processIdentifier, SIGKILL) }
             try? await Task.sleep(for: .milliseconds(200))

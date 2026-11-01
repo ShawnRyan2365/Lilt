@@ -22,6 +22,8 @@ struct AddRequest: Identifiable {
     let id = UUID()
     var replacing: UUID?
     var kind: AuthKind = .oauth
+    /// Opens on saving the current login rather than on a way of authorizing anew.
+    var current = false
 }
 /// The one thing the user most needs to know about the applied account, with the next step when there is one.
 struct Notice: Equatable {
@@ -60,6 +62,8 @@ final class AppModel {
     var loading = false
     var busy = false
     var loggingIn = false
+    /// The sign-in link of the browser login under way, once the CLI has printed it. Shown, never logged or saved.
+    var loginLink: URL?
     private(set) var autoRelay = false
     var status = "准备就绪"
     var message: String?
@@ -533,10 +537,12 @@ final class AppModel {
         return failure
     }
     private func login(label: String, replacing id: UUID?) async -> String? {
-        busy = true; loggingIn = true; status = "请在浏览器完成官方授权"
-        defer { busy = false; loggingIn = false }
+        busy = true; loggingIn = true; loginLink = nil; status = "正在向官方 CLI 要授权链接"
+        defer { busy = false; loggingIn = false; loginLink = nil }
         do {
-            let (credential, recorded) = try await login.login()
+            let (credential, recorded) = try await login.login { [weak self] link in
+                self?.loginLink = link; self?.status = "请打开授权链接完成官方授权"
+            }
             // Normally the CLI has written it down; if not, the profile endpoint says whose login this is.
             let identity = if let recorded { recorded } else { await IdentityClient().fetch(credential) }
             // The browser decides which account signs in. Two entries for one Claude account share one quota,
@@ -1000,6 +1006,94 @@ final class AppModel {
         } else {
             library.activeID = nil; save(); status = "已接管默认登录"
         }
+    }
+    /// Saves Claude Code's default login, as `/login` in a terminal left it, as one of Lilt's accounts. Returns the
+    /// reason when nothing was saved. While Lilt manages the default login, the account found there becomes the one
+    /// in use: that is what the CLI is running on, and it ends the pause a login from elsewhere caused. Otherwise the
+    /// login is copied and the default login is left as it is.
+    func saveCurrentLogin(label: String) async -> String? {
+        guard canAdd else { return "当前无法保存凭据。" }
+        let scope = fixtureRuntime ?? RuntimeScope(target: .system)
+        let managing = managesDefaultLogin, reserved = projectCatalog.reservedAccountIDs
+        busy = true; status = "正在读取当前登录…"
+        defer { busy = false }
+        var saved: (id: UUID, record: Data?, recorded: Data?)?
+        do {
+            let failure: String? = try await exclusively {
+                let current = try await Self.patiently {
+                    try await IOQueue.run { () throws -> (Credential, Data?, RuntimeScope.DualAuthority)? in
+                        let key = try scope.currentCredential(), file = try scope.fileCredential()
+                        if let key, let file, key.data != file.data { throw DualRuntimeConflict() }
+                        guard let found = key ?? file else { return nil }
+                        try found.validate()
+                        return (found, scope.readIdentity(), key != nil ? .keychain : .file)
+                    }
+                }
+                guard let (credential, recorded, authority) = current else {
+                    return "Claude Code 现在没有登录。先在终端运行 claude 并用 /login 登录，再回来保存。"
+                }
+                let ids = accounts.map(\.id)
+                let identical = await IOQueue.perform {
+                    ids.first { AccountVault.hasFile(account: $0.uuidString) && (try? AccountVault.read(account: $0.uuidString)) == credential.data }
+                }
+                let kept = accounts.map { (id: $0.id, identity: OAuthDocument.Identity(oauthAccount: identity(for: $0.id))) }
+                // The profile endpoint says whose login this is; the config beside it only says who last claimed it.
+                let verified = await IdentityClient().fetch(credential)
+                let plan = CurrentLoginPlan.decide(identical: identical, verified: verified.map { OAuthDocument.Identity(oauthAccount: $0) },
+                                                   recorded: OAuthDocument.Identity(oauthAccount: recorded), kept: kept)
+                let labels = Dictionary(accounts.map { ($0.id, $0.label) }, uniquingKeysWith: { first, _ in first })
+                func name(_ id: UUID) -> String { labels[id] ?? "已有账号" }
+                let record = CurrentLoginPlan.identityRecord(verified: verified, recorded: recorded)
+                let kind: AuthKind = credential.refreshable ? .oauth : .setupToken
+                let id: UUID
+                switch plan {
+                case .unconfirmed(let owner):
+                    return "暂时确认不了这份登录是谁的（官方资料接口没有回应）。它看起来是“\(name(owner))”，为免存错名下，这次没有保存，稍后再试。"
+                case .alreadySaved(let owner), .replaces(let owner):
+                    // A project's account stays out of the default login; its login lives in the project's own scope.
+                    if reserved.contains(owner) {
+                        return "这是固定给项目的“\(name(owner))”。项目账号不进默认登录，请到项目页更新它的授权。"
+                    }
+                    if case .alreadySaved = plan, !managing || (owner == library.activeID && scopeIssue == nil) {
+                        return "这份登录已经保存为“\(name(owner))”，不用再存。"
+                    }
+                    if case .replaces = plan { try store(credential, label: "", kind: kind, replacing: owner, identity: record) }
+                    id = owner
+                case .new:
+                    try store(credential, label: label.isEmpty ? "当前登录" : label, kind: kind, identity: record)
+                    guard let added = accounts.last?.id else { throw AppFailure("账号资料写入失败。") }
+                    id = added
+                }
+                if managing {
+                    try await Self.patiently { try await IOQueue.run {
+                        if authority == .file { try scope.resolveDual(using: .file, expected: credential) } else { try scope.rebaseline() }
+                    } }
+                }
+                saved = (id, record, recorded)
+                return nil
+            }
+            if let failure { status = "当前登录未保存"; return failure }
+        } catch let conflict as DualRuntimeConflict {
+            if managing { noteDualConflict(conflict) }
+            status = "当前登录未保存"; return conflict.message
+        } catch {
+            status = "当前登录未保存"
+            return Self.reason(error).map { $0 + "当前登录没有改动。" } ?? "无法保存当前登录，当前登录没有改动。"
+        }
+        guard let saved else { return nil }
+        if managing {
+            library.activeID = saved.id
+            dualConflict = false; scopeIssue = nil; scopeUnreadable = nil; scopeUnreadableSince = nil
+            latch = RelayLatch(); appliedPending = false
+            updatePreferences { $0.autoRelayStopReason = nil }
+            relayPause = library.preferences.autoRelay == true ? nil : library.preferences.autoRelayStopReason
+            // The CLI's own record stays unless it named someone else.
+            if saved.record != saved.recorded, let record = saved.record { await IOQueue.perform { try? scope.writeIdentity(record) } }
+            if liveUsageEnabled, let label = active?.label { await IOQueue.perform { StatusLineBridge.setLabel(label) } }
+        }
+        status = managing ? "已保存当前登录，并作为正在使用的账号" : "已保存当前登录"
+        await refresh(saved.id)
+        return nil
     }
     func resolveDualConflict(useFile: Bool) {
         guard !demo, !busy, storageAvailable else { return }
