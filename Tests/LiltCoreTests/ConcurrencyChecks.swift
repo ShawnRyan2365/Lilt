@@ -244,7 +244,10 @@ final class ConcurrencyChecks: Sendable {
         func identity(_ name: String) -> Data { try! JSONSerialization.data(withJSONObject: ["accountUuid": "fixture-stable-\(name)"]) }
         let existing = Account(label: "Fixture existing", kind: .oauth)
         var base = Library(); base.accounts = [existing]; base.activeID = existing.id; base.preferences.autoRelay = true
-        try SecureFiles.write(login("existing"), to: secrets.appendingPathComponent(existing.id.uuidString))
+        // Encoded once: JSONSerialization's key order changes from call to call, so a second encoding of the same
+        // login is not the same bytes and would count as a different login.
+        let existingLogin = login("existing")
+        try SecureFiles.write(existingLogin, to: secrets.appendingPathComponent(existing.id.uuidString))
         try SecureFiles.write(identity("existing"), to: secrets.appendingPathComponent(CredentialImport.identityName(existing.id)))
         // JSONEncoder's key order is not stable from one call to the next, so the bytes on disk are the reference.
         let baseBytes = try JSONEncoder().encode(base)
@@ -263,7 +266,7 @@ final class ConcurrencyChecks: Sendable {
         expectThrows(try plan([TransferItem(localID: UUID(), label: "  ", kind: .oauth, credential: login("blank"))], base))
         var twin = oauth; twin.localID = UUID()
         expectThrows(try plan([oauth, twin], base))
-        let sameID = TransferItem(localID: existing.id, label: "x", kind: .oauth, credential: login("existing"))
+        let sameID = TransferItem(localID: existing.id, label: "x", kind: .oauth, credential: existingLogin)
         let clash = TransferItem(localID: existing.id, label: "x", kind: .oauth, credential: login("newer-elsewhere"))
         let sameAccount = TransferItem(localID: UUID(), label: "x", kind: .oauth, credential: login("copy"), identity: identity("existing"))
         let decided = try plan([oauth, token, sameID, sameAccount], base)
