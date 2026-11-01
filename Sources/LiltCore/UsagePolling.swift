@@ -3,8 +3,8 @@ import Foundation
 public enum UsagePolling {
     public static let activeInterval: TimeInterval = 300
     public static let idleActiveInterval: TimeInterval = 900
-    public static let alternateInterval: TimeInterval = 300
-    public static let idleAlternateInterval: TimeInterval = 600
+    public static let alternateInterval: TimeInterval = 1800
+    public static let idleAlternateInterval: TimeInterval = 3600
     public static let relayActiveInterval: TimeInterval = 180
     public static let relayUrgentInterval: TimeInterval = 60
     public static let resetSlack: TimeInterval = 5

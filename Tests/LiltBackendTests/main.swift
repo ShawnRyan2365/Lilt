@@ -174,10 +174,11 @@ func testAlternatePolling() async throws {
     _ = try await engine.add(b, identity: identity("poll-b"), label: "B", kind: .oauth)
     await engine.refreshAll()
     await usage.reset([:])
-    clock.value = clock.value.addingTimeInterval(599)
+    clock.value = clock.value.addingTimeInterval(3599)
     await engine.tick()
     var calls = await usage.calls
-    expect(calls == 0, "alternate refreshed before its cadence: \(calls)")
+    expect(calls == 1, "alternate refreshed before its cadence, or the active account did not refresh: \(calls)")
+    await usage.reset([:])
     clock.value = clock.value.addingTimeInterval(1)
     await engine.tick()
     calls = await usage.calls
