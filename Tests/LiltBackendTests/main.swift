@@ -185,6 +185,32 @@ func testAlternatePolling() async throws {
     expect(calls == 1, "alternate was left stale at its scheduled poll: \(calls)")
 }
 
+func testExhaustedPollingWaitsForReset() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
+    let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+    let a = credential("spent-a"), b = credential("spent-b")
+    let clock = Clock()
+    let snapshot = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: clock.value.addingTimeInterval(3600)),
+                                 sevenDay: UsageWindow(used: 100, resetsAt: clock.value.addingTimeInterval(10800)), sampledAt: clock.value)
+    let usage = ScriptedUsage(snapshot: snapshot, scripts: [:])
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), now: { clock.value }, requestGap: 0)
+    let aID = try await engine.add(a, identity: identity("spent-a"), label: "A", kind: .oauth)
+    _ = try await engine.takeOver(label: nil)
+    let bID = try await engine.add(b, identity: identity("spent-b"), label: "B", kind: .oauth)
+    await engine.refreshAll()
+    await usage.reset([:])
+    clock.value = clock.value.addingTimeInterval(7200)
+    await engine.tick()
+    await engine.refresh(aID)
+    await engine.refresh(bID)
+    var calls = await usage.calls
+    expect(calls == 0, "an exhausted account was polled before every known exhausted window reset: \(calls)")
+    clock.value = clock.value.addingTimeInterval(3605)
+    await engine.tick()
+    calls = await usage.calls
+    expect(calls == 2, "accounts did not resume polling after their exhausted windows reset: \(calls)")
+}
+
 func testFreshServerTakeover() async throws {
     let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
     let engine = try HeadlessEngine(store: store, usageClient: FakeUsage(snapshots: [:]), identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), requestGap: 0)
@@ -244,6 +270,7 @@ try testSecureRuntime()
 try testStatusLine()
 try await testRefreshRecovery()
 try await testAlternatePolling()
+try await testExhaustedPollingWaitsForReset()
 try await testFreshServerTakeover()
 try await testAutomaticRelay()
 try await testProjects()
@@ -251,4 +278,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (13 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, alternate polling, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (14 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, alternate polling, exhausted polling reset, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

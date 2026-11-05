@@ -67,7 +67,7 @@ public actor HeadlessEngine {
     private var sessionConfirmed = false
     private var apiModeDetected = false
     private var switching = false
-    /// Status line events went missing; the next pass asks the endpoint whatever the cadence says.
+    /// Status line events went missing; the next pass asks the endpoint unless exhaustion says to wait.
     private var forcePoll: Set<UUID> = []
     private var liveGap = false
     private var projectBusy: Set<UUID> = []
@@ -393,6 +393,7 @@ public actor HeadlessEngine {
     public func refresh(_ id: UUID, manually: Bool = false) async {
         if switching { if manually { message = "正在切换账号，完成后即可刷新" }; return }
         if pauseForRateLimit(manually: manually) { return }
+        if !manually, let account = account(id), UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: now()) { return }
         if let running = refreshTasks[id] {
             await running.value
             if refreshTasks[id] == running { refreshTasks[id] = nil }
@@ -724,7 +725,7 @@ public actor HeadlessEngine {
         if writable { await relay(); await prepareHandOff() }
     }
     /// Project accounts never relay, so they are read only to show where they stand: when sessions have not reported
-    /// for a while, at the idle pace, or at once after events went missing.
+    /// for a while, at the idle pace, or after events went missing, unless a known exhausted window is awaiting reset.
     private func pollProjects() async {
         var reads = 0
         for project in projects.projects where project.phase == .ready && reads < 2 {

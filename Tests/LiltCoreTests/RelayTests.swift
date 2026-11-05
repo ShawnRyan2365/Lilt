@@ -231,6 +231,20 @@ final class RelayTests {
                                                    lifetime: UsagePolling.paceLifetime(of: latest))
         expect(seconds != nil && seconds! <= RelayPolicy.confirmLifetime)
         expectEqual(UsagePolling.paceLifetime(of: active.usage!), 300)
+        var exhausted = Account(label: "Exhausted", kind: .oauth)
+        exhausted.lastChecked = now
+        exhausted.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(1800)),
+                                        sevenDay: UsageWindow(used: 100, resetsAt: now.addingTimeInterval(7200)), sampledAt: now)
+        expect(UsagePolling.waitingForExhaustionReset(exhausted, threshold: 1, at: now.addingTimeInterval(3600)))
+        expect(UsagePolling.waitingForExhaustionReset(exhausted, threshold: 1, at: now.addingTimeInterval(5400)))
+        expectFalse(UsagePolling.waitingForExhaustionReset(exhausted, threshold: 1, at: now.addingTimeInterval(7205)))
+        expect(UsagePolling.due(exhausted, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(7205)))
+        exhausted.usage?.fiveHour = UsageWindow(used: 95, resetsAt: now.addingTimeInterval(1800))
+        exhausted.usage?.sevenDay = UsageWindow(used: 20)
+        expectFalse(UsagePolling.waitingForExhaustionReset(exhausted, threshold: 1, at: now))
+        expect(UsagePolling.waitingForExhaustionReset(exhausted, threshold: Thresholds(fiveHour: 10, sevenDay: 1), at: now))
+        exhausted.usage?.sevenDay = UsageWindow(used: 100)
+        expectFalse(UsagePolling.waitingForExhaustionReset(exhausted, threshold: 1, at: now))
         alternate.enabled = false
         expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: true, at: now.addingTimeInterval(3600)))
     }

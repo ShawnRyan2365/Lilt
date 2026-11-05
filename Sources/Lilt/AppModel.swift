@@ -111,7 +111,7 @@ final class AppModel {
     /// requests of any account start two seconds apart.
     private let spacing = RequestSpacing()
     private var refreshes: [UUID: Task<Void, Never>] = [:]
-    /// Status line events went missing for these accounts; their next pass asks the endpoint whatever the cadence.
+    /// Status line events went missing for these accounts; their next pass asks the endpoint unless exhaustion says to wait.
     private var forcePoll: Set<UUID> = []
     /// Live quota from Claude Code's status line (see `StatusLineBridge`).
     var liveUsageEnabled: Bool { library.preferences.liveUsage != false }
@@ -772,6 +772,8 @@ final class AppModel {
             return
         }
         if pauseForRateLimit() { return }
+        if !manually, let account = accounts.first(where: { $0.id == id }),
+           UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: .now) { return }
         // A request already out for this account answers this one too. Manual refresh may override an ordinary
         // backoff, never a server 429.
         if let running = refreshes[id] {
@@ -1870,7 +1872,7 @@ extension AppModel {
     }
 
     /// Project accounts never relay, so they are read only to show where they stand: when sessions have not reported
-    /// for a while, at the idle pace, or at once after events went missing.
+    /// for a while, at the idle pace, or after events went missing, unless a known exhausted window is awaiting reset.
     private func pollProjects() async {
         var reads = 0
         for project in projectCatalog.projects where project.phase == .ready && reads < 2 {

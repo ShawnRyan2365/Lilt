@@ -89,6 +89,7 @@ import LiltCore
         try await interruptedSwitchChecks()
         try await dualModelChecks()
         try await refreshRecoveryChecks()
+        try await exhaustedRefreshChecks()
         try await emptyFileTakeoverCheck()
         try fileRuntimeChecks()
         try runtimeChecks()
@@ -424,6 +425,42 @@ import LiltCore
     await model.relay()
     precondition(model.active?.id == active.id && model.autoRelay && model.relayPause?.contains("限流") == true,
                  "A global 429 holds relay instead of switching on an old candidate reading")
+}
+
+/// Automatic entry points do not keep asking an account whose quota is already known to be exhausted.
+@MainActor func exhaustedRefreshChecks() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    precondition(home.path.contains("/work/"))
+    let fiveReset = Date.now.addingTimeInterval(3600), sevenReset = Date.now.addingTimeInterval(10800)
+    func spent(_ label: String) -> Account {
+        var account = Account(label: label, kind: .oauth)
+        account.usageCapability = .verified
+        account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: fiveReset),
+                                      sevenDay: UsageWindow(used: 100, resetsAt: sevenReset))
+        return account
+    }
+    let active = spent("Fixture spent A"), spare = spent("Fixture spent B")
+    var library = Library()
+    library.accounts = [active, spare]; library.activeID = active.id
+    library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system
+    let login = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-spent-access", "refreshToken": "fixture-spent-refresh"]])
+    try AccountVault.write(login, account: active.id.uuidString)
+    try AccountVault.write(login, account: spare.id.uuidString)
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: { nil }, write: { _ in }, delete: { }))
+    var calls = 0
+    let model = AppModel(fixture: library, runtime: scope, usageFetch: { _ in
+        calls += 1
+        return UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: fiveReset), sevenDay: UsageWindow(used: 100, resetsAt: sevenReset))
+    })
+    await model.refresh(active.id)
+    await model.refresh(spare.id)
+    precondition(calls == 0, "Automatic refreshes must not poll exhausted accounts")
+    await model.refresh(active.id, manually: true)
+    precondition(calls == 1, "An explicit manual refresh must remain available")
+    model.library.accounts[0].usage?.fiveHour?.resetsAt = .distantPast
+    model.library.accounts[0].usage?.sevenDay?.resetsAt = .distantPast
+    await model.refresh(active.id)
+    precondition(calls == 2, "Automatic refresh must resume after the exhausted windows reset")
 }
 
 /// With every other account used up, relay waits for the first one to get its quota back and tries again then, not up

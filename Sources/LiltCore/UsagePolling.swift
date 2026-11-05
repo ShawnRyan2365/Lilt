@@ -27,6 +27,12 @@ public enum UsagePolling {
         }
     }
 
+    /// A known exhausted account cannot qualify before every exhausted window with a known reset has rolled over.
+    public static func waitingForExhaustionReset(_ account: Account, threshold: Thresholds, at now: Date) -> Bool {
+        guard let usage = account.usage, usage.remainsExhausted(threshold: threshold, at: now) else { return false }
+        return RelayPolicy(threshold: threshold).nextReset(of: [account], at: now) != nil
+    }
+
     public static func due(_ account: Account, active: Bool, autoRelay: Bool, urgent: Bool, watching: Bool, at now: Date) -> Bool {
         guard account.enabled, account.usageCapability != .unavailable else { return false }
         if resetNeedsRefresh(account.usage, lastChecked: account.lastChecked, at: now) { return true }
