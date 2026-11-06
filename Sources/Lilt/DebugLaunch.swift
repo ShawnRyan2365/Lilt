@@ -34,8 +34,8 @@ enum DebugLaunch {
     /// LILT_AUTOSORT=1 (automatic relay order), LILT_UPDATE=available|downloading|installing|failed|current (an update
     /// state with a fictional release), LILT_UPDATE=check|install (asks GitHub, and installs what it finds).
     /// LILT_UPDATE_FROM and LILT_UPDATE_TARGET are read by `Updater` itself.
-    /// LILT_ADD=browser|current|link opens the add-account sheet on that way in; `link` shows a fictional sign-in link
-    /// as if a browser login were waiting for its code. Nothing is started and its buttons stay off in demo mode.
+    /// LILT_ADD=browser|current|credential|link opens the add-account sheet on that way in; `link` shows a fictional
+    /// sign-in link as if a browser login were waiting for its code. Nothing is started and its buttons stay off in demo mode.
     @MainActor static func apply(to model: AppModel) {
         let environment = ProcessInfo.processInfo.environment
         if let look = environment["LILT_APPEARANCE"] { NSApp.appearance = NSAppearance(named: look == "dark" ? .darkAqua : .aqua) }
@@ -66,7 +66,7 @@ enum DebugLaunch {
         }
         if environment["LILT_PENDING"] == "1" { model.appliedPending = true }
         if let way = environment["LILT_ADD"] {
-            model.addRequest = AddRequest(kind: .oauth, current: way == "current")
+            model.addRequest = AddRequest(kind: .oauth, current: way == "current", credential: way == "credential")
             if way == "link" {
                 model.loggingIn = true
                 model.loginLink = URL(string: "https://claude.ai/oauth/authorize?code=true&client_id=fixture-client&state=fixture-state")

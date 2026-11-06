@@ -99,7 +99,8 @@ import LiltCore
         try await projectChecks()
         try await projectModelChecks()
         try transferStoreChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs global server 429 and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import. No live credentials or requests.")
+        try await oauthImportChecks()
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs global server 429 and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import. No live credentials or requests.")
     }
 }
 

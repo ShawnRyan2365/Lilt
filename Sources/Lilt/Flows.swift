@@ -1,13 +1,18 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import LiltCore
 
 struct AddAccountView: View {
-    /// How the login is obtained. Saving the current login is a way in, not a kind of account: what it saves is a
-    /// browser login or a long-lived token like any other.
+    /// How the login is obtained. Saving the current login or importing a file is a way in, not a kind of account.
     private enum Method: CaseIterable {
-        case browser, token, current
+        case browser, token, current, credential
         var title: String {
-            switch self { case .browser: AuthKind.oauth.title; case .token: AuthKind.setupToken.title; case .current: "当前登录" }
+            switch self {
+            case .browser: AuthKind.oauth.title
+            case .token: AuthKind.setupToken.title
+            case .current: "当前登录"
+            case .credential: "导入凭证"
+            }
         }
     }
     @Bindable var model: AppModel
@@ -17,14 +22,24 @@ struct AddAccountView: View {
     @State private var label = ""
     @State private var token = ""
     @State private var code = ""
+    @State private var credentialFile: URL?
     @State private var saving = false
     @State private var failure: String?
     init(model: AppModel, request: AddRequest) {
-        _model = Bindable(model); self.request = request; _method = State(initialValue: request.current && request.replacing == nil ? .current : request.kind == .oauth ? .browser : .token)
+        let initial: Method = request.credential && request.replacing == nil ? .credential : request.current && request.replacing == nil ? .current : request.kind == .oauth ? .browser : .token
+        _model = Bindable(model); self.request = request; _method = State(initialValue: initial)
     }
     private var target: Account? { request.replacing.flatMap { id in model.accounts.first { $0.id == id } } }
     /// Updating one account's authorization asks for a new login of it; whatever happens to be current is another matter.
-    private var methods: [Method] { target == nil ? Method.allCases : [.browser, .token] }
+    private var methods: [Method] { target == nil ? Method.allCases : [.browser, .token, .credential] }
+    private var saveTitle: String {
+        switch method {
+        case .browser: "获取授权链接"
+        case .token: "保存 Token"
+        case .current: "保存当前登录"
+        case .credential: "导入凭证"
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 12) {
@@ -72,6 +87,22 @@ struct AddAccountView: View {
                     Text("在终端运行 \(Text("claude setup-token").font(.system(size: 11, design: .monospaced)).foregroundStyle(Tokens.ink)) 获取。长效 Token 的额度查询和热切换可能受限，保存不代表验证通过。")
                         .font(Typo.caption).foregroundStyle(Tokens.muted).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                 }
+            case .credential:
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("选择官方 Claude Code 的 .credentials.json 文件。必须同时包含 accessToken 和 refreshToken，会作为完整 OAuth 登录保存。")
+                        .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        Button(credentialFile == nil ? "选择 JSON 文件…" : "重新选择…", action: chooseCredentialFile)
+                            .buttonStyle(.lilt(.secondary, size: .small)).disabled(saving)
+                        if let credentialFile {
+                            Label(credentialFile.lastPathComponent, systemImage: "checkmark.circle.fill")
+                                .font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(1).truncationMode(.middle)
+                        }
+                    }
+                    InlineNote(text: target == nil
+                               ? "只保存到 Lilt，不切换当前账号。Lilt 后续会续期这份登录；其他使用同一凭据的副本可能需要重新登录。"
+                               : "替换这个账号保存的登录；若它正在使用或固定给项目，Lilt 会同步新授权。其他使用同一凭据的副本可能需要重新登录。")
+                }
             }
             if target == nil { TextField("备注（可选），例如：日常创作", text: $label).textFieldStyle(.roundedBorder).disabled(model.loggingIn || saving) }
             // Swapping a full login for a long-lived token is a downgrade; say what is lost before it happens.
@@ -84,29 +115,45 @@ struct AddAccountView: View {
                 Spacer()
                 Button(model.loggingIn ? "取消授权" : "取消") { model.login.cancel(); if !model.loggingIn { token = ""; dismiss() } }
                     .buttonStyle(.lilt(.ghost)).keyboardShortcut(.cancelAction)
-                Button(method == .browser ? "获取授权链接" : method == .token ? "保存 Token" : "保存当前登录") {
+                Button(saveTitle) {
                     saving = true; failure = nil
                     Task {
                         let error = switch method {
                         case .browser: await model.browserLogin(label: label, replacing: request.replacing)
                         case .token: await model.addToken(label: label, token: token, replacing: request.replacing)
                         case .current: await model.saveCurrentLogin(label: label)
+                        case .credential:
+                            if let credentialFile {
+                                await model.importOAuthCredential(from: credentialFile, label: label, replacing: request.replacing)
+                            } else {
+                                "请先选择登录凭证 JSON 文件。"
+                            }
                         }
-                        token = ""; code = ""; saving = false
+                        token = ""; code = ""; credentialFile = nil; saving = false
                         if let error { failure = error } else { dismiss() }
                     }
                 }
                 .buttonStyle(.lilt(.primary)).keyboardShortcut(.defaultAction)
-                .disabled(saving || model.loggingIn || (method == .token && token.isEmpty) || !model.canAdd)
+                .disabled(saving || model.loggingIn || (method == .token && token.isEmpty) || (method == .credential && credentialFile == nil) || !model.canAdd)
             }
         }
-        .padding(24).frame(width: 440).tint(Tokens.accentTint)
-        .interactiveDismissDisabled(model.loggingIn)
-        .onDisappear { token = ""; code = ""; if model.loggingIn { model.login.cancel() } }
+        .padding(24).frame(width: 480).tint(Tokens.accentTint)
+        .interactiveDismissDisabled(model.loggingIn || saving)
+        .onDisappear { token = ""; code = ""; credentialFile = nil; if model.loggingIn { model.login.cancel() } }
     }
     private func submitCode() {
         guard !code.isEmpty else { return }
         model.login.submitCode(code); code = ""
+    }
+    private func chooseCredentialFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        panel.prompt = "选择凭证"
+        panel.message = "选择包含完整 Claude OAuth 登录的 .credentials.json 文件。"
+        if panel.runModal() == .OK { credentialFile = panel.url }
     }
 }
 /// The sign-in link the official CLI printed, with the two things to do with it: open it here, or copy it into a

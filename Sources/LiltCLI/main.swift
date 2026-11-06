@@ -10,7 +10,7 @@ import Glibc
 import Musl
 #endif
 
-let version = "0.3.4"
+let version = "0.3.5"
 let paths = BackendPaths()
 let client = LocalSocketClient(paths: paths)
 

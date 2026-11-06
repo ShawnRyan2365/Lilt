@@ -24,6 +24,8 @@ struct AddRequest: Identifiable {
     var kind: AuthKind = .oauth
     /// Opens on saving the current login rather than on a way of authorizing anew.
     var current = false
+    /// Opens on importing an official full-login JSON document.
+    var credential = false
 }
 /// The one thing the user most needs to know about the applied account, with the next step when there is one.
 struct Notice: Equatable {
@@ -222,14 +224,15 @@ final class AppModel {
     /// A live model whose scope is an in-memory fixture, for regression checks of how the scope is watched. Lilt's own
     /// files still go under `Disk.root`, so the caller must point the home directory at a fixture first.
     init(fixture library: Library, runtime: RuntimeScope, usageFetch: ((Credential) async throws -> UsageSnapshot)? = nil,
-         projects: ProjectCatalog = ProjectCatalog(), projectRuntime: ((ProjectBinding) -> RuntimeScope)? = nil) {
+         projects: ProjectCatalog = ProjectCatalog(), projectRuntime: ((ProjectBinding) -> RuntimeScope)? = nil,
+         identityFetch: ((Credential) async -> Data?)? = nil) {
         retryClock = { .now }
         self.library = library
         fixtureRuntime = runtime
         projectCatalog = projects
         if let usageFetch { self.usageFetch = usageFetch }
         if let projectRuntime { self.projectRuntime = projectRuntime }
-        identityFetch = { _ in nil }
+        self.identityFetch = identityFetch ?? { _ in nil }
         restoreRelayPreference()
     }
     private func restoreRelayPreference() {
@@ -478,6 +481,56 @@ final class AppModel {
             await syncScope(afterReplacing: id)
             return nil
         } catch { return (error as? AppFailure)?.message ?? "无法保存凭据。" }
+    }
+    /// Imports an official full-login JSON document without making it the active account. The profile endpoint is
+    /// used for duplicate detection when the access token is valid; renewal and quota verification happen only after
+    /// the credential is safely stored.
+    func importOAuthCredential(from url: URL, label: String, replacing id: UUID? = nil) async -> String? {
+        guard canAdd else { return "当前无法保存凭据。" }
+        busy = true; status = "正在读取登录凭证…"
+        defer { busy = false }
+        var saved: UUID?
+        do {
+            let data = try await IOQueue.run {
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard values.isRegularFile == true, let size = values.fileSize, size > 0, size <= OAuthCredentialFile.maximumBytes else {
+                    throw ImportFailure("凭证文件不存在、为空或超过 64 KB。")
+                }
+                return try Data(contentsOf: url)
+            }
+            let credential = Credential(data: try OAuthCredentialFile.parse(data))
+            let ids = accounts.map(\.id)
+            let identical = await IOQueue.perform {
+                ids.first { account in
+                    guard let stored = try? AccountVault.read(account: account.uuidString) else { return false }
+                    return OAuthDocument.accessToken(stored) == credential.token
+                        && OAuthDocument.refreshToken(stored) == OAuthDocument.refreshToken(credential.data)
+                }
+            }
+            if let identical, let owner = accounts.first(where: { $0.id == identical }) {
+                status = "凭证未导入"
+                return "这份登录已经保存为“\(owner.label)”，不用再导入。"
+            }
+            status = "正在核对账号身份…"
+            let identity = await identityFetch(credential)
+            if let twin = twin(of: identity, besides: id) {
+                status = "凭证未导入"
+                return "文件里是和“\(twin.label)”同一个 Claude 账号，没有重复保存。"
+            }
+            try store(credential, label: label, kind: .oauth, replacing: id, identity: identity)
+            saved = id ?? accounts.last?.id
+            guard saved != nil else { throw AppFailure("账号资料写入失败。") }
+            status = id == nil ? "登录凭证已安全保存；当前账号没有改动" : "登录凭证已安全保存"
+        } catch {
+            status = "凭证未导入"
+            return (error as? ImportFailure)?.message ?? (error as? AppFailure)?.message ?? "无法读取登录凭证，现有账号没有改动。"
+        }
+        busy = false
+        await syncScope(afterReplacing: id)
+        if let saved { await refresh(saved, manually: true) }
+        return nil
     }
     /// A new credential for the account in use belongs in the scope too; otherwise Lilt and the CLI would hold
     /// two different logins under one name without anyone being told.
