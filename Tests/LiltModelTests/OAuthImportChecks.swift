@@ -22,8 +22,9 @@ import LiltCore
     var identityCalls = 0
     let model = AppModel(fixture: Library(), runtime: scope, usageFetch: { _ in
         UsageSnapshot(fiveHour: UsageWindow(used: 20), sevenDay: UsageWindow(used: 30))
-    }, identityFetch: { _ in
+    }, identityFetch: { credential in
         identityCalls += 1
+        guard credential.token == access || credential.token == "sk-ant-oat01-fixture-import-access-0002" else { return nil }
         return Data(#"{"accountUuid":"fixture-import-account"}"#.utf8)
     })
     let failure = await model.importOAuthCredential(from: file, label: "Fixture imported")
@@ -47,8 +48,27 @@ import LiltCore
     let twin = await model.importOAuthCredential(from: file, label: "Twin")
     precondition(twin != nil && model.accounts.count == 1 && identityCalls == 2)
 
+    let wrapped: [String: Any] = [
+        "name": "Fixture wrapped",
+        "credentials": [
+            "access_token": "sk-ant-oat01-fixture-wrapped-access-0001",
+            "refresh_token": "sk-ant-ort01-fixture-wrapped-refresh-0001",
+            "expires_at": String(Int64(Date.now.addingTimeInterval(3600).timeIntervalSince1970)),
+            "scope": "user:inference user:profile",
+            "token_type": "Bearer",
+            "account_uuid": "fixture-wrapped-account",
+            "email_address": "fixture@example.invalid",
+            "org_uuid": "fixture-organization"
+        ]
+    ]
+    try SecureFiles.write(JSONSerialization.data(withJSONObject: wrapped), to: file)
+    let importedWrapped = await model.importOAuthCredential(from: file, label: "")
+    precondition(importedWrapped == nil && model.accounts.count == 2)
+    precondition(model.accounts[1].label == "Fixture wrapped" && model.accounts[1].usageCapability == .verified)
+    precondition(model.library.activeID == nil && held == untouched)
+
     try SecureFiles.write(Data("not json".utf8), to: file)
     let malformed = await model.importOAuthCredential(from: file, label: "Malformed")
-    precondition(malformed != nil && model.accounts.count == 1 && held == untouched)
+    precondition(malformed != nil && model.accounts.count == 2 && held == untouched)
     try? FileManager.default.removeItem(at: file)
 }

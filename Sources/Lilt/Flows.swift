@@ -89,7 +89,7 @@ struct AddAccountView: View {
                 }
             case .credential:
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("选择官方 Claude Code 的 .credentials.json 文件。必须同时包含 accessToken 和 refreshToken，会作为完整 OAuth 登录保存。")
+                    Text("选择官方 .credentials.json，或含 credentials 的账号 JSON。会转换为完整 OAuth 登录；备注留空时使用文件内的名称或文件名。")
                         .font(Typo.body).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
                         Button(credentialFile == nil ? "选择 JSON 文件…" : "重新选择…", action: chooseCredentialFile)
@@ -152,7 +152,7 @@ struct AddAccountView: View {
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json]
         panel.prompt = "选择凭证"
-        panel.message = "选择包含完整 Claude OAuth 登录的 .credentials.json 文件。"
+        panel.message = "选择官方 .credentials.json，或含完整 OAuth credentials 的账号 JSON 文件。"
         if panel.runModal() == .OK { credentialFile = panel.url }
     }
 }

@@ -482,9 +482,9 @@ final class AppModel {
             return nil
         } catch { return (error as? AppFailure)?.message ?? "无法保存凭据。" }
     }
-    /// Imports an official full-login JSON document without making it the active account. The profile endpoint is
-    /// used for duplicate detection when the access token is valid; renewal and quota verification happen only after
-    /// the credential is safely stored.
+    /// Imports a full-login JSON document without making it the active account. The profile endpoint is used for
+    /// duplicate detection when the access token is valid; wrapper metadata alone never proves a duplicate. Renewal
+    /// and quota verification happen only after the credential is safely stored.
     func importOAuthCredential(from url: URL, label: String, replacing id: UUID? = nil) async -> String? {
         guard canAdd else { return "当前无法保存凭据。" }
         busy = true; status = "正在读取登录凭证…"
@@ -500,7 +500,8 @@ final class AppModel {
                 }
                 return try Data(contentsOf: url)
             }
-            let credential = Credential(data: try OAuthCredentialFile.parse(data))
+            let parsed = try OAuthCredentialFile.parseDocument(data)
+            let credential = Credential(data: parsed.credential)
             let ids = accounts.map(\.id)
             let identical = await IOQueue.perform {
                 ids.first { account in
@@ -514,12 +515,16 @@ final class AppModel {
                 return "这份登录已经保存为“\(owner.label)”，不用再导入。"
             }
             status = "正在核对账号身份…"
-            let identity = await identityFetch(credential)
-            if let twin = twin(of: identity, besides: id) {
+            let verified = await identityFetch(credential)
+            if let twin = twin(of: verified, besides: id) {
                 status = "凭证未导入"
                 return "文件里是和“\(twin.label)”同一个 Claude 账号，没有重复保存。"
             }
-            try store(credential, label: label, kind: .oauth, replacing: id, identity: identity)
+            let identity = CurrentLoginPlan.identityRecord(verified: verified, recorded: parsed.identity)
+            let fileLabel = url.deletingPathExtension().lastPathComponent
+            let suggested = parsed.suggestedLabel ?? (fileLabel == ".credentials" ? nil : fileLabel)
+            try store(credential, label: label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? suggested ?? "" : label,
+                      kind: .oauth, replacing: id, identity: identity)
             saved = id ?? accounts.last?.id
             guard saved != nil else { throw AppFailure("账号资料写入失败。") }
             status = id == nil ? "登录凭证已安全保存；当前账号没有改动" : "登录凭证已安全保存"
