@@ -33,8 +33,15 @@ public enum UsagePolling {
         return RelayPolicy(threshold: threshold).nextReset(of: [account], at: now) != nil
     }
 
+    public static func renewalDue(_ account: Account, active: Bool, at now: Date) -> Bool {
+        guard !active, account.enabled, account.kind == .oauth, account.refreshRejected != true,
+              let expiresAt = account.expiresAt else { return false }
+        return expiresAt <= now.addingTimeInterval(RelayPolicy.renewalLead)
+    }
+
     public static func due(_ account: Account, active: Bool, autoRelay: Bool, urgent: Bool, watching: Bool, at now: Date) -> Bool {
         guard account.enabled, account.usageCapability != .unavailable else { return false }
+        if renewalDue(account, active: active, at: now) { return true }
         if resetNeedsRefresh(account.usage, lastChecked: account.lastChecked, at: now) { return true }
         if active, let usage = account.usage, usage.source == UsageParser.statusLineSource {
             let liveWindow: TimeInterval = autoRelay ? 60 : 300
@@ -44,9 +51,15 @@ public enum UsagePolling {
         return age < 0 || age >= interval(active: active, autoRelay: autoRelay, urgent: urgent, watching: watching)
     }
 
-    public static func refreshOrder(_ accounts: [Account]) -> [Account] {
+    public static func refreshOrder(_ accounts: [Account], at now: Date) -> [Account] {
         accounts.sorted {
-            ($0.lastChecked ?? $0.usage?.sampledAt ?? .distantPast, $0.label) < ($1.lastChecked ?? $1.usage?.sampledAt ?? .distantPast, $1.label)
+            let leftRenewal = renewalDue($0, active: false, at: now)
+            let rightRenewal = renewalDue($1, active: false, at: now)
+            if leftRenewal != rightRenewal { return leftRenewal }
+            if leftRenewal, let leftExpiry = $0.expiresAt, let rightExpiry = $1.expiresAt, leftExpiry != rightExpiry {
+                return leftExpiry < rightExpiry
+            }
+            return ($0.lastChecked ?? $0.usage?.sampledAt ?? .distantPast, $0.label) < ($1.lastChecked ?? $1.usage?.sampledAt ?? .distantPast, $1.label)
         }
     }
 }

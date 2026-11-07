@@ -393,7 +393,9 @@ public actor HeadlessEngine {
     public func refresh(_ id: UUID, manually: Bool = false) async {
         if switching { if manually { message = "正在切换账号，完成后即可刷新" }; return }
         if pauseForRateLimit(manually: manually) { return }
-        if !manually, let account = account(id), UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: now()) { return }
+        if !manually, let account = account(id),
+           !UsagePolling.renewalDue(account, active: inScope(id), at: now()),
+           UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: now()) { return }
         if let running = refreshTasks[id] {
             await running.value
             if refreshTasks[id] == running { refreshTasks[id] = nil }
@@ -703,7 +705,7 @@ public actor HeadlessEngine {
                 await refresh(active.id)
             }
         }
-        let alternates = UsagePolling.refreshOrder(globalRelayCandidates().filter { $0.id != library.activeID })
+        let alternates = UsagePolling.refreshOrder(globalRelayCandidates().filter { $0.id != library.activeID }, at: now())
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
             if forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: library.preferences.autoRelay == true, urgent: false, watching: false, at: now()) {

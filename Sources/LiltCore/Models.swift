@@ -144,10 +144,10 @@ public struct RelayPolicy: Sendable {
     /// a second exhaustion threshold and defaults to zero for callers without a pace history.
     public var requiredMargin: Thresholds
     /// How long before expiry a target account's access token is renewed.
-    /// Claude Code refreshes on its own about five minutes ahead. Ten minutes is twice that buffer,
-    /// so a token written into the scope is not already inside the CLI's refresh window.
+    /// Claude Code refreshes on its own about five minutes ahead. Renewing unused accounts an hour ahead
+    /// leaves ample time for retries, and a token written into the scope is not already inside the CLI's refresh window.
     /// The account currently in the scope is never renewed here.
-    public static let renewalLead: TimeInterval = 600
+    public static let renewalLead: TimeInterval = 3600
     /// After an automatic hand-off, the account just left cannot be selected again until this many
     /// seconds have passed. Two accounts sitting just above the threshold would otherwise swap on
     /// every sample. This is not a second threshold and not a ten-point lag.

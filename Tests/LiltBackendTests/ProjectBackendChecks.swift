@@ -72,7 +72,7 @@ func testProjects() async throws {
     // The project's CLI renewed its login: a launch takes the renewal in and writes nothing new.
     var renewedLogin = try JSONSerialization.jsonObject(with: b.data) as! [String: Any]
     var oauth = renewedLogin["claudeAiOauth"] as! [String: Any]
-    oauth["accessToken"] = "fixture-access-project-b-renewed"; oauth["expiresAt"] = Int64(Date.now.timeIntervalSince1970 * 1000 + 7_200_000)
+    oauth["accessToken"] = "fixture-access-project-b-renewed"; oauth["expiresAt"] = Int64(Date.now.timeIntervalSince1970 * 1000 + 43_200_000)
     renewedLogin["claudeAiOauth"] = oauth
     let renewed = try JSONSerialization.data(withJSONObject: renewedLogin)
     try SecureFiles.write(renewed, to: scopeA.credentials)

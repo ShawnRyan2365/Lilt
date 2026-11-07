@@ -10,7 +10,7 @@ import LiltCore
     let login: [String: Any] = ["claudeAiOauth": [
         "accessToken": access,
         "refreshToken": refresh,
-        "expiresAt": Int64(Date.now.addingTimeInterval(3600).timeIntervalSince1970 * 1000),
+        "expiresAt": Int64(Date.now.addingTimeInterval(7200).timeIntervalSince1970 * 1000),
         "scopes": ["user:inference", "user:profile"],
         "subscriptionType": NSNull(),
         "rateLimitTier": NSNull()
@@ -53,7 +53,7 @@ import LiltCore
         "credentials": [
             "access_token": "sk-ant-oat01-fixture-wrapped-access-0001",
             "refresh_token": "sk-ant-ort01-fixture-wrapped-refresh-0001",
-            "expires_at": String(Int64(Date.now.addingTimeInterval(3600).timeIntervalSince1970)),
+            "expires_at": String(Int64(Date.now.addingTimeInterval(7200).timeIntervalSince1970)),
             "scope": "user:inference user:profile",
             "token_type": "Bearer",
             "account_uuid": "fixture-wrapped-account",

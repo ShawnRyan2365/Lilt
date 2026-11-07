@@ -11,7 +11,7 @@ func expectThrowing(_ condition: @autoclosure () throws -> Bool, _ message: Stri
 func credential(_ name: String) -> Credential {
     Credential(data: try! JSONSerialization.data(withJSONObject: ["claudeAiOauth": [
         "accessToken": "fixture-access-\(name)", "refreshToken": "fixture-refresh-\(name)",
-        "expiresAt": Int64(Date.now.timeIntervalSince1970 * 1000 + 3_600_000), "scopes": ["user:profile", "user:inference"]
+        "expiresAt": Int64(Date.now.timeIntervalSince1970 * 1000 + 28_800_000), "scopes": ["user:profile", "user:inference"]
     ]]))
 }
 func identity(_ name: String) -> Data {
@@ -211,6 +211,31 @@ func testExhaustedPollingWaitsForReset() async throws {
     expect(calls == 2, "accounts did not resume polling after their exhausted windows reset: \(calls)")
 }
 
+func testExpiringExhaustedAlternateRenewsBeforeReset() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
+    let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+    let clock = Clock()
+    let expiring = Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": [
+        "accessToken": "fixture-access-spent-expiring", "refreshToken": "fixture-refresh-spent-expiring",
+        "expiresAt": Int64(clock.value.timeIntervalSince1970 * 1000 + 1_800_000), "scopes": ["user:profile", "user:inference"]
+    ]]))
+    let snapshot = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: clock.value.addingTimeInterval(7200)),
+                                 sevenDay: UsageWindow(used: 20), sampledAt: clock.value)
+    let usage = ScriptedUsage(snapshot: snapshot, scripts: [:])
+    let renewer = CountingRenewer()
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: renewer, now: { clock.value }, requestGap: 0)
+    _ = try await engine.add(credential("spent-current"), identity: identity("spent-current"), label: "Current", kind: .oauth)
+    _ = try await engine.takeOver(label: nil)
+    let id = try await engine.add(expiring, identity: identity("spent-expiring"), label: "Spare", kind: .oauth)
+    await engine.refreshAll()
+    await usage.reset([:])
+    let initialRenewals = await renewer.renewals
+    clock.value = clock.value.addingTimeInterval(1)
+    await engine.refresh(id)
+    let calls = await usage.calls, renewals = await renewer.renewals
+    expect(calls == 1 && renewals == initialRenewals + 1, "an expiring exhausted alternate did not renew before its quota reset: calls=\(calls), renewals=\(renewals)")
+}
+
 func testFreshServerTakeover() async throws {
     let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
     let engine = try HeadlessEngine(store: store, usageClient: FakeUsage(snapshots: [:]), identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), requestGap: 0)
@@ -271,6 +296,7 @@ try testStatusLine()
 try await testRefreshRecovery()
 try await testAlternatePolling()
 try await testExhaustedPollingWaitsForReset()
+try await testExpiringExhaustedAlternateRenewsBeforeReset()
 try await testFreshServerTakeover()
 try await testAutomaticRelay()
 try await testProjects()
@@ -278,4 +304,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (14 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, alternate polling, exhausted polling reset, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (15 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, alternate polling, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

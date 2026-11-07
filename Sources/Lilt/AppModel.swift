@@ -634,8 +634,8 @@ final class AppModel {
     private func identity(for id: UUID) -> Data? { (try? storedSecret(Keychain.identityAccount(id))) ?? nil }
     /// A stored full login, renewed first when it is about to expire. Never for the account in the scope: there the
     /// official CLI renews it and Lilt reads the result back, so the two cannot spend the same refresh token.
-    /// The lead is `RelayPolicy.renewalLead` (ten minutes), twice Claude Code's own five-minute refresh buffer,
-    /// so the token written into the scope is not already due for the CLI to refresh it again.
+    /// The lead is `RelayPolicy.renewalLead` (one hour), leaving time for retries before expiry and keeping
+    /// the token written into the scope well outside the CLI's own five-minute refresh buffer.
     private func renewedCredential(for id: UUID) async throws -> Credential {
         let renewal: Task<Credential, Error>
         if let running = renewals[id] { renewal = running } else {
@@ -831,6 +831,7 @@ final class AppModel {
         }
         if pauseForRateLimit() { return }
         if !manually, let account = accounts.first(where: { $0.id == id }),
+           !UsagePolling.renewalDue(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), at: .now),
            UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: .now) { return }
         // A request already out for this account answers this one too. Manual refresh may override an ordinary
         // backoff, never a server 429.
@@ -1543,7 +1544,7 @@ final class AppModel {
             }
         }
         let reserved = projectCatalog.reservedAccountIDs
-        let alternates = UsagePolling.refreshOrder(accounts.filter { $0.id != library.activeID && !reserved.contains($0.id) })
+        let alternates = UsagePolling.refreshOrder(accounts.filter { $0.id != library.activeID && !reserved.contains($0.id) }, at: .now)
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
             if forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: autoRelay, urgent: false, watching: watching, at: .now) {

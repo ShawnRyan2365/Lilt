@@ -245,6 +245,22 @@ final class RelayTests {
         expect(UsagePolling.waitingForExhaustionReset(exhausted, threshold: Thresholds(fiveHour: 10, sevenDay: 1), at: now))
         exhausted.usage?.sevenDay = UsageWindow(used: 100)
         expectFalse(UsagePolling.waitingForExhaustionReset(exhausted, threshold: 1, at: now))
+        var expiring = Account(label: "Expiring", kind: .oauth)
+        expiring.lastChecked = now
+        expiring.expiresAt = now.addingTimeInterval(3600)
+        expect(UsagePolling.renewalDue(expiring, active: false, at: now))
+        expect(UsagePolling.due(expiring, active: false, autoRelay: false, urgent: false, watching: true, at: now))
+        expectFalse(UsagePolling.renewalDue(expiring, active: true, at: now))
+        expiring.expiresAt = now.addingTimeInterval(3601)
+        expectFalse(UsagePolling.renewalDue(expiring, active: false, at: now))
+        expiring.expiresAt = now.addingTimeInterval(1800)
+        var later = expiring; later.id = UUID(); later.label = "Later"; later.expiresAt = now.addingTimeInterval(3000)
+        var ordinary = Account(label: "Ordinary", kind: .oauth); ordinary.lastChecked = .distantPast
+        expectEqual(UsagePolling.refreshOrder([later, ordinary, expiring], at: now).map(\.label), ["Expiring", "Later", "Ordinary"])
+        expiring.refreshRejected = true
+        expectFalse(UsagePolling.renewalDue(expiring, active: false, at: now))
+        expiring.refreshRejected = nil; expiring.kind = .setupToken
+        expectFalse(UsagePolling.renewalDue(expiring, active: false, at: now))
         alternate.enabled = false
         expectFalse(UsagePolling.due(alternate, active: false, autoRelay: false, urgent: false, watching: true, at: now.addingTimeInterval(3600)))
     }
@@ -255,9 +271,9 @@ final class RelayTests {
         let s = try UsageParser.parse(Data("{\"five_hour\":{\"utilization\":99},\"seven_day\":null}".utf8), at: now)
         expect(s.exhausted(threshold: 1, at: now)); expectFalse(s.available(threshold: 1, at: now))
     }
-    /// Ten minutes is twice Claude Code's own five-minute refresh buffer. The default threshold stays 1%.
-    func testRenewalLeadIsTwiceTheCLIBuffer() {
-        expectEqual(RelayPolicy.renewalLead, 600)
+    /// Unused logins renew an hour ahead; the default threshold stays 1%.
+    func testRenewalLeadIsOneHour() {
+        expectEqual(RelayPolicy.renewalLead, 3600)
         expectEqual(RelayPolicy().threshold, 1)
         expectEqual(Preferences().threshold, 1)
         expectFalse(Preferences().soonerWeekly == true)
@@ -656,7 +672,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testRetryAfterAndAuthentication()
         suite.testUsagePollingKeepsAlternatesAndResetsMoving()
         try suite.testParserRejectsMalformedAndBooleanUsage()
-        suite.testRenewalLeadIsTwiceTheCLIBuffer()
+        suite.testRenewalLeadIsOneHour()
         try suite.testRejectedRefreshLeavesAutomaticRelayUntilReauthorized()
         suite.testAccountJustLeftIsSkippedUntilTheCooldownEnds()
         suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
