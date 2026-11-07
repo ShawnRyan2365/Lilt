@@ -26,6 +26,10 @@ public actor HeadlessEngine {
     private var library: Library
     private var projects: ProjectCatalog
     private var backoffs: [UUID: Backoff] = [:]
+    /// Lilt's own usage requests in the last hour, and when each account was last seen active; both only feed the
+    /// `usage-429` lines in `switches.log`.
+    private var requestTally = UsageRequestTally()
+    private var lastActiveAt: [UUID: Date] = [:]
     private var refreshTasks: [UUID: Task<Void, Never>] = [:]
     private var renewalTasks: [UUID: Task<Credential, Error>] = [:]
     private var tickTask: Task<Void, Never>?
@@ -87,6 +91,8 @@ public actor HeadlessEngine {
         do { try CredentialImport.recover(secrets: store.secretsDirectory, libraryFile: store.libraryFile) }
         catch { recovery = (error as? ImportFailure)?.message ?? "上次导入的现场无法自动收尾，请检查后再导入。" }
         library = try store.load()
+        // A server 429's wait saved before a restart is served out, not asked about again at once.
+        for (id, until) in UsageHold.restore(&library.accounts, at: now()) { backoffs[id] = Backoff(heldUntil: until); usageFailures[id] = .rateLimited(nil) }
         projectStore = ProjectCatalogStore(store: store)
         projects = try projectStore.load()
         message = recovery
@@ -432,9 +438,10 @@ public actor HeadlessEngine {
         var asked: Credential?
         do {
             let credential = try await renewed(id); asked = credential
+            requestTally.note(id, at: now())
             let snapshot = try await usageClient.fetch(credential)
             guard library.accounts.contains(where: { $0.id == id }), current(credential, id: id) else { return }
-            update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = self.now(); $0.issue = nil }
+            update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = self.now(); $0.issue = nil; $0.usageRetryAt = nil }
             if id == library.activeID { notePace(snapshot, id: id) }
             backoffs[id]?.succeed(); usageFailures[id] = nil; rateLimit.answered(); message = "额度已更新"
             if credential.refreshable, !(try store.readSecret(id.uuidString + ".identity") != nil),
@@ -447,13 +454,18 @@ public actor HeadlessEngine {
             if let asked, !current(asked, id: id) { return }
             let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: now()); usageFailures[id] = failure
+            var retryAt: Date?
             if case .rateLimited(let server) = failure, let next = backoffs[id]?.nextAttempt {
+                retryAt = next
                 let pausedAll = rateLimit.refused(id, until: next, at: now())
-                store.log("usage-429", detail: usageRefusal(retryAfter: server, wait: next.timeIntervalSince(now()),
-                                                            active: id == library.activeID, pausedAll: pausedAll))
+                let at = now()
+                store.log("usage-429", detail: usageRefusal(retryAfter: server, wait: next.timeIntervalSince(at), active: id == library.activeID,
+                                                            pausedAll: pausedAll, left: lastActiveAt[id].map { at.timeIntervalSince($0) },
+                                                            requests: requestTally.count(id, at: at), allRequests: requestTally.total(at: at)))
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
             update(id) {
+                $0.usageRetryAt = retryAt
                 if failure == .permission { $0.usageCapability = .unavailable }
                 $0.issue = UsageFailure.shown(failure.message, capability: $0.usageCapability)
             }
@@ -747,6 +759,7 @@ public actor HeadlessEngine {
         }
     }
     public func tick() async {
+        if let active = library.activeID { lastActiveAt[active] = now() }
         guard !switching else { return }
         do { projects = try projectStore.load() }
         catch { message = backendReason(error); return }

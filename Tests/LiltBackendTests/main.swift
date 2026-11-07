@@ -161,6 +161,13 @@ func testRefreshRecovery() async throws {
     await engine.refresh(bID, manually: true)
     let limitedCalls = await usage.calls
     expect(limitedCalls == 3, "manual refresh bypassed server 429")
+    let savedWait = await engine.account(bID)?.usageRetryAt
+    expect(savedWait == clock.value.addingTimeInterval(120), "a server 429's wait was not saved with the account")
+    // A daemon restarted on the same files keeps waiting instead of asking again early.
+    let restarted = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: renewer, now: { clock.value }, requestGap: 0)
+    await restarted.refresh(bID, manually: true)
+    let restartedCalls = await usage.calls
+    expect(restartedCalls == 3, "a restart asked a waiting account again: calls=\(restartedCalls)")
     await engine.refresh(aID, manually: true)
     let independentCalls = await usage.calls
     expect(independentCalls == 4, "one account's 429 paused another account")
@@ -411,4 +418,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (17 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429, alternate polling, waiting and exhausted accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (17 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429 and its wait kept across restart, alternate polling, waiting and exhausted accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

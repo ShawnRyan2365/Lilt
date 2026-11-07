@@ -78,6 +78,9 @@ public struct Account: Identifiable, Codable, Equatable, Sendable {
     /// is stored. A later usage sample does not clear it. A dropped connection or a 429 never sets it.
     /// Optional so account files written before it existed still load.
     public var refreshRejected: Bool?
+    /// Until when the usage endpoint's last 429 asked this account to wait. Kept so a relaunch keeps waiting instead of
+    /// asking again at once and earning another refusal; cleared by any later answer. Optional for older files.
+    public var usageRetryAt: Date?
     public init(id: UUID = UUID(), label: String, kind: AuthKind) { self.id = id; self.label = label; self.kind = kind }
 }
 /// Where Lilt puts the selected account's login.
@@ -407,13 +410,17 @@ public enum UsageFailure: Error, Equatable, Sendable {
 public struct Backoff: Sendable {
     public private(set) var failures = 0
     public private(set) var nextAttempt = Date.distantPast
+    /// The longest wait a server 429 is granted; anything longer is taken as a mistake rather than obeyed.
+    public static let longestServerWait: TimeInterval = 4500
     public init() {}
+    /// A wait carried over from before a relaunch (`UsageHold`): one failure, asked again no sooner than `until`.
+    public init(heldUntil until: Date) { failures = 1; nextAttempt = until }
     public mutating func fail(_ error: UsageFailure, at now: Date) {
         failures += 1
         var delay = min(900, 15 * pow(2, Double(min(failures - 1, 6))))
         if case .rateLimited(let server) = error {
             // No readable Retry-After keeps the one-minute floor it always had.
-            let requested = server.map { $0 == 0 ? 300 : min(4500, max(0, $0)) } ?? 60
+            let requested = server.map { $0 == 0 ? 300 : min(Self.longestServerWait, max(0, $0)) } ?? 60
             delay = max(delay, requested)
         }
         if error == .authentication || error == .permission || error == .accessExpired { delay = max(delay, 900) }
@@ -430,14 +437,6 @@ public enum RetryAfter {
         formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         return formatter.date(from: header).map { max(0, $0.timeIntervalSince(now)) }
     }
-}
-/// One line for `switches.log` when the usage endpoint refuses an account: what the server asked for, how long that
-/// account now waits (Lilt's own backoff can be longer, a server value beyond 75 minutes is cut), whether it was the
-/// active account, and whether every read now waits. Numbers only; no names, ids or secrets. It exists because a long
-/// wait on screen could not be told apart from a server value or Lilt's own choice after the fact.
-public func usageRefusal(retryAfter: TimeInterval?, wait: TimeInterval, active: Bool, pausedAll: Bool) -> String {
-    "retry-after=\(retryAfter.map { String(format: "%.0f", $0) + "s" } ?? "none") wait=\(String(format: "%.0f", max(0, wait)))s "
-        + "account=\(active ? "active" : "spare")" + (pausedAll ? " all-paused" : "")
 }
 public enum UsageParser {
     public static func parse(_ data: Data, at now: Date = .now) throws -> UsageSnapshot {

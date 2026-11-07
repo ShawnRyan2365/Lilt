@@ -100,7 +100,7 @@ import LiltCore
         try await projectModelChecks()
         try transferStoreChecks()
         try await oauthImportChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs per-account server 429, every read paused after two accounts refused in a row, renewal while reads wait, quiet background retries and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import (scope without user:profile marked unreadable, left out of refreshing everything, its reason kept through a 429). No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs per-account server 429, a saved 429 wait served out after relaunch, every read paused after two accounts refused in a row, renewal while reads wait, quiet background retries and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import (scope without user:profile marked unreadable, left out of refreshing everything, its reason kept through a 429). No live credentials or requests.")
     }
 }
 
@@ -429,6 +429,17 @@ import LiltCore
     failures = [UsageFailure.rateLimited(120)]
     await model.refresh(active.id, manually: true)
     precondition(calls == 7)
+    let savedWait = model.library.accounts.first { $0.id == active.id }?.usageRetryAt
+    precondition(savedWait.map { $0 > Date.now.addingTimeInterval(100) } == true, "A server 429's wait is saved with the account")
+    // Relaunched on the saved library, the account keeps waiting: neither the monitor nor a person asks it again early.
+    let relaunched = AppModel(fixture: model.library, runtime: scope, usageFetch: { _ in
+        calls += 1
+        return UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    })
+    await relaunched.refresh(active.id)
+    await relaunched.refresh(active.id, manually: true)
+    precondition(calls == 7 && relaunched.status.contains("重试") && relaunched.usageRetryText(active.id) != nil,
+                 "A relaunch serves out a saved 429 wait instead of asking again")
     await model.refresh(active.id, manually: true)
     precondition(calls == 7 && model.status.contains("重试"), "A server 429 still blocks a manual retry of that account")
     model.status = "fixture-quiet"
@@ -436,6 +447,7 @@ import LiltCore
     precondition(calls == 7 && model.status == "fixture-quiet", "The monitor meeting a waiting account announces nothing")
     await model.refresh(spare.id, manually: true)
     precondition(calls == 8 && model.status == "额度已更新", "One account's 429 does not pause another")
+    precondition(model.library.accounts.first { $0.id == spare.id }?.usageRetryAt == nil, "An answer leaves no saved wait")
     precondition(model.notice()?.detail?.contains("全部额度查询") != true)
 
     // The answer for B cleared A's refusal. B and then C refused, with nothing answered between, pause every read.

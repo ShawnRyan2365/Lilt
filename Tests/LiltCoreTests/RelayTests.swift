@@ -216,9 +216,37 @@ final class RelayTests {
         expectEqual(RetryAfter.seconds(formatter.string(from: now.addingTimeInterval(-60)), now: now), 0)
         expectEqual(RetryAfter.seconds(nil, now: now), nil); expectEqual(RetryAfter.seconds("", now: now), nil); expectEqual(RetryAfter.seconds("soon", now: now), nil)
         // The log line says what the server asked for apart from what Lilt waits, and carries no account detail.
-        expectEqual(usageRefusal(retryAfter: 3600, wait: 3600, active: false, pausedAll: false), "retry-after=3600s wait=3600s account=spare")
-        expectEqual(usageRefusal(retryAfter: nil, wait: 60, active: true, pausedAll: true), "retry-after=none wait=60s account=active all-paused")
-        expectEqual(usageRefusal(retryAfter: 86400, wait: 4500, active: false, pausedAll: false), "retry-after=86400s wait=4500s account=spare")
+        expectEqual(usageRefusal(retryAfter: 3600, wait: 3600, active: false, pausedAll: false, left: 750, requests: 2, allRequests: 9),
+                    "retry-after=3600s wait=3600s account=spare left=12m lilt-1h=2 lilt-1h-all=9")
+        expectEqual(usageRefusal(retryAfter: nil, wait: 60, active: true, pausedAll: true, left: 750, requests: 20, allRequests: 31),
+                    "retry-after=none wait=60s account=active lilt-1h=20 lilt-1h-all=31 all-paused")
+        expectEqual(usageRefusal(retryAfter: 86400, wait: 4500, active: false, pausedAll: false, requests: 1, allRequests: 1),
+                    "retry-after=86400s wait=4500s account=spare left=unknown lilt-1h=1 lilt-1h-all=1")
+    }
+    /// A server 429's wait is saved with the account and served out after a relaunch; passed waits are dropped, and
+    /// Lilt's own requests are counted per account and in all over the last hour.
+    func testUsageWaitSurvivesRelaunch() {
+        var waiting = Account(label: "fixture-waiting", kind: .oauth); waiting.usageRetryAt = now.addingTimeInterval(1800)
+        var passed = Account(label: "fixture-passed", kind: .oauth); passed.usageRetryAt = now.addingTimeInterval(-1)
+        var far = Account(label: "fixture-far", kind: .oauth); far.usageRetryAt = now.addingTimeInterval(86400)
+        let plain = Account(label: "fixture-plain", kind: .oauth)
+        var accounts = [waiting, passed, far, plain]
+        let holds = UsageHold.restore(&accounts, at: now)
+        expectEqual(holds[waiting.id], now.addingTimeInterval(1800))
+        expectEqual(holds[far.id], now.addingTimeInterval(Backoff.longestServerWait))
+        expectEqual(holds.count, 2)
+        expectEqual(accounts[1].usageRetryAt, nil); expectEqual(accounts[0].usageRetryAt, now.addingTimeInterval(1800))
+        let held = Backoff(heldUntil: now.addingTimeInterval(1800))
+        expectEqual(held.nextAttempt, now.addingTimeInterval(1800)); expectEqual(held.failures, 1)
+        // Files written before the field existed still load.
+        let old = #"{"id":"6F9619FF-8B86-D011-B42D-00C04FC964FF","label":"fixture-old","kind":"oauth","enabled":true,"usageCapability":"unknown","hotSwitchCapability":"unknown"}"#
+        expectEqual((try? JSONDecoder().decode(Account.self, from: Data(old.utf8)))?.usageRetryAt, nil)
+        var tally = UsageRequestTally()
+        let a = UUID(), b = UUID()
+        tally.note(a, at: now.addingTimeInterval(-3700)); tally.note(a, at: now.addingTimeInterval(-600)); tally.note(b, at: now.addingTimeInterval(-60))
+        expectEqual(tally.count(a, at: now), 1); expectEqual(tally.count(b, at: now), 1); expectEqual(tally.total(at: now), 2)
+        tally.note(a, at: now)
+        expectEqual(tally.count(a, at: now), 2); expectEqual(tally.total(at: now), 3); expectEqual(tally.count(UUID(), at: now), 0)
     }
     /// One account refused says nothing about the others; two different accounts refused close together, with no
     /// answer in between, pause every read until the later of them may ask again.
@@ -740,6 +768,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testStatusLineReadingsAreParsedAndMatchedToTheirAccount()
         suite.testDuplicateEventClaimedOnce()
         suite.testRetryAfterAndAuthentication()
+        suite.testUsageWaitSurvivesRelaunch()
         suite.testRateLimitHoldsOneAccountUntilTwoAreRefused()
         suite.testUsageScopeComesFromTheStatedScopes()
         suite.testExhaustedAccountIsHeldUnlessItsLoginNeedsRenewal()
@@ -773,7 +802,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 45 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 46 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 

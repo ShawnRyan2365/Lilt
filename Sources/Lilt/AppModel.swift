@@ -108,6 +108,10 @@ final class AppModel {
     private var savedAPIMode = false
     private var backoffs: [UUID: Backoff] = [:]
     private var failures: [UUID: UsageFailure] = [:]
+    /// Lilt's own usage requests in the last hour, and when each account was last seen active; both only feed the
+    /// `usage-429` lines in `switches.log`.
+    private var requestTally = UsageRequestTally()
+    private var lastActiveAt: [UUID: Date] = [:]
     /// A 429 holds back the account it was for; refusals of two accounts close together pause every read (`UsageRateLimit`).
     private var rateLimit = UsageRateLimit()
     private var rateLimitedUntil: Date { rateLimit.pausedUntil }
@@ -188,9 +192,13 @@ final class AppModel {
         do { try AccountVaultTransfer.recover() } catch { message = (error as? ImportFailure)?.message ?? "上次导入的现场无法自动收尾，请检查后再导入。" }
         do { library = try Disk.load() } catch { storageAvailable = false; message = "账号资料无法读取，已停止写入。请先检查本地数据；不会以空列表覆盖。" }
         loadProjects()
+        let held = restoreUsageHolds()
         // Being told to wait, or a dropped connection, is not a lasting problem with an account; earlier versions kept it as one.
+        // An account still serving a server 429's wait keeps saying so.
         let passing: Set<String> = ["额度接口限流，已按服务端要求延后重试。", UsageFailure.rateLimited(0).message, UsageFailure.network.message]
-        for index in library.accounts.indices where library.accounts[index].issue.map(passing.contains) == true { library.accounts[index].issue = nil }
+        for index in library.accounts.indices where library.accounts[index].issue.map(passing.contains) == true && !held.contains(library.accounts[index].id) {
+            library.accounts[index].issue = nil
+        }
         if storageAvailable {
             do { try CLILogin.cleanupStaleLogins() } catch { message = "上次授权的临时资料未能清理，请检查钥匙串与目录权限。" }
         }
@@ -238,6 +246,7 @@ final class AppModel {
         if let tokenRenew { self.tokenRenew = tokenRenew }
         if let projectRuntime { self.projectRuntime = projectRuntime }
         self.identityFetch = identityFetch ?? { _ in nil }
+        restoreUsageHolds()
         restoreRelayPreference()
     }
     private func restoreRelayPreference() {
@@ -443,6 +452,13 @@ final class AppModel {
         guard let index = library.accounts.firstIndex(where: { $0.id == id }) else { return }
         change(&library.accounts[index]); save()
     }
+    /// Turns the 429 waits saved before a relaunch back into backoffs, so no waiting account is asked again early.
+    @discardableResult
+    private func restoreUsageHolds() -> Set<UUID> {
+        let holds = UsageHold.restore(&library.accounts, at: .now)
+        for (id, until) in holds { backoffs[id] = Backoff(heldUntil: until); failures[id] = .rateLimited(nil) }
+        return Set(holds.keys)
+    }
     /// Turning an account off says which projects can no longer start; turning one on lets a paused hand-off look again
     /// at once rather than at its retry time.
     func setEnabled(_ enabled: Bool, id: UUID) {
@@ -584,7 +600,7 @@ final class AppModel {
         let usage: Capability = OAuthDocument.lacksUsageScope(credential.data) ? .unavailable : .unknown
         let issue = usage == .unavailable ? UsageFailure.permission.message : nil
         if let id {
-            update(id) { $0.kind = kind; $0.usageCapability = usage; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = issue; $0.refreshRejected = nil }
+            update(id) { $0.kind = kind; $0.usageCapability = usage; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = issue; $0.refreshRejected = nil; $0.usageRetryAt = nil }
             failures[id] = nil; backoffs[id] = nil; renewalBackoffs[id] = nil
         } else {
             var account = Account(id: accountID, label: label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "新账号 \(accounts.count + 1)" : label, kind: kind)
@@ -803,7 +819,7 @@ final class AppModel {
                 try runtime.rebaseline()
             }
             if verdict == .adopt {
-                update(account.id) { $0.expiresAt = found.expiresAt; $0.issue = nil; $0.refreshRejected = nil }
+                update(account.id) { $0.expiresAt = found.expiresAt; $0.issue = nil; $0.refreshRejected = nil; $0.usageRetryAt = nil }
                 failures[account.id] = nil; backoffs[account.id] = nil; status = "已同步官方 CLI 续期的凭据"
             }
             return verdict
@@ -902,9 +918,10 @@ final class AppModel {
         do {
             let credential = try await renewedCredential(for: id)
             asked = credential
+            requestTally.note(id, at: .now)
             let snapshot = try await usageFetch(credential)
             guard accounts.contains(where: { $0.id == id }), await isCurrent(credential, for: id) else { return }
-            update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil }
+            update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil; $0.usageRetryAt = nil }
             if id == library.activeID { notePace(snapshot, for: id) }
             if let backoff = backoffs[id], backoff.failures > 0 || backoff.nextAttempt != .distantPast { backoffs[id]?.succeed() }
             if failures[id] != nil { failures[id] = nil }
@@ -924,14 +941,19 @@ final class AppModel {
             if let asked, await !isCurrent(asked, for: id) { return }
             let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
+            var retryAt: Date?
             if case .rateLimited(let server) = failure, let next = backoffs[id]?.nextAttempt {
+                retryAt = next
                 let pausedAll = rateLimit.refused(id, until: next, at: .now)
                 // Each line is a request the server refused, and an account asks again only after its wait: no flood.
-                SwitchLog.record("usage-429", detail: usageRefusal(retryAfter: server, wait: next.timeIntervalSinceNow,
-                                                                   active: id == library.activeID, pausedAll: pausedAll))
+                let active = id == library.activeID
+                SwitchLog.record("usage-429", detail: usageRefusal(retryAfter: server, wait: next.timeIntervalSinceNow, active: active,
+                                                                   pausedAll: pausedAll, left: lastActiveAt[id].map { Date.now.timeIntervalSince($0) },
+                                                                   requests: requestTally.count(id, at: .now), allRequests: requestTally.total(at: .now)))
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
             update(id) {
+                $0.usageRetryAt = retryAt
                 if failure == .permission { $0.usageCapability = .unavailable }
                 $0.issue = UsageFailure.shown(failure.message, capability: $0.usageCapability)
             }
@@ -1610,6 +1632,7 @@ final class AppModel {
         // account, so each change redraws the whole window. The figures that depend on time change by the minute, so
         // the clock moves at most every 15 seconds.
         if Date.now.timeIntervalSince(clock) >= 15 || Date.now < clock { clock = .now }
+        if let active = library.activeID { lastActiveAt[active] = .now }
         // A switch in progress has the scope; reads that are out (`loading`) no longer hold the pass up.
         guard !busy else { return }
         if demo { touchDemoSamples(); await relay(); return }
@@ -1724,7 +1747,7 @@ final class AppModel {
                     }
                 }
                 update(id) {
-                    $0.expiresAt = credential.expiresAt; $0.issue = nil
+                    $0.expiresAt = credential.expiresAt; $0.issue = nil; $0.usageRetryAt = nil
                     // What was adopted decides what the account is: a login that can renew itself is a full login.
                     $0.kind = credential.refreshable ? .oauth : .setupToken; $0.usageCapability = .unknown
                 }
