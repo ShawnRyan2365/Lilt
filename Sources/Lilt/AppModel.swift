@@ -924,8 +924,11 @@ final class AppModel {
             if let asked, await !isCurrent(asked, for: id) { return }
             let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
-            if case .rateLimited = failure, let next = backoffs[id]?.nextAttempt {
-                rateLimit.refused(id, until: next, at: .now)
+            if case .rateLimited(let server) = failure, let next = backoffs[id]?.nextAttempt {
+                let pausedAll = rateLimit.refused(id, until: next, at: .now)
+                // Each line is a request the server refused, and an account asks again only after its wait: no flood.
+                SwitchLog.record("usage-429", detail: usageRefusal(retryAfter: server, wait: next.timeIntervalSinceNow,
+                                                                   active: id == library.activeID, pausedAll: pausedAll))
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
             update(id) {

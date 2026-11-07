@@ -92,7 +92,7 @@ struct WindowGlance: Equatable {
     /// What is left, or nil when it is not known.
     var remaining: Double?
     var level: QuotaLevel
-    /// "3 小时后", "时间未知", "待刷新", or nil when there is nothing worth saying: a full window that has not started has no clock.
+    /// "3 小时后", "时间未知", "已重置，待读取", or nil when there is nothing worth saying: a full window that has not started has no clock.
     var caption: String?
     var resetsAt: Date?
     /// How far the window has run, 0...1, for the clock hand. A full window with no reset time has not
@@ -113,8 +113,9 @@ struct WindowGlance: Equatable {
         if let remaining {
             caption = Wording.resetAmount(window?.resetsAt, now: now).map { "\($0)后" } ?? (remaining >= 100 ? nil : "时间未知")
         } else if window?.resetsAt.map({ $0 <= now }) == true {
-            // The window refreshed after this reading. It is read again rather than assumed full (PRD).
-            caption = "待刷新"
+            // The window refreshed after this reading. It is read again rather than assumed full (PRD). "待刷新" was
+            // taken for a login that needs renewing; this says it is the quota reading that is out of date.
+            caption = "已重置，待读取"
         } else {
             caption = nil
         }

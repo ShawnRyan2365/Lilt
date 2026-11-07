@@ -31,10 +31,7 @@ struct UsageClient {
                 let lacksProfile = OAuthDocument.lacksUsageScope(credential.data)
                 throw body.contains("scope") || body.contains("user:profile") || lacksProfile ? UsageFailure.permission : UsageFailure.authentication
             case 429:
-                let header = response.value(forHTTPHeaderField: "Retry-After") ?? ""
-                let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-                let seconds = Double(header) ?? formatter.date(from: header).map { max(0, $0.timeIntervalSinceNow) } ?? 60
-                throw UsageFailure.rateLimited(seconds)
+                throw UsageFailure.rateLimited(RetryAfter.seconds(response.value(forHTTPHeaderField: "Retry-After")))
             default: throw UsageFailure.invalidResponse
             }
         } catch let error as UsageFailure { throw error }

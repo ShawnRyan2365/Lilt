@@ -383,7 +383,9 @@ public struct RelayLatch: Sendable {
     }
 }
 public enum UsageFailure: Error, Equatable, Sendable {
-    case authentication, permission, accessExpired, rateLimited(TimeInterval), network, invalidResponse
+    /// `rateLimited` carries the seconds the server's `Retry-After` asked for, or nil when it sent none Lilt could read;
+    /// the two are told apart so `switches.log` can say which it was.
+    case authentication, permission, accessExpired, rateLimited(TimeInterval?), network, invalidResponse
     public var message: String {
         switch self {
         case .authentication: "授权已失效，请重新授权。"
@@ -410,13 +412,32 @@ public struct Backoff: Sendable {
         failures += 1
         var delay = min(900, 15 * pow(2, Double(min(failures - 1, 6))))
         if case .rateLimited(let server) = error {
-            let requested = server == 0 ? 300 : min(4500, max(0, server))
+            // No readable Retry-After keeps the one-minute floor it always had.
+            let requested = server.map { $0 == 0 ? 300 : min(4500, max(0, $0)) } ?? 60
             delay = max(delay, requested)
         }
         if error == .authentication || error == .permission || error == .accessExpired { delay = max(delay, 900) }
         nextAttempt = now.addingTimeInterval(delay)
     }
     public mutating func succeed() { failures = 0; nextAttempt = .distantPast }
+}
+/// A 429's `Retry-After`: delta seconds or an HTTP date. Nil when the header is missing or unreadable.
+public enum RetryAfter {
+    public static func seconds(_ header: String?, now: Date = .now) -> TimeInterval? {
+        guard let header = header?.trimmingCharacters(in: .whitespaces), !header.isEmpty else { return nil }
+        if let seconds = Double(header), seconds.isFinite { return max(0, seconds) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter.date(from: header).map { max(0, $0.timeIntervalSince(now)) }
+    }
+}
+/// One line for `switches.log` when the usage endpoint refuses an account: what the server asked for, how long that
+/// account now waits (Lilt's own backoff can be longer, a server value beyond 75 minutes is cut), whether it was the
+/// active account, and whether every read now waits. Numbers only; no names, ids or secrets. It exists because a long
+/// wait on screen could not be told apart from a server value or Lilt's own choice after the fact.
+public func usageRefusal(retryAfter: TimeInterval?, wait: TimeInterval, active: Bool, pausedAll: Bool) -> String {
+    "retry-after=\(retryAfter.map { String(format: "%.0f", $0) + "s" } ?? "none") wait=\(String(format: "%.0f", max(0, wait)))s "
+        + "account=\(active ? "active" : "spare")" + (pausedAll ? " all-paused" : "")
 }
 public enum UsageParser {
     public static func parse(_ data: Data, at now: Date = .now) throws -> UsageSnapshot {

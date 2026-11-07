@@ -203,6 +203,22 @@ final class RelayTests {
         expectEqual(backoff.nextAttempt, now.addingTimeInterval(300))
         var bounded = Backoff(); bounded.fail(.rateLimited(86400), at: now)
         expectEqual(bounded.nextAttempt, now.addingTimeInterval(4500))
+        // No readable Retry-After keeps the one-minute floor.
+        var unspecified = Backoff(); unspecified.fail(.rateLimited(nil), at: now)
+        expectEqual(unspecified.nextAttempt, now.addingTimeInterval(60))
+        // The header: delta seconds, an HTTP date, or nothing usable.
+        expectEqual(RetryAfter.seconds("3600", now: now), 3600)
+        expectEqual(RetryAfter.seconds(" 120 ", now: now), 120)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        expectEqual(RetryAfter.seconds(formatter.string(from: now.addingTimeInterval(1800)), now: now).map { $0.rounded() }, 1800)
+        expectEqual(RetryAfter.seconds(formatter.string(from: now.addingTimeInterval(-60)), now: now), 0)
+        expectEqual(RetryAfter.seconds(nil, now: now), nil); expectEqual(RetryAfter.seconds("", now: now), nil); expectEqual(RetryAfter.seconds("soon", now: now), nil)
+        // The log line says what the server asked for apart from what Lilt waits, and carries no account detail.
+        expectEqual(usageRefusal(retryAfter: 3600, wait: 3600, active: false, pausedAll: false), "retry-after=3600s wait=3600s account=spare")
+        expectEqual(usageRefusal(retryAfter: nil, wait: 60, active: true, pausedAll: true), "retry-after=none wait=60s account=active all-paused")
+        expectEqual(usageRefusal(retryAfter: 86400, wait: 4500, active: false, pausedAll: false), "retry-after=86400s wait=4500s account=spare")
     }
     /// One account refused says nothing about the others; two different accounts refused close together, with no
     /// answer in between, pause every read until the later of them may ask again.
@@ -757,7 +773,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 45 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 45 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 
