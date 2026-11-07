@@ -51,3 +51,32 @@ public func usageRefusal(retryAfter: TimeInterval?, wait: TimeInterval, active: 
     line += " lilt-1h=\(requests) lilt-1h-all=\(allRequests)"
     return line + (pausedAll ? " all-paused" : "")
 }
+
+/// How the renewal that followed a refused token went (`UsagePolling.renewsAfterRefusal`).
+public enum RefusalRenewal: String, Sendable {
+    /// A fresh token was saved and quota was read again with it.
+    case renewed
+    /// The token endpoint refused the refresh token too.
+    case rejected
+    /// No answer: the network, the token endpoint, or local storage failed.
+    case failed
+}
+
+/// One `usage-401` line for `switches.log`: the usage endpoint refused a spare login's token, Lilt renewed it at once,
+/// and this is what came of it. `expires-in` is how long the refused token still had (Lilt never sends one it knows
+/// has expired, so any value here means it was revoked early). `renewal=rejected` means the refresh token is dead too:
+/// the login was renewed somewhere else or signed out, and only a new authorization helps. `renewal=renewed read=ok`
+/// means only the access token had been revoked, and the account is back. `read=refused` means even a fresh token was
+/// refused, which points at the account rather than the token. Words and numbers only; no names, ids or secrets.
+public func tokenRefusal(renewal: RefusalRenewal, read: UsageFailure?, expiresIn: TimeInterval?) -> String {
+    var line = "expires-in=" + (expiresIn.map { String(format: "%.0f", max(0, $0 / 60)) + "m" } ?? "unknown") + " renewal=\(renewal.rawValue)"
+    guard renewal == .renewed else { return line }
+    switch read {
+    case nil: line += " read=ok"
+    case .authentication?: line += " read=refused"
+    case .permission?: line += " read=no-scope"
+    case .rateLimited?: line += " read=429"
+    default: line += " read=failed"
+    }
+    return line
+}

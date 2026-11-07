@@ -39,6 +39,8 @@ public actor HeadlessEngine {
     private var rateLimitedUntil: Date { rateLimit.pausedUntil }
     /// Failed renewals of a login whose reads are waiting back off here, apart from the reads.
     private var renewalBackoffs: [UUID: Backoff] = [:]
+    /// When the monitor last renewed a spare login because its token was refused (`UsagePolling.renewsAfterRefusal`).
+    private var refusalRenewals: [UUID: Date] = [:]
     private var latch = RelayLatch()
     private var departedID: UUID?
     private var departedAt: Date?
@@ -185,6 +187,7 @@ public actor HeadlessEngine {
         guard !label.isEmpty, label.count <= 100 else { throw BackendFailure("备注需为 1–100 个字符。") }
         if let duplicate = twin(identity, besides: id) { throw BackendFailure("这个 Claude 账号已经添加为“\(duplicate.label)”。") }
         let accountID = id ?? UUID()
+        refusalRenewals[accountID] = nil
         var account = id.flatMap({ old in library.accounts.first { $0.id == old } }) ?? Account(id: accountID, label: label, kind: kind)
         account.label = label; account.kind = kind; account.enabled = true; account.expiresAt = credential.expiresAt
         account.issue = nil; account.refreshRejected = nil; account.hotSwitchCapability = .unknown
@@ -274,10 +277,13 @@ public actor HeadlessEngine {
     /// those itself; the CLI using the scope does, and Lilt reads the result back. Two renewals of one refresh token
     /// would leave one side with a token the server already spent.
     private func inScope(_ id: UUID) -> Bool { id == library.activeID || projects.reservedAccountIDs.contains(id) }
-    private func renewed(_ id: UUID) async throws -> Credential {
+    /// `refused` is a credential the usage endpoint just refused (`readAfterRefusal`): it is renewed whatever its
+    /// expiry, as long as it is still the stored one.
+    private func renewed(_ id: UUID, refused: Credential? = nil) async throws -> Credential {
         if let task = renewalTasks[id] { return try await task.value }
         let stored = try credential(id)
-        guard !inScope(id), stored.refreshable, stored.expires(within: RelayPolicy.renewalLead) else { return stored }
+        let due = refused.map { $0.data == stored.data } ?? stored.expires(within: RelayPolicy.renewalLead)
+        guard !inScope(id), stored.refreshable, due else { return stored }
         let task = Task { try await renewer.renew(stored) }
         renewalTasks[id] = task
         defer { renewalTasks[id] = nil }
@@ -437,9 +443,14 @@ public actor HeadlessEngine {
         }
         var asked: Credential?
         do {
-            let credential = try await renewed(id); asked = credential
+            var credential = try await renewed(id); asked = credential
             requestTally.note(id, at: now())
-            let snapshot = try await usageClient.fetch(credential)
+            let snapshot: UsageSnapshot
+            do { snapshot = try await usageClient.fetch(credential) }
+            catch UsageFailure.authentication where renewsAfterRefusal(id, credential, manually: manually) {
+                snapshot = try await readAfterRefusal(id, refused: credential, asked: &asked)
+                credential = asked ?? credential
+            }
             guard library.accounts.contains(where: { $0.id == id }), current(credential, id: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = self.now(); $0.issue = nil; $0.usageRetryAt = nil }
             if id == library.activeID { notePace(snapshot, id: id) }
@@ -470,6 +481,40 @@ public actor HeadlessEngine {
                 $0.issue = UsageFailure.shown(failure.message, capability: $0.usageCapability)
             }
             message = "额度暂未更新，保留上次读数。"
+        }
+    }
+    /// Whether a token the usage endpoint refused is renewed before the read gives up (`UsagePolling.renewsAfterRefusal`).
+    private func renewsAfterRefusal(_ id: UUID, _ credential: Credential, manually: Bool) -> Bool {
+        guard credential.refreshable, let account = account(id) else { return false }
+        return UsagePolling.renewsAfterRefusal(account, active: inScope(id), lastTried: manually ? nil : refusalRenewals[id], at: now())
+    }
+    /// The usage endpoint refused `refused`, a spare login's token that had not expired. It is renewed at once and quota
+    /// is read again with the new one; the attempt and its outcome go to `switches.log` as `usage-401`. Throws what the
+    /// renewal or the second read threw. `asked` follows the credential that the outcome is about.
+    private func readAfterRefusal(_ id: UUID, refused: Credential, asked: inout Credential?) async throws -> UsageSnapshot {
+        // Replaced while the request was out: the refusal says nothing about the new login, which the next pass reads.
+        guard current(refused, id: id) else { throw UsageFailure.authentication }
+        let at = now()
+        refusalRenewals[id] = at
+        let expiresIn = refused.expiresAt.map { $0.timeIntervalSince(at) }
+        let fresh: Credential
+        do { fresh = try await renewed(id, refused: refused) }
+        catch {
+            let renewal: RefusalRenewal = error as? UsageFailure == .authentication ? .rejected : .failed
+            store.log("usage-401", detail: tokenRefusal(renewal: renewal, read: nil, expiresIn: expiresIn))
+            throw error
+        }
+        // Nothing was renewed (the account went into a scope meanwhile, where its CLI renews it): the refusal stands.
+        guard fresh.data != refused.data else { throw UsageFailure.authentication }
+        asked = fresh
+        requestTally.note(id, at: now())
+        do {
+            let snapshot = try await usageClient.fetch(fresh)
+            store.log("usage-401", detail: tokenRefusal(renewal: .renewed, read: nil, expiresIn: expiresIn))
+            return snapshot
+        } catch {
+            store.log("usage-401", detail: tokenRefusal(renewal: .renewed, read: error as? UsageFailure ?? .network, expiresIn: expiresIn))
+            throw error
         }
     }
     /// The read of a spare login is waiting, but its token is about to expire. Renewal goes to another endpoint, so

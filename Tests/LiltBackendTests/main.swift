@@ -70,6 +70,36 @@ actor ExtendingRenewer: TokenRenewing {
     }
 }
 
+/// Refuses the tokens it is told to (a revoked login), or every token. Counts requests, apart from those with `uncounted`:
+/// a takeover reads the active account in the background, at a moment the checks do not control.
+actor RevokingUsage: UsageFetching {
+    var refused: Set<String>
+    let uncounted: String
+    var refuseAll = false
+    var calls = 0
+    init(refused: Set<String>, uncounted: String) { self.refused = refused; self.uncounted = uncounted }
+    func fetch(_ credential: Credential) async throws -> UsageSnapshot {
+        if credential.token != uncounted { calls += 1 }
+        if refuseAll || refused.contains(credential.token ?? "") { throw UsageFailure.authentication }
+        return UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    }
+    func refuseEverything() { refuseAll = true }
+    func refuse(_ token: String) { refused.insert(token) }
+}
+/// Hands back a new login good for eight hours, or refuses the refresh token once told to.
+actor RotatingRenewer: TokenRenewing {
+    var count = 0
+    var rejects = false
+    func renew(_ credential: Credential) async throws -> Credential {
+        count += 1
+        if rejects { throw RenewalFailure.rejected }
+        return Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": [
+            "accessToken": "fixture-access-renewed-\(count)", "refreshToken": "fixture-refresh-renewed-\(count)",
+            "expiresAt": Int64(Date.now.timeIntervalSince1970 * 1000 + 28_800_000)]]))
+    }
+    func reject() { rejects = true }
+}
+
 func testSecureRuntime() throws {
     let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
     try initialConfig(store)
@@ -126,6 +156,63 @@ func testStatusLine() throws {
     let restored = try JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.settings)) as! [String: Any]
     expect((restored["statusLine"] as! [String: Any])["command"] as? String == "cat", "status line restore")
     expect(!FileManager.default.fileExists(atPath: store.paths.runtimeScope.spool.path), "status line cleanup")
+}
+
+/// A spare login whose token is refused is renewed at once and read again; automatic attempts come once an hour; a dead
+/// refresh token marks the account for re-authorization; the active account is left to its CLI. Each attempt is logged.
+func testRefusalRenewal() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
+    let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+    let a = credential("revoked-a"), b = credential("revoked-b")
+    let usage = RevokingUsage(refused: [b.token!], uncounted: a.token!)
+    let renewer = RotatingRenewer()
+    let clock = Clock()
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: renewer, now: { clock.value }, requestGap: 0)
+    let aID = try await engine.add(a, identity: identity("revoked-a"), label: "A", kind: .oauth)
+    _ = try await engine.takeOver(label: nil)
+    let bID = try await engine.add(b, identity: identity("revoked-b"), label: "B", kind: .oauth)
+    let activeID = await engine.snapshot().0.activeID
+    expect(activeID == aID, "fixture: A is the active account")
+    func log() -> String { (try? String(contentsOf: store.paths.stateRoot.appendingPathComponent("switches.log"), encoding: .utf8)) ?? "" }
+
+    await engine.refresh(bID)
+    var calls = await usage.calls, renewals = await renewer.count
+    expect(calls == 2 && renewals == 1, "a refused spare token was not renewed and read again: calls=\(calls) renewals=\(renewals)")
+    let recovered = await engine.account(bID)
+    expect(recovered?.issue == nil && recovered?.usage?.fiveHour?.used == 25 && recovered?.refreshRejected == nil, "the renewed login did not bring the account back")
+    let stored = try store.readSecret(bID.uuidString).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    expect(stored.contains("fixture-access-renewed-1"), "the renewed login was not stored")
+    expect(log().contains("usage-401 expires-in=480m renewal=renewed read=ok"), "the recovery was not logged")
+
+    // Fresh tokens refused too: no second renewal on its own within the hour, one after it.
+    await usage.refuseEverything()
+    await engine.refresh(bID)
+    calls = await usage.calls; renewals = await renewer.count
+    expect(calls == 3 && renewals == 1, "renewed again within the hour: calls=\(calls) renewals=\(renewals)")
+    let refusedIssue = await engine.account(bID)?.issue
+    expect(refusedIssue == UsageFailure.authentication.message, "a refused token did not say so")
+    clock.value = clock.value.addingTimeInterval(UsagePolling.refusalRenewalGap + 1)
+    await engine.refresh(bID)
+    calls = await usage.calls; renewals = await renewer.count
+    expect(calls == 5 && renewals == 2, "no renewal after the hour: calls=\(calls) renewals=\(renewals)")
+    expect(log().contains("renewal=renewed read=refused"), "a fresh token refused too was not logged")
+
+    // A dead refresh token: marked for re-authorization and not tried again.
+    await renewer.reject()
+    await engine.refresh(bID, manually: true)
+    calls = await usage.calls; renewals = await renewer.count
+    let dead = await engine.account(bID)
+    expect(calls == 6 && renewals == 3 && dead?.refreshRejected == true && dead?.issue == UsageFailure.authentication.message, "a rejected renewal did not mark the account")
+    expect(log().contains("renewal=rejected"), "a rejected renewal was not logged")
+    await engine.refresh(bID, manually: true)
+    calls = await usage.calls; renewals = await renewer.count
+    expect(calls == 7 && renewals == 3, "a dead refresh token was tried again: renewals=\(renewals)")
+
+    // The active account's login is renewed by the CLI that uses it, never here.
+    await engine.refresh(aID, manually: true)
+    renewals = await renewer.count
+    let activeIssue = await engine.account(aID)?.issue
+    expect(renewals == 3 && activeIssue == UsageFailure.authentication.message, "the active account was renewed: renewals=\(renewals)")
 }
 
 func testRefreshRecovery() async throws {
@@ -406,6 +493,7 @@ expect(SHA256.hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
 try testSecureRuntime()
 try testStatusLine()
 try await testRefreshRecovery()
+try await testRefusalRenewal()
 try await testAlternatePolling()
 try await testWaitingAccountsTakeNoPollSlot()
 try await testExhaustedAccountsTakeNoPollSlot()
@@ -418,4 +506,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (17 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429 and its wait kept across restart, alternate polling, waiting and exhausted accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (18 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429 and its wait kept across restart, a refused spare token renewed at once (once an hour, never the active account), alternate polling, waiting and exhausted accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

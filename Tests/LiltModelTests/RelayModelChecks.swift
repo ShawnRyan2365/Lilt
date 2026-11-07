@@ -89,6 +89,7 @@ import LiltCore
         try await interruptedSwitchChecks()
         try await dualModelChecks()
         try await refreshRecoveryChecks()
+        try await refusalRenewalChecks()
         try await exhaustedRefreshChecks()
         try await emptyFileTakeoverCheck()
         try fileRuntimeChecks()
@@ -100,7 +101,7 @@ import LiltCore
         try await projectModelChecks()
         try transferStoreChecks()
         try await oauthImportChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs per-account server 429, a saved 429 wait served out after relaunch, every read paused after two accounts refused in a row, renewal while reads wait, quiet background retries and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import (scope without user:profile marked unreadable, left out of refreshing everything, its reason kept through a 429). No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs per-account server 429, a saved 429 wait served out after relaunch, every read paused after two accounts refused in a row, renewal while reads wait, a refused spare token renewed at once (once an hour on its own, never the active account, a dead refresh token marked for re-authorization), quiet background retries and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import (scope without user:profile marked unreadable, left out of refreshing everything, its reason kept through a 429). No live credentials or requests.")
     }
 }
 
@@ -475,6 +476,87 @@ import LiltCore
     await model.relay()
     precondition(model.active?.id == active.id && model.autoRelay && model.relayPause?.contains("限流") == true,
                  "A global 429 holds relay instead of switching on an old candidate reading")
+}
+
+/// A spare login whose token the usage endpoint refuses (401) is renewed at once, hours before its renewal lead, and
+/// read again. A fresh token refused too is not renewed again on the next automatic pass; a dead refresh token marks the
+/// account for re-authorization; the active account is left to its CLI. Each attempt leaves a `usage-401` line.
+@MainActor func refusalRenewalChecks() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    precondition(home.path.contains("/work/"))
+    var active = Account(label: "Fixture refused A", kind: .oauth)
+    active.usageCapability = .verified
+    var spare = Account(label: "Fixture refused B", kind: .oauth)
+    spare.usageCapability = .verified
+    let later = Date.now.addingTimeInterval(5 * 3600)
+    spare.expiresAt = later
+    var library = Library()
+    library.accounts = [active, spare]; library.activeID = active.id
+    library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system; library.preferences.liveUsage = false
+    func login(_ access: String) throws -> Data {
+        try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": access, "refreshToken": access + "-refresh",
+                                                                      "expiresAt": later.timeIntervalSince1970 * 1000]])
+    }
+    try AccountVault.write(try login("fixture-revoked-active"), account: active.id.uuidString)
+    try AccountVault.write(try login("fixture-revoked-access"), account: spare.id.uuidString)
+    let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: { nil }, write: { _ in }, delete: { }))
+    var calls = 0, renewals = 0, refuseAll = false
+    var renewal: Error? = nil
+    let model = AppModel(fixture: library, runtime: scope, usageFetch: { credential in
+        calls += 1
+        if refuseAll || credential.token?.hasPrefix("fixture-revoked") == true { throw UsageFailure.authentication }
+        return UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    }, tokenRenew: { _ in
+        renewals += 1
+        if let renewal { throw renewal }
+        return Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": [
+            "accessToken": "fixture-renewed-access-\(renewals)", "refreshToken": "fixture-renewed-refresh-\(renewals)",
+            "expiresAt": (Date.now.timeIntervalSince1970 + 28800) * 1000]]))
+    })
+    func row(_ id: UUID) -> Account? { model.library.accounts.first { $0.id == id } }
+    func logged(_ text: String) async -> Bool {
+        for _ in 0..<200 {
+            let log = (try? String(contentsOf: Disk.file("switches.log"), encoding: .utf8)) ?? ""
+            if log.contains(text) { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    // Revoked with five hours left: renewed at once and read again, and the account is back.
+    await model.refresh(spare.id)
+    precondition(calls == 2 && renewals == 1, "A refused spare token is renewed at once and read again: calls=\(calls) renewals=\(renewals)")
+    precondition(row(spare.id)?.issue == nil && row(spare.id)?.usage?.fiveHour?.used == 25 && row(spare.id)?.refreshRejected == nil)
+    precondition((row(spare.id)?.expiresAt ?? .distantPast) > Date.now.addingTimeInterval(7 * 3600))
+    let saved = try AccountVault.read(account: spare.id.uuidString).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    precondition(saved.contains("fixture-renewed-access-1"), "The renewed login is what is stored")
+    let recovered = await logged("usage-401 expires-in=300m renewal=renewed read=ok")
+    precondition(recovered, "The recovery is logged")
+
+    // Even the fresh token is refused: the next automatic pass does not renew it again. A person asking does.
+    refuseAll = true
+    await model.refresh(spare.id)
+    precondition(calls == 3 && renewals == 1, "No second renewal on its own within the hour: calls=\(calls) renewals=\(renewals)")
+    precondition(row(spare.id)?.issue == UsageFailure.authentication.message)
+    await model.refresh(spare.id, manually: true)
+    precondition(calls == 5 && renewals == 2 && row(spare.id)?.refreshRejected == nil, "A manual refresh renews and reads again")
+    let refusedAgain = await logged("renewal=renewed read=refused")
+    precondition(refusedAgain, "A fresh token refused too is logged")
+
+    // The refresh token is dead too: marked for re-authorization, and not renewed again.
+    renewal = TokenRenewer.Failure.rejected
+    await model.refresh(spare.id, manually: true)
+    precondition(calls == 6 && renewals == 3 && row(spare.id)?.refreshRejected == true && row(spare.id)?.issue == UsageFailure.authentication.message,
+                 "A rejected renewal marks the account for re-authorization")
+    let rejected = await logged("renewal=rejected")
+    precondition(rejected, "A rejected renewal is logged")
+    await model.refresh(spare.id, manually: true)
+    precondition(calls == 7 && renewals == 3, "A dead refresh token is not tried again")
+
+    // The active account's login belongs to the CLI using it, which renews it; Lilt does not.
+    renewal = nil
+    await model.refresh(active.id, manually: true)
+    precondition(calls == 8 && renewals == 3 && row(active.id)?.issue == UsageFailure.authentication.message, "The active account is not renewed here")
 }
 
 /// Automatic entry points do not keep asking an account whose quota is already known to be exhausted.

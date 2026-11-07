@@ -46,6 +46,23 @@ public enum UsagePolling {
         return expiresAt <= now.addingTimeInterval(RelayPolicy.renewalLead)
     }
 
+    /// The shortest time between two renewals `renewsAfterRefusal` starts on its own for one account.
+    public static let refusalRenewalGap: TimeInterval = 3600
+
+    /// The usage endpoint refused a spare login's access token (401) before it expired, so it was revoked early: the
+    /// same login renewed somewhere else, a sign-out on claude.ai, or a reason the server does not give. One renewal
+    /// at once tells which. A refresh token that still works brings the account back; a dead one marks it for
+    /// re-authorization. Before, nothing happened until an hour before expiry, so the row could say "re-authorize"
+    /// for hours about a login that renewal would have fixed. The account in a scope is left to the CLI that uses it,
+    /// like every renewal. Automatic attempts come at most once per `refusalRenewalGap`, so a login whose fresh tokens
+    /// are refused too is not renewed on every pass; a person who refreshes it by hand passes no `lastTried`.
+    public static func renewsAfterRefusal(_ account: Account, active: Bool, lastTried: Date?, at now: Date) -> Bool {
+        guard !active, account.enabled, account.kind == .oauth, account.refreshRejected != true else { return false }
+        guard let lastTried else { return true }
+        let age = now.timeIntervalSince(lastTried)
+        return age < 0 || age >= refusalRenewalGap
+    }
+
     public static func due(_ account: Account, active: Bool, autoRelay: Bool, urgent: Bool, watching: Bool, at now: Date) -> Bool {
         guard account.enabled, account.usageCapability != .unavailable else { return false }
         if renewalDue(account, active: active, at: now) { return true }

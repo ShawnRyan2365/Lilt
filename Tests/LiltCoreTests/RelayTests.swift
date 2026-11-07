@@ -248,6 +248,29 @@ final class RelayTests {
         tally.note(a, at: now)
         expectEqual(tally.count(a, at: now), 2); expectEqual(tally.total(at: now), 3); expectEqual(tally.count(UUID(), at: now), 0)
     }
+    /// A spare login whose token the usage endpoint refused is renewed at once, at most once an hour on its own; the
+    /// account in a scope, a setup token, a disabled account and one whose refresh token is already dead are not.
+    func testRenewalAfterRefusal() {
+        let spare = Account(label: "fixture-refused", kind: .oauth)
+        expect(UsagePolling.renewsAfterRefusal(spare, active: false, lastTried: nil, at: now))
+        expectFalse(UsagePolling.renewsAfterRefusal(spare, active: true, lastTried: nil, at: now))
+        var dead = spare; dead.refreshRejected = true
+        expectFalse(UsagePolling.renewsAfterRefusal(dead, active: false, lastTried: nil, at: now))
+        var off = spare; off.enabled = false
+        expectFalse(UsagePolling.renewsAfterRefusal(off, active: false, lastTried: nil, at: now))
+        expectFalse(UsagePolling.renewsAfterRefusal(Account(label: "fixture-setup", kind: .setupToken), active: false, lastTried: nil, at: now))
+        expectFalse(UsagePolling.renewsAfterRefusal(spare, active: false, lastTried: now.addingTimeInterval(-600), at: now))
+        expect(UsagePolling.renewsAfterRefusal(spare, active: false, lastTried: now.addingTimeInterval(-UsagePolling.refusalRenewalGap), at: now))
+        // A clock that moved back does not hold the account for longer than the gap.
+        expect(UsagePolling.renewsAfterRefusal(spare, active: false, lastTried: now.addingTimeInterval(600), at: now))
+        expectEqual(tokenRefusal(renewal: .rejected, read: nil, expiresIn: 95 * 60), "expires-in=95m renewal=rejected")
+        expectEqual(tokenRefusal(renewal: .failed, read: .authentication, expiresIn: nil), "expires-in=unknown renewal=failed")
+        expectEqual(tokenRefusal(renewal: .renewed, read: nil, expiresIn: 3600), "expires-in=60m renewal=renewed read=ok")
+        expectEqual(tokenRefusal(renewal: .renewed, read: .authentication, expiresIn: 3600), "expires-in=60m renewal=renewed read=refused")
+        expectEqual(tokenRefusal(renewal: .renewed, read: .rateLimited(120), expiresIn: 3600), "expires-in=60m renewal=renewed read=429")
+        expectEqual(tokenRefusal(renewal: .renewed, read: .permission, expiresIn: -5), "expires-in=0m renewal=renewed read=no-scope")
+        expectEqual(tokenRefusal(renewal: .renewed, read: .network, expiresIn: 3600), "expires-in=60m renewal=renewed read=failed")
+    }
     /// One account refused says nothing about the others; two different accounts refused close together, with no
     /// answer in between, pause every read until the later of them may ask again.
     func testRateLimitHoldsOneAccountUntilTwoAreRefused() {
@@ -769,6 +792,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testDuplicateEventClaimedOnce()
         suite.testRetryAfterAndAuthentication()
         suite.testUsageWaitSurvivesRelaunch()
+        suite.testRenewalAfterRefusal()
         suite.testRateLimitHoldsOneAccountUntilTwoAreRefused()
         suite.testUsageScopeComesFromTheStatedScopes()
         suite.testExhaustedAccountIsHeldUnlessItsLoginNeedsRenewal()
@@ -802,7 +826,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 46 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 47 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 

@@ -117,6 +117,8 @@ final class AppModel {
     private var rateLimitedUntil: Date { rateLimit.pausedUntil }
     /// A login about to expire is renewed while its quota reads wait; failed renewals back off here, apart from reads.
     private var renewalBackoffs: [UUID: Backoff] = [:]
+    /// When the monitor last renewed a spare login because its token was refused (`UsagePolling.renewsAfterRefusal`).
+    private var refusalRenewals: [UUID: Date] = [:]
     /// Requests for one account share one answer (`refreshes`); requests of any account start two seconds apart.
     private let spacing = RequestSpacing()
     private var refreshes: [UUID: Task<Void, Never>] = [:]
@@ -601,7 +603,7 @@ final class AppModel {
         let issue = usage == .unavailable ? UsageFailure.permission.message : nil
         if let id {
             update(id) { $0.kind = kind; $0.usageCapability = usage; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = issue; $0.refreshRejected = nil; $0.usageRetryAt = nil }
-            failures[id] = nil; backoffs[id] = nil; renewalBackoffs[id] = nil
+            failures[id] = nil; backoffs[id] = nil; renewalBackoffs[id] = nil; refusalRenewals[id] = nil
         } else {
             var account = Account(id: accountID, label: label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "新账号 \(accounts.count + 1)" : label, kind: kind)
             account.expiresAt = credential.expiresAt
@@ -663,13 +665,16 @@ final class AppModel {
     /// official CLI renews it and Lilt reads the result back, so the two cannot spend the same refresh token.
     /// The lead is `RelayPolicy.renewalLead` (one hour), leaving time for retries before expiry and keeping
     /// the token written into the scope well outside the CLI's own five-minute refresh buffer.
-    private func renewedCredential(for id: UUID) async throws -> Credential {
+    /// `refused` is a credential the usage endpoint just refused (`readAfterRefusal`): it is renewed whatever its
+    /// expiry, as long as it is still the stored one.
+    private func renewedCredential(for id: UUID, refused: Credential? = nil) async throws -> Credential {
         let renewal: Task<Credential, Error>
         if let running = renewals[id] { renewal = running } else {
             let stored = try await credential(for: id)
+            let due = refused.map { $0.data == stored.data } ?? stored.expires(within: RelayPolicy.renewalLead)
             // An account in a project's scope is renewed by that project's CLI, like the one in the default login.
             guard !demo, id != library.activeID, !projectCatalog.reservedAccountIDs.contains(id), stored.refreshable,
-                  stored.expires(within: RelayPolicy.renewalLead) else { return stored }
+                  due else { return stored }
             if let running = renewals[id] { renewal = running } else {
                 let renew = tokenRenew
                 renewal = Task {
@@ -873,6 +878,40 @@ final class AppModel {
             renewalBackoffs[id, default: Backoff()].fail(.network, at: .now)
         }
     }
+    /// Whether a token the usage endpoint refused is renewed before the read gives up (`UsagePolling.renewsAfterRefusal`).
+    private func renewsAfterRefusal(_ id: UUID, _ credential: Credential, manually: Bool) -> Bool {
+        guard !demo, credential.refreshable, let account = accounts.first(where: { $0.id == id }) else { return false }
+        return UsagePolling.renewsAfterRefusal(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id),
+                                               lastTried: manually ? nil : refusalRenewals[id], at: .now)
+    }
+    /// The usage endpoint refused `refused`, a spare login's token that had not expired. It is renewed at once and quota
+    /// is read again with the new one; the attempt and its outcome go to `switches.log` as `usage-401`. Throws what the
+    /// renewal or the second read threw. `asked` follows the credential that the outcome is about.
+    private func readAfterRefusal(_ id: UUID, refused: Credential, asked: inout Credential?) async throws -> UsageSnapshot {
+        // Replaced while the request was out: the refusal says nothing about the new login, which the next pass reads.
+        guard await isCurrent(refused, for: id) else { throw UsageFailure.authentication }
+        refusalRenewals[id] = .now
+        let expiresIn = refused.expiresAt.map { $0.timeIntervalSinceNow }
+        let fresh: Credential
+        do { fresh = try await renewedCredential(for: id, refused: refused) }
+        catch {
+            let renewal: RefusalRenewal = error as? UsageFailure == .authentication ? .rejected : .failed
+            SwitchLog.record("usage-401", detail: tokenRefusal(renewal: renewal, read: nil, expiresIn: expiresIn))
+            throw error
+        }
+        // Nothing was renewed (the account went into a scope meanwhile, where its CLI renews it): the refusal stands.
+        guard fresh.data != refused.data else { throw UsageFailure.authentication }
+        asked = fresh
+        requestTally.note(id, at: .now)
+        do {
+            let snapshot = try await usageFetch(fresh)
+            SwitchLog.record("usage-401", detail: tokenRefusal(renewal: .renewed, read: nil, expiresIn: expiresIn))
+            return snapshot
+        } catch {
+            SwitchLog.record("usage-401", detail: tokenRefusal(renewal: .renewed, read: error as? UsageFailure ?? .network, expiresIn: expiresIn))
+            throw error
+        }
+    }
     func refresh(_ id: UUID, manually: Bool = false) async {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
         if busy {
@@ -916,10 +955,15 @@ final class AppModel {
         }
         var asked: Credential?
         do {
-            let credential = try await renewedCredential(for: id)
+            var credential = try await renewedCredential(for: id)
             asked = credential
             requestTally.note(id, at: .now)
-            let snapshot = try await usageFetch(credential)
+            let snapshot: UsageSnapshot
+            do { snapshot = try await usageFetch(credential) }
+            catch UsageFailure.authentication where renewsAfterRefusal(id, credential, manually: manually) {
+                snapshot = try await readAfterRefusal(id, refused: credential, asked: &asked)
+                credential = asked ?? credential
+            }
             guard accounts.contains(where: { $0.id == id }), await isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil; $0.usageRetryAt = nil }
             if id == library.activeID { notePace(snapshot, for: id) }
