@@ -59,6 +59,11 @@ cleanup() {
 }
 trap cleanup EXIT
 lilt() { HOME="$HOME_DIR" PATH="$FIX/bin:$PATH" "$BIN" "$@"; }
+# A release check passes the version it expects: 0.3.7 shipped with the CLI still calling itself 0.3.6.
+if [ -n "${LILT_EXPECT_VERSION-}" ]; then
+    LILT_FAKE_OUT="$FIX/version.out" lilt --version < /dev/null > "$FIX/version.txt"
+    grep -q "^Lilt $LILT_EXPECT_VERSION " "$FIX/version.txt" || fail "lilt --version is not $LILT_EXPECT_VERSION: $(cat "$FIX/version.txt")"
+fi
 # Output goes to a file before grep reads it: under pipefail, `grep -q` closing the pipe early fails the writer.
 # Feeds `input` to a command through a pseudo-terminal, the only place `lilt export|import` reads a passphrase from.
 # The input arrives after the prompt and the pipe stays open a moment: `script` turns the end of its input into an
