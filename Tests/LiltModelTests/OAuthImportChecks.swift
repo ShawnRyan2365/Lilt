@@ -21,8 +21,9 @@ import LiltCore
     let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: { held }, write: { held = $0 }, delete: { held = nil }))
     var identityCalls = 0
     var usageCalls = 0
-    let model = AppModel(fixture: Library(), runtime: scope, usageFetch: { _ in
+    let model = AppModel(fixture: Library(), runtime: scope, usageFetch: { credential in
         usageCalls += 1
+        if credential.token == "sk-ant-oat01-fixture-inference-access-0001" { throw UsageFailure.rateLimited(60) }
         return UsageSnapshot(fiveHour: UsageWindow(used: 20), sevenDay: UsageWindow(used: 30))
     }, identityFetch: { credential in
         identityCalls += 1
@@ -86,6 +87,13 @@ import LiltCore
     let inferenceOnly = model.accounts[2]
     precondition(inferenceOnly.usageCapability == .unavailable && inferenceOnly.issue == UsageFailure.permission.message && usageCalls == readsBefore)
     precondition(model.usageRetryText(inferenceOnly.id) == nil, "A credential that is never asked again is not promised a retry")
+    // Refreshing everything leaves it out; asked by hand and refused with a 429, it still says why it shows nothing.
+    await model.refreshAll()
+    precondition(usageCalls == readsBefore + 2, "Refreshing every account asked one that cannot read quota")
+    await model.refresh(inferenceOnly.id, manually: true)
+    let after = model.accounts[2]
+    precondition(usageCalls == readsBefore + 3 && after.usageCapability == .unavailable && after.issue == UsageFailure.permission.message,
+                 "A later 429 replaced the reason an unreadable credential shows nothing")
     precondition(model.library.activeID == nil && held == untouched)
 
     try SecureFiles.write(Data("not json".utf8), to: file)

@@ -369,7 +369,7 @@ struct AccountRow: View {
                         if summary.stale, let age = summary.state?.text { Pill(text: age) }
                     }
                     Text(capabilities).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(1)
-                    if let issue = account.issue {
+                    if let issue = UsageFailure.shown(account.issue, capability: account.usageCapability) {
                         Label(issue, systemImage: "exclamationmark.circle").font(Typo.caption).foregroundStyle(Tone.danger.text)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -381,7 +381,7 @@ struct AccountRow: View {
                 cells(summary)
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("优先级 \(index + 1)，\(account.label)\(active ? "，使用中" : "")\(account.enabled ? "" : "，已停用")，\(capabilities)，\(summary.spoken)\(account.issue.map { "，" + $0 } ?? "")")
+            .accessibilityLabel("优先级 \(index + 1)，\(account.label)\(active ? "，使用中" : "")\(account.enabled ? "" : "，已停用")，\(capabilities)，\(summary.spoken)\(UsageFailure.shown(account.issue, capability: account.usageCapability).map { "，" + $0 } ?? "")")
             ZStack {
                 if active {
                     Pill(text: "使用中", style: .ink)

@@ -865,8 +865,7 @@ final class AppModel {
         }
         if pauseForRateLimit(announce: manually) { await renewWhileWaiting(id); return }
         if !manually, let account = accounts.first(where: { $0.id == id }),
-           !UsagePolling.renewalDue(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), at: .now),
-           UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: .now) { return }
+           UsagePolling.holdsForExhaustion(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), threshold: thresholds, at: .now) { return }
         // A request already out for this account answers this one too. Manual refresh may override an ordinary
         // backoff, never a server 429.
         if let running = refreshes[id] {
@@ -929,7 +928,10 @@ final class AppModel {
                 rateLimit.refused(id, until: next, at: .now)
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
-            update(id) { $0.issue = failure.message; if failure == .permission { $0.usageCapability = .unavailable } }
+            update(id) {
+                if failure == .permission { $0.usageCapability = .unavailable }
+                $0.issue = UsageFailure.shown(failure.message, capability: $0.usageCapability)
+            }
             // A spare account's failure stays on its row; announcing each one, unnamed, read as the whole list failing.
             guard manually || id == library.activeID else { return }
             if let retry = usageRetryText(id) { status = "额度暂未更新，\(retry)；保留上次读数" }
@@ -939,7 +941,9 @@ final class AppModel {
     /// A one-off pass the user asked for; never run on a timer.
     func refreshAll() async {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
-        for account in accounts where account.enabled { await refresh(account.id, manually: true) }
+        // A credential that cannot read quota is left out: asking it again only earns a refusal, or a 429. Its own row
+        // can still be refreshed by hand.
+        for account in accounts where account.enabled && account.usageCapability != .unavailable { await refresh(account.id, manually: true) }
     }
     /// The panel just opened or the window came forward: refresh the active account promptly and any idle accounts due.
     func refreshIfStale() async {
@@ -1589,9 +1593,11 @@ final class AppModel {
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
             guard forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: autoRelay, urgent: false, watching: watching, at: .now) else { continue }
-            // An account whose reads wait sends no read, so it takes no slot: logins due for renewal sort first, and
-            // two of them in a backoff used to take both slots on every pass, so no other spare account was read.
-            // `refresh` still renews it if its token is about to run out.
+            // Only an account that sends a read takes a slot. Exhausted accounts awaiting their reset are never read, so
+            // they keep the oldest reading and sort first; with two of them the two slots went to them on every pass and
+            // no other spare account was read at all. Logins due for renewal sort first too, and one in a backoff sends
+            // nothing either; `refresh` still renews it if its token is about to run out.
+            if UsagePolling.holdsForExhaustion(account, active: false, threshold: thresholds, at: .now) { continue }
             if readable(account.id) { reads += 1 }
             await refresh(account.id)
         }

@@ -41,7 +41,7 @@ func printLibrary(_ library: Library) {
     for (index, account) in library.accounts.enumerated() {
         let active = account.id == library.activeID ? "*" : " "
         let disabled = account.enabled ? "" : " [已停用]"
-        let issue = account.issue.map { " · \($0)" } ?? ""
+        let issue = UsageFailure.shown(account.issue, capability: account.usageCapability).map { " · \($0)" } ?? ""
         print("\(active) \(index + 1). \(account.label)\(disabled) · 5小时剩 \(remaining(account.usage?.fiveHour)) · 7天剩 \(remaining(account.usage?.sevenDay))\(issue)")
     }
 }

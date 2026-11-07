@@ -33,6 +33,13 @@ public enum UsagePolling {
         return RelayPolicy(threshold: threshold).nextReset(of: [account], at: now) != nil
     }
 
+    /// An automatic read of this account would be held back: it is known exhausted until a reset still ahead, and its
+    /// login is not due for renewal (a renewal goes ahead and reads quota with it). Such an account sends nothing, so it
+    /// must not take a polling slot either.
+    public static func holdsForExhaustion(_ account: Account, active: Bool, threshold: Thresholds, at now: Date) -> Bool {
+        !renewalDue(account, active: active, at: now) && waitingForExhaustionReset(account, threshold: threshold, at: now)
+    }
+
     public static func renewalDue(_ account: Account, active: Bool, at now: Date) -> Bool {
         guard !active, account.enabled, account.kind == .oauth, account.refreshRejected != true,
               let expiresAt = account.expiresAt else { return false }

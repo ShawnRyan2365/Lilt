@@ -394,6 +394,13 @@ public enum UsageFailure: Error, Equatable, Sendable {
         case .invalidResponse: "额度接口返回了无法识别的数据。"
         }
     }
+    /// What an account's row says went wrong. A credential that cannot read quota keeps saying so: a 429 or a dropped
+    /// connection on a later manual try does not explain why it shows nothing, yet it replaced that reason on screen.
+    /// A refused login is a different, newer problem and stays.
+    public static func shown(_ issue: String?, capability: Capability) -> String? {
+        guard let issue, capability == .unavailable, issue != UsageFailure.authentication.message else { return issue }
+        return UsageFailure.permission.message
+    }
 }
 public struct Backoff: Sendable {
     public private(set) var failures = 0

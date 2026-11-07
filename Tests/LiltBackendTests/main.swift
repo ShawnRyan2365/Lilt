@@ -252,6 +252,44 @@ func testWaitingAccountsTakeNoPollSlot() async throws {
     expect(calls == 2 && checked == clock.value, "accounts in a backoff took the poll slots: calls=\(calls)")
 }
 
+/// Answers each token with its own reading and remembers who was asked.
+actor TokenUsage: UsageFetching {
+    let readings: [String: UsageSnapshot]
+    var asked: [String] = []
+    init(_ readings: [String: UsageSnapshot]) { self.readings = readings }
+    func fetch(_ credential: Credential) async throws -> UsageSnapshot {
+        let token = credential.token ?? ""; asked.append(token)
+        return readings[token] ?? UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    }
+    func reset() { asked = [] }
+}
+
+/// Exhausted spare accounts are not read before their reset, so they keep the oldest reading and sort first. Two of
+/// them must not take the pass's two slots: the account behind them is read on schedule.
+func testExhaustedAccountsTakeNoPollSlot() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
+    let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+    let clock = Clock()
+    let a = credential("held-a"), b = credential("held-b"), c = credential("held-c"), d = credential("held-d")
+    let spent = UsageSnapshot(fiveHour: UsageWindow(used: 10), sevenDay: UsageWindow(used: 100, resetsAt: clock.value.addingTimeInterval(3 * 86400)))
+    let usage = TokenUsage([b.token!: spent, c.token!: spent])
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), now: { clock.value }, requestGap: 0)
+    _ = try await engine.add(a, identity: identity("held-a"), label: "A", kind: .oauth)
+    _ = try await engine.takeOver(label: nil)
+    _ = try await engine.add(b, identity: identity("held-b"), label: "B", kind: .oauth)
+    _ = try await engine.add(c, identity: identity("held-c"), label: "C", kind: .oauth)
+    let dID = try await engine.add(d, identity: identity("held-d"), label: "D", kind: .oauth)
+    await engine.refreshAll()
+    clock.value = clock.value.addingTimeInterval(10)
+    await engine.refresh(dID, manually: true)
+    clock.value = clock.value.addingTimeInterval(3600)
+    await usage.reset()
+    await engine.tick()
+    let asked = await usage.asked
+    expect(asked.contains(d.token!) && !asked.contains(b.token!) && !asked.contains(c.token!),
+           "exhausted accounts took the poll slots: asked \(asked.count), D read \(asked.contains(d.token!))")
+}
+
 func testExhaustedPollingWaitsForReset() async throws {
     final class Clock: @unchecked Sendable { var value = Date.now }
     let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
@@ -363,6 +401,7 @@ try testStatusLine()
 try await testRefreshRecovery()
 try await testAlternatePolling()
 try await testWaitingAccountsTakeNoPollSlot()
+try await testExhaustedAccountsTakeNoPollSlot()
 try await testExhaustedPollingWaitsForReset()
 try await testExpiringExhaustedAlternateRenewsBeforeReset()
 try await testFreshServerTakeover()
@@ -372,4 +411,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (16 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429, alternate polling, waiting accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (17 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429, alternate polling, waiting and exhausted accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

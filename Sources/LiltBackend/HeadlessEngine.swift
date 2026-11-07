@@ -401,8 +401,7 @@ public actor HeadlessEngine {
         if switching { if manually { message = "正在切换账号，完成后即可刷新" }; return }
         if pauseForRateLimit(manually: manually) { await renewWhileWaiting(id); return }
         if !manually, let account = account(id),
-           !UsagePolling.renewalDue(account, active: inScope(id), at: now()),
-           UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: now()) { return }
+           UsagePolling.holdsForExhaustion(account, active: inScope(id), threshold: thresholds, at: now()) { return }
         if let running = refreshTasks[id] {
             await running.value
             if refreshTasks[id] == running { refreshTasks[id] = nil }
@@ -452,7 +451,10 @@ public actor HeadlessEngine {
                 rateLimit.refused(id, until: next, at: now())
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
-            update(id) { $0.issue = failure.message; if failure == .permission { $0.usageCapability = .unavailable } }
+            update(id) {
+                if failure == .permission { $0.usageCapability = .unavailable }
+                $0.issue = UsageFailure.shown(failure.message, capability: $0.usageCapability)
+            }
             message = "额度暂未更新，保留上次读数。"
         }
     }
@@ -471,7 +473,10 @@ public actor HeadlessEngine {
             renewalBackoffs[id, default: Backoff()].fail(.network, at: now())
         }
     }
-    public func refreshAll() async { for account in library.accounts where account.enabled { await refresh(account.id, manually: true) } }
+    /// A credential that cannot read quota is left out; it can still be refreshed on its own.
+    public func refreshAll() async {
+        for account in library.accounts where account.enabled && account.usageCapability != .unavailable { await refresh(account.id, manually: true) }
+    }
     private func notePace(_ reading: UsageSnapshot, id: UUID) {
         if paceAccount != id { paceAccount = id; paceReadings = [] }
         paceReadings.removeAll { $0.sampledAt >= reading.sampledAt || reading.sampledAt.timeIntervalSince($0.sampledAt) > UsagePace.span }
@@ -732,7 +737,9 @@ public actor HeadlessEngine {
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
             guard forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: library.preferences.autoRelay == true, urgent: false, watching: false, at: now()) else { continue }
-            // An account whose reads wait sends no read and takes no slot; `refresh` still renews it when due.
+            // Only an account that sends a read takes a slot: exhausted accounts awaiting reset sort first and used to
+            // take both slots on every pass. One in a backoff sends nothing either; `refresh` still renews it when due.
+            if UsagePolling.holdsForExhaustion(account, active: false, threshold: thresholds, at: now()) { continue }
             if readable(account.id) { reads += 1 }
             await refresh(account.id)
         }

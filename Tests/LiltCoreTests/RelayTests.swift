@@ -235,6 +235,29 @@ final class RelayTests {
         expectFalse(OAuthDocument.lacksUsageScope(login(nil)))
         expectFalse(OAuthDocument.lacksUsageScope(login([])))
     }
+    /// An exhausted account awaiting its reset is held back unless its login is due for renewal; a held account sends
+    /// nothing and so takes no polling slot.
+    func testExhaustedAccountIsHeldUnlessItsLoginNeedsRenewal() {
+        var spent = Account(label: "Spent", kind: .oauth)
+        spent.lastChecked = now
+        spent.usage = UsageSnapshot(fiveHour: UsageWindow(used: 20), sevenDay: UsageWindow(used: 99, resetsAt: now.addingTimeInterval(86400)), sampledAt: now)
+        spent.expiresAt = now.addingTimeInterval(7200)
+        expect(UsagePolling.holdsForExhaustion(spent, active: false, threshold: Thresholds(fiveHour: 5, sevenDay: 2), at: now))
+        expectFalse(UsagePolling.holdsForExhaustion(spent, active: false, threshold: Thresholds(fiveHour: 5, sevenDay: 0), at: now))
+        spent.expiresAt = now.addingTimeInterval(1800)
+        expectFalse(UsagePolling.holdsForExhaustion(spent, active: false, threshold: Thresholds(fiveHour: 5, sevenDay: 2), at: now))
+        // The account in use is never renewed by Lilt, so its exhaustion holds whatever the expiry.
+        expect(UsagePolling.holdsForExhaustion(spent, active: true, threshold: Thresholds(fiveHour: 5, sevenDay: 2), at: now))
+    }
+    /// A credential that cannot read quota keeps its reason on screen; a refused login still shows as such.
+    func testUnreadableCredentialKeepsItsReason() {
+        let limited = UsageFailure.rateLimited(60).message
+        expectEqual(UsageFailure.shown(limited, capability: .unavailable), UsageFailure.permission.message)
+        expectEqual(UsageFailure.shown(UsageFailure.network.message, capability: .unavailable), UsageFailure.permission.message)
+        expectEqual(UsageFailure.shown(UsageFailure.authentication.message, capability: .unavailable), UsageFailure.authentication.message)
+        expectEqual(UsageFailure.shown(limited, capability: .verified), limited)
+        expect(UsageFailure.shown(nil, capability: .unavailable) == nil)
+    }
     func testUsagePollingKeepsAlternatesAndResetsMoving() {
         var active = Account(label: "Active", kind: .oauth)
         active.lastChecked = now
@@ -703,6 +726,8 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testRetryAfterAndAuthentication()
         suite.testRateLimitHoldsOneAccountUntilTwoAreRefused()
         suite.testUsageScopeComesFromTheStatedScopes()
+        suite.testExhaustedAccountIsHeldUnlessItsLoginNeedsRenewal()
+        suite.testUnreadableCredentialKeepsItsReason()
         suite.testUsagePollingKeepsAlternatesAndResetsMoving()
         try suite.testParserRejectsMalformedAndBooleanUsage()
         suite.testRenewalLeadIsOneHour()
@@ -732,7 +757,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 43 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, per-account 429, usage scope, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 45 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 
