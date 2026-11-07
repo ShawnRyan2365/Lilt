@@ -59,6 +59,16 @@ struct FakeIdentity: IdentityFetching {
     func fetch(_ credential: Credential) async -> Data? { credential.token.flatMap { identities[$0] } }
 }
 struct FakeRenewer: TokenRenewing { func renew(_ credential: Credential) async throws -> Credential { credential } }
+/// Counts renewals and hands back the same login good for eight more hours.
+actor ExtendingRenewer: TokenRenewing {
+    var count = 0
+    func renew(_ credential: Credential) async throws -> Credential {
+        count += 1
+        var oauth = (try JSONSerialization.jsonObject(with: credential.data) as! [String: Any])["claudeAiOauth"] as! [String: Any]
+        oauth["expiresAt"] = Int64(Date.now.timeIntervalSince1970 * 1000 + 28_800_000)
+        return Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": oauth]))
+    }
+}
 
 func testSecureRuntime() throws {
     let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
@@ -125,7 +135,8 @@ func testRefreshRecovery() async throws {
     let snapshot = UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
     let usage = ScriptedUsage(snapshot: snapshot, scripts: [a.token!: [.network, nil], b.token!: [.rateLimited(120), nil]])
     let clock = Clock()
-    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), now: { clock.value }, requestGap: 0)
+    let renewer = ExtendingRenewer()
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: renewer, now: { clock.value }, requestGap: 0)
     let aID = try await engine.add(a, identity: identity("refresh-a"), label: "A", kind: .oauth)
     _ = try await engine.takeOver(label: nil)
     await Task.yield()
@@ -152,13 +163,37 @@ func testRefreshRecovery() async throws {
     expect(limitedCalls == 3, "manual refresh bypassed server 429")
     await engine.refresh(aID, manually: true)
     let independentCalls = await usage.calls
-    expect(independentCalls == 3, "one account's 429 did not pause every account")
+    expect(independentCalls == 4, "one account's 429 paused another account")
+    let independentState = await engine.snapshot()
+    expect(independentState.1.usageRetryAt == nil, "one account's 429 published a global pause")
+    // Two accounts refused in a row, with nothing answered between, pause every read.
+    let c = credential("refresh-c")
+    let cID = try await engine.add(c, identity: identity("refresh-c"), label: "C", kind: .oauth)
+    var soon = (try JSONSerialization.jsonObject(with: credential("refresh-d").data) as! [String: Any])["claudeAiOauth"] as! [String: Any]
+    soon["expiresAt"] = Int64(Date.now.timeIntervalSince1970 * 1000 + 600_000)
+    let dID = try await engine.add(Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": soon])),
+                                   identity: identity("refresh-d"), label: "D", kind: .oauth)
+    await usage.reset([a.token!: [.rateLimited(120)], c.token!: [.rateLimited(120)]])
+    await engine.refresh(aID, manually: true)
+    let soloState = await engine.snapshot()
+    expect(soloState.1.usageRetryAt == nil, "a single refusal paused every account")
+    await engine.refresh(cID, manually: true)
+    await engine.refresh(cID, manually: true)
+    let pausedCalls = await usage.calls
+    expect(pausedCalls == 2, "reads went on after two accounts were refused: calls=\(pausedCalls)")
     let limitedState = await engine.snapshot()
     expect(limitedState.1.usageRetryAt == clock.value.addingTimeInterval(120), "daemon did not publish the global retry time")
+    // A login about to expire is renewed while every read waits, without a quota read.
+    await engine.refresh(dID)
+    let renewedCount = await renewer.count
+    let renewedCalls = await usage.calls
+    expect(renewedCount == 1 && renewedCalls == 2, "expiring login was not renewed during the pause")
+    let renewedExpiry = await engine.account(dID)?.expiresAt ?? .distantPast
+    expect(renewedExpiry > Date.now.addingTimeInterval(3600), "renewed expiry not recorded")
     clock.value = clock.value.addingTimeInterval(121)
     await engine.refresh(aID, manually: true)
     let recoveredCalls = await usage.calls
-    expect(recoveredCalls == 4, "queries did not recover after the global cooldown")
+    expect(recoveredCalls == 3, "queries did not recover after the global cooldown")
 }
 
 func testAlternatePolling() async throws {
@@ -183,6 +218,38 @@ func testAlternatePolling() async throws {
     await engine.tick()
     calls = await usage.calls
     expect(calls == 1, "alternate was left stale at its scheduled poll: \(calls)")
+}
+
+/// Logins due for renewal sort first among spare accounts. Two of them waiting out a backoff send no read, so they
+/// must not take the pass's two slots: the spare account behind them is read on schedule.
+func testWaitingAccountsTakeNoPollSlot() async throws {
+    final class Clock: @unchecked Sendable { var value = Date.now }
+    let (store, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+    func expiring(_ name: String) throws -> Credential {
+        var oauth = (try JSONSerialization.jsonObject(with: credential(name).data) as! [String: Any])["claudeAiOauth"] as! [String: Any]
+        oauth["expiresAt"] = Int64(Date.now.timeIntervalSince1970 * 1000 + 600_000)
+        return Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": oauth]))
+    }
+    let a = credential("slot-a"), b = try expiring("slot-b"), c = try expiring("slot-c"), d = credential("slot-d")
+    let snapshot = UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    let usage = ScriptedUsage(snapshot: snapshot, scripts: [:])
+    let clock = Clock()
+    let engine = try HeadlessEngine(store: store, usageClient: usage, identityClient: FakeIdentity(identities: [:]), renewer: FakeRenewer(), now: { clock.value }, requestGap: 0)
+    _ = try await engine.add(a, identity: identity("slot-a"), label: "A", kind: .oauth)
+    _ = try await engine.takeOver(label: nil)
+    let bID = try await engine.add(b, identity: identity("slot-b"), label: "B", kind: .oauth)
+    let cID = try await engine.add(c, identity: identity("slot-c"), label: "C", kind: .oauth)
+    let dID = try await engine.add(d, identity: identity("slot-d"), label: "D", kind: .oauth)
+    await engine.refreshAll()
+    clock.value = clock.value.addingTimeInterval(3600)
+    await usage.reset([b.token!: [.authentication], c.token!: [.authentication]])
+    await engine.refresh(bID, manually: true)
+    await engine.refresh(cID, manually: true)
+    await usage.reset([:])
+    await engine.tick()
+    let calls = await usage.calls
+    let checked = await engine.account(dID)?.lastChecked
+    expect(calls == 2 && checked == clock.value, "accounts in a backoff took the poll slots: calls=\(calls)")
 }
 
 func testExhaustedPollingWaitsForReset() async throws {
@@ -295,6 +362,7 @@ try testSecureRuntime()
 try testStatusLine()
 try await testRefreshRecovery()
 try await testAlternatePolling()
+try await testWaitingAccountsTakeNoPollSlot()
 try await testExhaustedPollingWaitsForReset()
 try await testExpiringExhaustedAlternateRenewsBeforeReset()
 try await testFreshServerTakeover()
@@ -304,4 +372,4 @@ try await testObservationIsNotBlocked()
 try await testRelayRunsOnce()
 try await testTransfer()
 try await testProjectAccountsAreNotRenewed()
-print("LiltBackendChecks: PASS (15 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery, alternate polling, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")
+print("LiltBackendChecks: PASS (16 groups: digest, secure runtime, API preservation, per-event status line with concurrent sessions, refresh recovery with per-account 429, alternate polling, waiting accounts take no poll slot, exhausted polling reset, expiring exhausted alternate renewal, fresh server, automatic relay, two isolated projects, observation during a hung request, one hand-off per trigger, encrypted transfer, no renewal of project logins)")

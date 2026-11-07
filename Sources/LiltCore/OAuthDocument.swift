@@ -13,6 +13,13 @@ public enum OAuthDocument {
     public static func accessToken(_ data: Data) -> String? { text(oauth(data)?["accessToken"]) }
     public static func refreshToken(_ data: Data) -> String? { text(oauth(data)?["refreshToken"]) }
     public static func scopes(_ data: Data) -> [String] { oauth(data)?["scopes"] as? [String] ?? [] }
+    /// The usage endpoint needs `user:profile`. A login that states its scopes without it (a long-lived token made for
+    /// model requests only, often with a one-year expiry) is refused there every time, whatever else it can do.
+    /// A document that states no scopes is not judged.
+    public static func lacksUsageScope(_ data: Data) -> Bool {
+        let granted = scopes(data)
+        return !granted.isEmpty && !granted.contains("user:profile")
+    }
     /// When the access token stops working. The CLI stores it as milliseconds since 1970.
     public static func expiry(_ data: Data) -> Date? {
         (oauth(data)?["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }

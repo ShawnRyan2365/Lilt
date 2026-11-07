@@ -30,7 +30,11 @@ public actor HeadlessEngine {
     private var renewalTasks: [UUID: Task<Credential, Error>] = [:]
     private var tickTask: Task<Void, Never>?
     private var usageFailures: [UUID: UsageFailure] = [:]
-    private var rateLimitedUntil = Date.distantPast
+    /// A 429 holds back the account it was for; refusals of two accounts close together pause every read (`UsageRateLimit`).
+    private var rateLimit = UsageRateLimit()
+    private var rateLimitedUntil: Date { rateLimit.pausedUntil }
+    /// Failed renewals of a login whose reads are waiting back off here, apart from the reads.
+    private var renewalBackoffs: [UUID: Backoff] = [:]
     private var latch = RelayLatch()
     private var departedID: UUID?
     private var departedAt: Date?
@@ -178,7 +182,10 @@ public actor HeadlessEngine {
         var account = id.flatMap({ old in library.accounts.first { $0.id == old } }) ?? Account(id: accountID, label: label, kind: kind)
         account.label = label; account.kind = kind; account.enabled = true; account.expiresAt = credential.expiresAt
         account.issue = nil; account.refreshRejected = nil; account.hotSwitchCapability = .unknown
-        if kind == .setupToken { account.usageCapability = .unavailable; account.usage = nil }
+        // A login stating its scopes without user:profile is refused by the usage endpoint every time. A new login for
+        // an account that could not read quota gets asked again; it is not read on a timer while marked unreadable.
+        if kind == .setupToken || OAuthDocument.lacksUsageScope(credential.data) { account.usageCapability = .unavailable; account.usage = nil }
+        else { account.usageCapability = .unknown }
         let wasCurrent = library.activeID == accountID
         try store.writeSecret(accountID.uuidString, data: credential.data)
         if let identity { try store.writeSecret(accountID.uuidString + ".identity", data: identity) }
@@ -392,7 +399,7 @@ public actor HeadlessEngine {
     /// Requests for one account share one answer. Manual refresh may override an ordinary backoff, never a 429.
     public func refresh(_ id: UUID, manually: Bool = false) async {
         if switching { if manually { message = "正在切换账号，完成后即可刷新" }; return }
-        if pauseForRateLimit(manually: manually) { return }
+        if pauseForRateLimit(manually: manually) { await renewWhileWaiting(id); return }
         if !manually, let account = account(id),
            !UsagePolling.renewalDue(account, active: inScope(id), at: now()),
            UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: now()) { return }
@@ -404,6 +411,7 @@ public actor HeadlessEngine {
         }
         if let next = backoffs[id]?.nextAttempt, next > now(), !manually || isRateLimited(id) {
             if manually { message = "额度暂未更新，请稍后再试。" }
+            await renewWhileWaiting(id)
             return
         }
         let task = Task { await self.performRefresh(id, manually: manually) }
@@ -429,7 +437,7 @@ public actor HeadlessEngine {
             guard library.accounts.contains(where: { $0.id == id }), current(credential, id: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = self.now(); $0.issue = nil }
             if id == library.activeID { notePace(snapshot, id: id) }
-            backoffs[id]?.succeed(); usageFailures[id] = nil; message = "额度已更新"
+            backoffs[id]?.succeed(); usageFailures[id] = nil; rateLimit.answered(); message = "额度已更新"
             if credential.refreshable, !(try store.readSecret(id.uuidString + ".identity") != nil),
                let record = await identityClient.fetch(credential), current(credential, id: id) {
                 try store.writeSecret(id.uuidString + ".identity", data: record)
@@ -441,11 +449,26 @@ public actor HeadlessEngine {
             let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: now()); usageFailures[id] = failure
             if case .rateLimited = failure, let next = backoffs[id]?.nextAttempt {
-                rateLimitedUntil = max(rateLimitedUntil, next)
+                rateLimit.refused(id, until: next, at: now())
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
             update(id) { $0.issue = failure.message; if failure == .permission { $0.usageCapability = .unavailable } }
             message = "额度暂未更新，保留上次读数。"
+        }
+    }
+    /// The read of a spare login is waiting, but its token is about to expire. Renewal goes to another endpoint, so
+    /// it goes ahead rather than letting the login run out during a long 429; it backs off on its own.
+    private func renewWhileWaiting(_ id: UUID) async {
+        guard let account = account(id), UsagePolling.renewalDue(account, active: inScope(id), at: now()),
+              (renewalBackoffs[id]?.nextAttempt ?? .distantPast) <= now() else { return }
+        do {
+            _ = try await renewed(id)
+            renewalBackoffs[id] = nil
+        } catch UsageFailure.authentication {
+            usageFailures[id] = .authentication
+            update(id) { $0.issue = UsageFailure.authentication.message }
+        } catch {
+            renewalBackoffs[id, default: Backoff()].fail(.network, at: now())
         }
     }
     public func refreshAll() async { for account in library.accounts where account.enabled { await refresh(account.id, manually: true) } }
@@ -708,10 +731,10 @@ public actor HeadlessEngine {
         let alternates = UsagePolling.refreshOrder(globalRelayCandidates().filter { $0.id != library.activeID }, at: now())
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
-            if forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: library.preferences.autoRelay == true, urgent: false, watching: false, at: now()) {
-                reads += 1
-                await refresh(account.id)
-            }
+            guard forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: library.preferences.autoRelay == true, urgent: false, watching: false, at: now()) else { continue }
+            // An account whose reads wait sends no read and takes no slot; `refresh` still renews it when due.
+            if readable(account.id) { reads += 1 }
+            await refresh(account.id)
         }
     }
     public func tick() async {

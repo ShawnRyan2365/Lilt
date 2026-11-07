@@ -30,8 +30,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
-<key>CFBundleShortVersionString</key><string>0.3.6</string>
-<key>CFBundleVersion</key><string>25</string>
+<key>CFBundleShortVersionString</key><string>0.3.7</string>
+<key>CFBundleVersion</key><string>26</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

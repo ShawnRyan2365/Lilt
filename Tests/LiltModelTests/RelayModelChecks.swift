@@ -100,7 +100,7 @@ import LiltCore
         try await projectModelChecks()
         try transferStoreChecks()
         try await oauthImportChecks()
-        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs global server 429 and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import. No live credentials or requests.")
+        print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs per-account server 429, every read paused after two accounts refused in a row, renewal while reads wait, quiet background retries and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import (scope without user:profile marked unreadable). No live credentials or requests.")
     }
 }
 
@@ -361,13 +361,22 @@ import LiltCore
     active.usageCapability = .verified
     var spare = Account(label: "Fixture refresh B", kind: .oauth)
     spare.usage = active.usage; spare.usageCapability = .verified
+    var third = Account(label: "Fixture refresh C", kind: .oauth)
+    third.usage = active.usage; third.usageCapability = .verified
+    // A spare login whose token runs out within the renewal lead.
+    var expiring = Account(label: "Fixture refresh D", kind: .oauth)
+    expiring.usage = active.usage; expiring.usageCapability = .verified; expiring.expiresAt = Date.now.addingTimeInterval(600)
     var library = Library()
-    library.accounts = [active, spare]; library.activeID = active.id
+    library.accounts = [active, spare, third, expiring]; library.activeID = active.id
     library.preferences.scopeEnabled = true; library.preferences.scopeTarget = .system
     library.preferences.autoRelay = true; library.preferences.liveUsage = false
     let login = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-refresh-access", "refreshToken": "fixture-refresh-token"]])
     try AccountVault.write(login, account: active.id.uuidString)
     try AccountVault.write(login, account: spare.id.uuidString)
+    try AccountVault.write(login, account: third.id.uuidString)
+    let soon = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": ["accessToken": "fixture-expiring-access", "refreshToken": "fixture-expiring-refresh",
+                                                                            "expiresAt": (Date.now.timeIntervalSince1970 + 600) * 1000]])
+    try AccountVault.write(soon, account: expiring.id.uuidString)
     var keychainCalls = 0
     let scope = RuntimeScope(fixtureHome: home, credentials: .init(read: {
         keychainCalls += 1
@@ -375,10 +384,16 @@ import LiltCore
     }, write: { _ in }, delete: { }))
     var calls = 0
     var failures: [Error?] = []
+    var renewals = 0
     let model = AppModel(fixture: library, runtime: scope, usageFetch: { _ in
         calls += 1
         if !failures.isEmpty, let failure = failures.removeFirst() { throw failure }
         return UsageSnapshot(fiveHour: UsageWindow(used: 25), sevenDay: UsageWindow(used: 20))
+    }, tokenRenew: { _ in
+        renewals += 1
+        return Credential(data: try JSONSerialization.data(withJSONObject: ["claudeAiOauth": [
+            "accessToken": "fixture-renewed-access", "refreshToken": "fixture-renewed-refresh",
+            "expiresAt": (Date.now.timeIntervalSince1970 + 28800) * 1000]]))
     })
 
     await model.refresh(active.id, manually: true)
@@ -415,12 +430,34 @@ import LiltCore
     await model.refresh(active.id, manually: true)
     precondition(calls == 7)
     await model.refresh(active.id, manually: true)
-    precondition(calls == 7 && model.status.contains("重试"), "A server 429 still blocks a manual retry")
+    precondition(calls == 7 && model.status.contains("重试"), "A server 429 still blocks a manual retry of that account")
+    model.status = "fixture-quiet"
+    await model.refresh(active.id)
+    precondition(calls == 7 && model.status == "fixture-quiet", "The monitor meeting a waiting account announces nothing")
     await model.refresh(spare.id, manually: true)
-    precondition(calls == 7 && model.status.contains("限流"), "One account's 429 pauses every account, even for a manual retry")
+    precondition(calls == 8 && model.status == "额度已更新", "One account's 429 does not pause another")
+    precondition(model.notice()?.detail?.contains("全部额度查询") != true)
+
+    // The answer for B cleared A's refusal. B and then C refused, with nothing answered between, pause every read.
+    failures = [UsageFailure.rateLimited(120)]
+    await model.refresh(spare.id, manually: true)
+    precondition(calls == 9 && model.notice()?.detail?.contains("全部额度查询") != true, "One refusal pauses only its account")
+    failures = [UsageFailure.rateLimited(120)]
+    model.status = "fixture-quiet"
+    await model.refresh(third.id)
+    precondition(calls == 10 && model.status == "fixture-quiet", "A spare account's failure stays on its row")
+    precondition(model.notice()?.detail?.contains("全部额度查询") == true, "Two accounts refused in a row pause every read")
+
+    // The monitor reaching the expiring login during the pause renews it without asking for quota.
+    precondition(renewals == 0)
+    await model.refresh(expiring.id)
+    precondition(renewals == 1 && calls == 10 && model.status == "fixture-quiet", "A login about to expire is renewed while reads wait")
+    precondition((model.library.accounts.first { $0.id == expiring.id }?.expiresAt ?? .distantPast) > Date.now.addingTimeInterval(3600))
+    await model.refresh(expiring.id, manually: true)
+    precondition(calls == 10 && renewals == 1 && model.status.contains("限流"), "The pause holds a manual retry too, and a renewed login is not renewed again")
+    model.status = "fixture-quiet"
     await model.refresh(spare.id)
-    precondition(calls == 7, "Automatic candidate reads stop during the global 429 cooldown")
-    precondition(model.notice()?.detail?.contains("全部额度查询") == true)
+    precondition(calls == 10 && model.status == "fixture-quiet", "Automatic reads stop during the global 429 cooldown, quietly")
 
     model.library.accounts[0].usage = UsageSnapshot(fiveHour: UsageWindow(used: 100), sevenDay: UsageWindow(used: 20))
     await model.relay()

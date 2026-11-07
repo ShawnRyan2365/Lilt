@@ -108,9 +108,12 @@ final class AppModel {
     private var savedAPIMode = false
     private var backoffs: [UUID: Backoff] = [:]
     private var failures: [UUID: UsageFailure] = [:]
-    private var rateLimitedUntil = Date.distantPast
-    /// A 429 pauses every endpoint read. Requests for one account share one answer (`refreshes`);
-    /// requests of any account start two seconds apart.
+    /// A 429 holds back the account it was for; refusals of two accounts close together pause every read (`UsageRateLimit`).
+    private var rateLimit = UsageRateLimit()
+    private var rateLimitedUntil: Date { rateLimit.pausedUntil }
+    /// A login about to expire is renewed while its quota reads wait; failed renewals back off here, apart from reads.
+    private var renewalBackoffs: [UUID: Backoff] = [:]
+    /// Requests for one account share one answer (`refreshes`); requests of any account start two seconds apart.
     private let spacing = RequestSpacing()
     private var refreshes: [UUID: Task<Void, Never>] = [:]
     /// Status line events went missing for these accounts; their next pass asks the endpoint unless exhaustion says to wait.
@@ -164,6 +167,7 @@ final class AppModel {
     private var monitor: Task<Void, Never>?
     private var liveMonitor: Task<Void, Never>?
     private var usageFetch: (Credential) async throws -> UsageSnapshot = { try await UsageClient().fetch($0) }
+    private var tokenRenew: (Credential) async throws -> Credential = { try await TokenRenewer().renew($0) }
     /// Where a project's login goes. Regression checks replace it with in-memory credential stores.
     private var projectRuntime: (ProjectBinding) -> RuntimeScope = { RuntimeScope(project: $0) }
     private var requestGap: TimeInterval = 2
@@ -225,12 +229,13 @@ final class AppModel {
     /// files still go under `Disk.root`, so the caller must point the home directory at a fixture first.
     init(fixture library: Library, runtime: RuntimeScope, usageFetch: ((Credential) async throws -> UsageSnapshot)? = nil,
          projects: ProjectCatalog = ProjectCatalog(), projectRuntime: ((ProjectBinding) -> RuntimeScope)? = nil,
-         identityFetch: ((Credential) async -> Data?)? = nil) {
+         identityFetch: ((Credential) async -> Data?)? = nil, tokenRenew: ((Credential) async throws -> Credential)? = nil) {
         retryClock = { .now }
         self.library = library
         fixtureRuntime = runtime
         projectCatalog = projects
         if let usageFetch { self.usageFetch = usageFetch }
+        if let tokenRenew { self.tokenRenew = tokenRenew }
         if let projectRuntime { self.projectRuntime = projectRuntime }
         self.identityFetch = identityFetch ?? { _ in nil }
         restoreRelayPreference()
@@ -534,7 +539,8 @@ final class AppModel {
         }
         busy = false
         await syncScope(afterReplacing: id)
-        if let saved { await refresh(saved, manually: true) }
+        if let saved, accounts.first(where: { $0.id == saved })?.usageCapability != .unavailable { await refresh(saved, manually: true) }
+        else if saved != nil { status = "凭证已保存；它没有读额度的权限（缺 user:profile）" }
         return nil
     }
     /// A new credential for the account in use belongs in the scope too; otherwise Lilt and the CLI would hold
@@ -573,12 +579,17 @@ final class AppModel {
         // Whose login this is, when the CLI recorded it. A credential without one must not inherit the previous owner's.
         if let identity { try AccountVault.write(identity, account: Keychain.identityAccount(accountID)) }
         else { try? AccountVault.delete(account: Keychain.identityAccount(accountID)) }
+        // A login that states its scopes without user:profile is refused by the usage endpoint every time. Saying so
+        // now spares it a read that can only fail, or earn a 429.
+        let usage: Capability = OAuthDocument.lacksUsageScope(credential.data) ? .unavailable : .unknown
+        let issue = usage == .unavailable ? UsageFailure.permission.message : nil
         if let id {
-            update(id) { $0.kind = kind; $0.usageCapability = .unknown; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = nil; $0.refreshRejected = nil }
-            failures[id] = nil; backoffs[id] = nil
+            update(id) { $0.kind = kind; $0.usageCapability = usage; $0.hotSwitchCapability = .unknown; $0.usage = nil; $0.expiresAt = credential.expiresAt; $0.issue = issue; $0.refreshRejected = nil }
+            failures[id] = nil; backoffs[id] = nil; renewalBackoffs[id] = nil
         } else {
             var account = Account(id: accountID, label: label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "新账号 \(accounts.count + 1)" : label, kind: kind)
             account.expiresAt = credential.expiresAt
+            account.usageCapability = usage; account.issue = issue
             library.accounts.append(account)
         }
         // A new login has to be on disk before the caller is told it was saved.
@@ -644,8 +655,9 @@ final class AppModel {
             guard !demo, id != library.activeID, !projectCatalog.reservedAccountIDs.contains(id), stored.refreshable,
                   stored.expires(within: RelayPolicy.renewalLead) else { return stored }
             if let running = renewals[id] { renewal = running } else {
+                let renew = tokenRenew
                 renewal = Task {
-                    let fresh = try await TokenRenewer().renew(stored)
+                    let fresh = try await renew(stored)
                     // Saved before anything else uses it: the old refresh token may already be spent.
                     try await IOQueue.run { try AccountVault.write(fresh.data, account: id.uuidString) }
                     return fresh
@@ -814,14 +826,36 @@ final class AppModel {
         return false
     }
     private func globallyRateLimited(at now: Date = .now) -> Bool { rateLimitedUntil > now }
-    private func pauseForRateLimit() -> Bool {
+    /// True while every read waits. Only a person who asked hears about it: the monitor meets the pause on every
+    /// pass, and announcing it each time (the minutes in the text change) kept flashing the same notice.
+    private func pauseForRateLimit(announce: Bool) -> Bool {
         guard globallyRateLimited() else { return false }
-        status = "额度接口限流，\(Self.wait(until: rateLimitedUntil))后自动重试；保留上次读数"
+        if announce { status = "额度接口限流，\(Self.wait(until: rateLimitedUntil))后自动重试；保留上次读数" }
         return true
     }
+    /// When the monitor asks this account again. A credential that cannot read quota is never asked again on its own,
+    /// so it is not promised a retry.
     func usageRetryText(_ id: UUID, at now: Date = .now) -> String? {
-        guard let next = backoffs[id]?.nextAttempt, next > now else { return nil }
+        guard accounts.first(where: { $0.id == id })?.usageCapability != .unavailable,
+              let next = backoffs[id]?.nextAttempt, next > now else { return nil }
         return "\(Self.wait(until: next, from: now))后重试"
+    }
+    /// The read of a spare login is waiting (a 429 or another backoff), but its token is about to expire. Renewal goes
+    /// to another endpoint, so it goes ahead: a long wait used to let these logins run out. It backs off on its own.
+    private func renewWhileWaiting(_ id: UUID) async {
+        guard !demo, let account = accounts.first(where: { $0.id == id }),
+              UsagePolling.renewalDue(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), at: .now),
+              (renewalBackoffs[id]?.nextAttempt ?? .distantPast) <= .now else { return }
+        do {
+            _ = try await renewedCredential(for: id)
+            renewalBackoffs[id] = nil
+        } catch UsageFailure.authentication {
+            // The refresh token was refused; `renewedCredential` has taken the account out of relay.
+            failures[id] = .authentication
+            update(id) { $0.issue = UsageFailure.authentication.message }
+        } catch {
+            renewalBackoffs[id, default: Backoff()].fail(.network, at: .now)
+        }
     }
     func refresh(_ id: UUID, manually: Bool = false) async {
         if demo { touchDemoSamples(); status = "已刷新演示数据"; return }
@@ -829,7 +863,7 @@ final class AppModel {
             if manually { status = "正在切换账号，完成后即可刷新" }
             return
         }
-        if pauseForRateLimit() { return }
+        if pauseForRateLimit(announce: manually) { await renewWhileWaiting(id); return }
         if !manually, let account = accounts.first(where: { $0.id == id }),
            !UsagePolling.renewalDue(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), at: .now),
            UsagePolling.waitingForExhaustionReset(account, threshold: thresholds, at: .now) { return }
@@ -838,24 +872,28 @@ final class AppModel {
         if let running = refreshes[id] {
             await running.value
             if refreshes[id] == running { refreshes[id] = nil; loading = !refreshes.isEmpty }
-            if pauseForRateLimit() { return }
+            if pauseForRateLimit(announce: manually) { return }
             guard manually, let next = backoffs[id]?.nextAttempt, next > .now, !isRateLimited(id), refreshes[id] == nil else { return }
         }
         if let next = backoffs[id]?.nextAttempt, next > .now, !manually || isRateLimited(id) {
-            status = "额度暂未更新，\(Self.wait(until: next))后重试"; return
+            // The monitor meets a waiting account on every pass; only a person who asked is told.
+            if manually { status = isRateLimited(id) ? "额度接口要求这个账号稍后再查，\(Self.wait(until: next))后重试" : "额度暂未更新，\(Self.wait(until: next))后重试" }
+            await renewWhileWaiting(id)
+            return
         }
-        let task = Task { await self.performRefresh(id) }
+        let task = Task { await self.performRefresh(id, manually: manually) }
         refreshes[id] = task; loading = true
         await task.value
         // Every waiter reaches this cleanup; only the task still registered may remove itself.
         if refreshes[id] == task { refreshes[id] = nil; loading = !refreshes.isEmpty }
     }
 
-    private func performRefresh(_ id: UUID) async {
+    private func performRefresh(_ id: UUID, manually: Bool) async {
         await spacing.reserve(gap: requestGap)
-        if pauseForRateLimit() { return }
+        if pauseForRateLimit(announce: manually) { return }
         if let next = backoffs[id]?.nextAttempt, next > .now, isRateLimited(id) {
-            status = "额度暂未更新，\(Self.wait(until: next))后重试"; return
+            if manually { status = "额度暂未更新，\(Self.wait(until: next))后重试" }
+            return
         }
         // A project's CLI may have renewed this account's login; the stored copy could be expired or spent.
         if let project = projectCatalog.projects.first(where: { $0.accountID == id && $0.phase == .ready }), !projectBusy.contains(project.id) {
@@ -871,6 +909,7 @@ final class AppModel {
             if id == library.activeID { notePace(snapshot, for: id) }
             if let backoff = backoffs[id], backoff.failures > 0 || backoff.nextAttempt != .distantPast { backoffs[id]?.succeed() }
             if failures[id] != nil { failures[id] = nil }
+            rateLimit.answered()
             if status != "额度已更新" { status = "额度已更新" }
             // Logins added before Lilt kept identities get theirs once, while the token is known to work.
             let identityMissing = await IOQueue.perform { !AccountVault.hasFile(account: Keychain.identityAccount(id)) }
@@ -887,10 +926,12 @@ final class AppModel {
             let failure = error as? UsageFailure ?? .network
             backoffs[id, default: Backoff()].fail(failure, at: .now); failures[id] = failure
             if case .rateLimited = failure, let next = backoffs[id]?.nextAttempt {
-                rateLimitedUntil = max(rateLimitedUntil, next)
+                rateLimit.refused(id, until: next, at: .now)
             }
             // A failed attempt is not a fresh measurement. Keep the last reading and its original sampling time.
             update(id) { $0.issue = failure.message; if failure == .permission { $0.usageCapability = .unavailable } }
+            // A spare account's failure stays on its row; announcing each one, unnamed, read as the whole list failing.
+            guard manually || id == library.activeID else { return }
             if let retry = usageRetryText(id) { status = "额度暂未更新，\(retry)；保留上次读数" }
             else { status = failure.message }
         }
@@ -1547,10 +1588,12 @@ final class AppModel {
         let alternates = UsagePolling.refreshOrder(accounts.filter { $0.id != library.activeID && !reserved.contains($0.id) }, at: .now)
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
-            if forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: autoRelay, urgent: false, watching: watching, at: .now) {
-                reads += 1
-                await refresh(account.id)
-            }
+            guard forcePoll.remove(account.id) != nil || UsagePolling.due(account, active: false, autoRelay: autoRelay, urgent: false, watching: watching, at: .now) else { continue }
+            // An account whose reads wait sends no read, so it takes no slot: logins due for renewal sort first, and
+            // two of them in a backoff used to take both slots on every pass, so no other spare account was read.
+            // `refresh` still renews it if its token is about to run out.
+            if readable(account.id) { reads += 1 }
+            await refresh(account.id)
         }
     }
     private func tick() async {
@@ -1633,7 +1676,7 @@ final class AppModel {
     }
     static func unreadableQuotaDetail(_ kind: AuthKind) -> String {
         kind == .setupToken ? "长效 Token 只能发模型请求，官方额度接口不认它。改用浏览器登录后才能看额度、参与自动接力；模型请求本身不受影响。"
-                            : "官方额度接口拒绝了这个凭据。重新用浏览器登录后再试。"
+                            : "这个凭据没有读额度的权限（缺 user:profile），只给模型请求用的长效令牌就是这样。模型请求不受影响；要看额度、参与自动接力，用浏览器重新登录这个账号。"
     }
     /// Whether the notice's button has to wait for work in progress. Dismissing a note or opening a page never does:
     /// the monitor reads quota in the background every few minutes, more often near the threshold, and those reads

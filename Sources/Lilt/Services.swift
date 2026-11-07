@@ -28,8 +28,7 @@ struct UsageClient {
                 // The usage endpoint needs the user:profile scope, which setup-token credentials do not carry.
                 // Any other refusal is treated as a credential that no longer works. The body is inspected, never kept.
                 let body = String(data: data.prefix(2048), encoding: .utf8)?.lowercased() ?? ""
-                let scopes = credential.oauth["scopes"] as? [String]
-                let lacksProfile = scopes.map { !$0.contains("user:profile") } ?? false
+                let lacksProfile = OAuthDocument.lacksUsageScope(credential.data)
                 throw body.contains("scope") || body.contains("user:profile") || lacksProfile ? UsageFailure.permission : UsageFailure.authentication
             case 429:
                 let header = response.value(forHTTPHeaderField: "Retry-After") ?? ""

@@ -204,6 +204,37 @@ final class RelayTests {
         var bounded = Backoff(); bounded.fail(.rateLimited(86400), at: now)
         expectEqual(bounded.nextAttempt, now.addingTimeInterval(4500))
     }
+    /// One account refused says nothing about the others; two different accounts refused close together, with no
+    /// answer in between, pause every read until the later of them may ask again.
+    func testRateLimitHoldsOneAccountUntilTwoAreRefused() {
+        let a = UUID(), b = UUID()
+        var limit = UsageRateLimit()
+        expectFalse(limit.refused(a, until: now.addingTimeInterval(120), at: now))
+        expectFalse(limit.paused(at: now)) // one account's 429 pauses nobody else
+        expectFalse(limit.refused(a, until: now.addingTimeInterval(300), at: now.addingTimeInterval(10))) // still one account
+        limit.answered()
+        expectFalse(limit.refused(b, until: now.addingTimeInterval(200), at: now.addingTimeInterval(20))) // the answer cleared a
+        expect(limit.refused(a, until: now.addingTimeInterval(240), at: now.addingTimeInterval(30)))
+        expect(limit.paused(at: now.addingTimeInterval(239)))
+        expectFalse(limit.paused(at: now.addingTimeInterval(240)))
+        // Refusals further apart than the window are not one limit.
+        var apart = UsageRateLimit()
+        apart.refused(a, until: now.addingTimeInterval(60), at: now)
+        expectFalse(apart.refused(b, until: now.addingTimeInterval(700), at: now.addingTimeInterval(UsageRateLimit.window)))
+        expectFalse(apart.paused(at: now.addingTimeInterval(UsageRateLimit.window)))
+    }
+    /// A login whose stated scopes lack user:profile is never readable at the usage endpoint; one stating none is not judged.
+    func testUsageScopeComesFromTheStatedScopes() {
+        func login(_ scopes: [String]?) -> Data {
+            var oauth: [String: Any] = ["accessToken": "fixture-scope-access"]
+            if let scopes { oauth["scopes"] = scopes }
+            return try! JSONSerialization.data(withJSONObject: ["claudeAiOauth": oauth])
+        }
+        expect(OAuthDocument.lacksUsageScope(login(["user:inference"])))
+        expectFalse(OAuthDocument.lacksUsageScope(login(["user:inference", "user:profile"])))
+        expectFalse(OAuthDocument.lacksUsageScope(login(nil)))
+        expectFalse(OAuthDocument.lacksUsageScope(login([])))
+    }
     func testUsagePollingKeepsAlternatesAndResetsMoving() {
         var active = Account(label: "Active", kind: .oauth)
         active.lastChecked = now
@@ -670,6 +701,8 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testStatusLineReadingsAreParsedAndMatchedToTheirAccount()
         suite.testDuplicateEventClaimedOnce()
         suite.testRetryAfterAndAuthentication()
+        suite.testRateLimitHoldsOneAccountUntilTwoAreRefused()
+        suite.testUsageScopeComesFromTheStatedScopes()
         suite.testUsagePollingKeepsAlternatesAndResetsMoving()
         try suite.testParserRejectsMalformedAndBooleanUsage()
         suite.testRenewalLeadIsOneHour()
@@ -699,7 +732,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 41 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 43 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, per-account 429, usage scope, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 
