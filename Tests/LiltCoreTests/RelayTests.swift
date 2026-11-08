@@ -16,7 +16,9 @@ final class RelayTests {
         expectFalse(snapshot(0, 0, age: 61).exhausted(threshold: 1, at: now))
         expectFalse(snapshot(0, 0, age: -1).exhausted(threshold: 1, at: now))
         expect(snapshot(nil, 1).exhausted(threshold: 1, at: now))
-        expectFalse(snapshot(90, nil).available(threshold: 1, at: now))
+        // A 7-day window alone is a partial reading. A 5-hour window alone is a login without a weekly limit.
+        expectFalse(snapshot(nil, 90).available(threshold: 1, at: now))
+        expect(snapshot(90, nil).available(threshold: 1, at: now))
     }
     func testLastKnownIsDisplayOnly() {
         let stale = snapshot(0.5, 40, age: 61)
@@ -501,6 +503,49 @@ final class RelayTests {
         expectEqual(RelayOrder.sorted([twin, weekEighty], at: now).map(\.label), ["Fixture J", "Fixture A"])
         expectFalse(Preferences().autoSort == true)
     }
+    /// Enterprise logins report no 7-day window. They are judged on the 5-hour window alone, auto sort puts them first
+    /// in the user's own order, and with auto sort on a hand-off takes one of them before any Pro or Max login, however
+    /// empty that one is. Without auto sort the emptiest-first rule stands as it was.
+    func testNoWeeklyLimitGoesFirst() {
+        let hour: TimeInterval = 3600, day: TimeInterval = 86400
+        func uncapped(_ label: String, five: Double) -> Account {
+            var account = Account(label: label, kind: .oauth)
+            account.hotSwitchCapability = .verified
+            account.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100 - five, resetsAt: now.addingTimeInterval(3 * hour)), sampledAt: now)
+            return account
+        }
+        let enterpriseA = uncapped("Fixture A", five: 60), enterpriseB = uncapped("Fixture B", five: 95)
+        let spentEnterprise = uncapped("Fixture C", five: 3)
+        expect(enterpriseA.usage!.hasNoWeeklyLimit)
+        expectFalse(placed("Fixture X", five: 50, week: 50, weekResetsIn: day).usage!.hasNoWeeklyLimit)
+        expectFalse(UsageSnapshot(sampledAt: now).hasNoWeeklyLimit)
+        expect(enterpriseA.usage!.available(threshold: 5, at: now)); expectFalse(enterpriseA.usage!.exhausted(threshold: 5, at: now))
+        expect(spentEnterprise.usage!.exhausted(threshold: 5, at: now)); expect(spentEnterprise.usage!.remainsExhausted(threshold: 5, at: now))
+        let resetsSoon = placed("Fixture D", five: 100, week: 10, weekResetsIn: hour)
+        let full = placed("Fixture E", five: 100, week: 100, weekResetsIn: 3 * day)
+        var unread = Account(label: "Fixture F", kind: .oauth); unread.usage = nil
+        var disabled = uncapped("Fixture G", five: 100); disabled.enabled = false
+        let input = [resetsSoon, enterpriseB, unread, disabled, full, enterpriseA]
+        expectEqual(RelayOrder.sorted(input, at: now).map(\.label), ["Fixture B", "Fixture A", "Fixture D", "Fixture E", "Fixture F", "Fixture G"])
+        // The account in use reaches the threshold. The order passed in is the auto-sorted one.
+        let active = placed("Fixture H", five: 4, week: 50, weekResetsIn: 2 * day)
+        let candidates = RelayOrder.sorted([full, spentEnterprise, enterpriseA, enterpriseB], at: now)
+        let sorted = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true, noWeeklyLimitFirst: true)
+        expectEqual(sorted.obstacle(for: enterpriseA, at: now), nil)
+        expectEqual(sorted.handOffOrder(candidates, leaving: active, at: now).map(\.label), ["Fixture B", "Fixture A", "Fixture E"])
+        expectEqual(sorted.decide(active: active, candidates: candidates, at: now), .select(enterpriseB.id))
+        expectEqual(sorted.decide(active: active, candidates: [full, enterpriseA], at: now), .select(enterpriseA.id))
+        // An enterprise login at its 5-hour threshold is passed over for the next account.
+        expectEqual(sorted.decide(active: active, candidates: [spentEnterprise, full], at: now), .select(full.id))
+        // Manual order: emptiest first, the order only breaking ties within ten points.
+        let manual = RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true)
+        expectEqual(manual.handOffOrder([enterpriseA, full], leaving: active, at: now).map(\.label), ["Fixture E", "Fixture A"])
+        expectEqual(manual.decide(active: active, candidates: [enterpriseA], at: now), .select(enterpriseA.id))
+        // An enterprise login in use hands off at its 5-hour threshold only, and sooner-weekly never moves it.
+        let enterpriseActive = uncapped("Fixture I", five: 4)
+        expectEqual(sorted.decide(active: enterpriseActive, candidates: [full], at: now), .select(full.id))
+        expectEqual(RelayPolicy(threshold: 5, allowUnverifiedHotSwitch: true, soonerWeekly: true).decide(active: enterpriseA, candidates: [resetsSoon], at: now), .wait)
+    }
     /// The hand-offs of 2026-10-22 in miniature. The account in use leaves ahead of the threshold with 13% left, and the
     /// relay order puts accounts with 10% and 14% left first. The baton goes to the emptiest account, the relay order
     /// deciding only between accounts within ten points of each other, and never to one closer to the limit than the
@@ -804,6 +849,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testAccountJustLeftIsSkippedUntilTheCooldownEnds()
         suite.testSoonerWeeklyResetIsOptionalAndDoesNotReplaceOrdinaryRelay()
         suite.testAutoSortOrdersByWeeklyResetDayThenWhatIsLeft()
+        suite.testNoWeeklyLimitGoesFirst()
         suite.testHandOffGoesToTheEmptiestAccount()
         suite.testHandOffConfirmsTheAccountItTakes()
         suite.testHandOffReadsTheTargetAndMovesOnWhenItWasSpent()
@@ -826,7 +872,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 47 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 48 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 

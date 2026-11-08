@@ -1607,7 +1607,7 @@ final class AppModel {
     private func relayPolicy(soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) -> RelayPolicy {
         RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: !demo,
                     leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: .now),
-                    soonerWeekly: soonerWeekly, requiredMargin: requiredMargin)
+                    soonerWeekly: soonerWeekly, requiredMargin: requiredMargin, noWeeklyLimitFirst: autoSort)
     }
     /// The account is not in a backoff; asking now would only be refused.
     private func readable(_ id: UUID) -> Bool {

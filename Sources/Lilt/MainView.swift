@@ -231,7 +231,7 @@ struct MainView: View {
             if !model.accounts.isEmpty {
                 HStack(alignment: .top, spacing: 12) {
                     Text(model.autoSort
-                         ? "从上到下是接力顺序：7 天额度先重置的在前，同一天重置的剩余多的在前。换号时先挑 5 小时额度最空的账号，一样空的按这个顺序，用到阈值再换。关闭后恢复你拖好的顺序。"
+                         ? "从上到下是接力顺序：不限 7 天额度的账号（如企业版）排最前，换号时最先用；其余 7 天额度先重置的在前，同一天重置的剩余多的在前。同一组里先挑 5 小时额度最空的，一样空的按这个顺序，用到阈值再换。关闭后恢复你拖好的顺序。"
                          : "从上到下是接力顺序，可以拖动调整；换号时先挑 5 小时额度最空的账号，一样空的按这个顺序。项目专用账号不参与默认自动接力；备注只用于本机识别。")
                         .font(Typo.caption).foregroundStyle(Tokens.muted).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)

@@ -32,7 +32,7 @@ import LiltCore
 
         // Missing, stale and partial data keep relay armed, but never justify a switch. The account taken must have
         // been read in the last two minutes (`RelayPolicy.confirmLifetime`), so stale means older than that.
-        for usage: UsageSnapshot? in [nil, snapshot(20, age: 121), UsageSnapshot(fiveHour: UsageWindow(used: 20))] {
+        for usage: UsageSnapshot? in [nil, snapshot(20, age: 121), UsageSnapshot(sevenDay: UsageWindow(used: 20))] {
             var fixture = source; fixture.accounts[1].usage = usage
             let waiting = AppModel(preview: fixture)
             await waiting.relay()
@@ -670,6 +670,20 @@ import LiltCore
     precondition(model.active?.id == soonFresh.id, "The emptiest 5-hour window, and the relay order between equally empty ones")
     model.setSoonerWeekly(true)
     precondition(!model.autoSort && model.accounts.map(\.label) == ["Fixture A", "Fixture B", "Fixture C", "Fixture D"])
+
+    // An enterprise login reports no 7-day window. Sorted, it leads the order and takes the baton ahead of an emptier
+    // Pro or Max login; in the manual order the emptiest still goes first.
+    var enterprise = account("Fixture E", five: 60, week: 0, weekResetsIn: 0); enterprise.usage?.sevenDay = nil
+    for sorted in [true, false] {
+        var mixed = Library()
+        mixed.accounts = [active, later, enterprise]; mixed.activeID = active.id; mixed.preferences.autoRelay = true
+        let relay = AppModel(preview: mixed)
+        relay.setAutoSort(sorted)
+        precondition(relay.accounts.map(\.label) == (sorted ? ["Fixture E", "Fixture A", "Fixture B"] : ["Fixture A", "Fixture B", "Fixture E"]))
+        relay.library.accounts[0].usage?.fiveHour = UsageWindow(used: 99.5)
+        await relay.relay()
+        precondition(relay.active?.id == (sorted ? enterprise.id : later.id), "Sorted relay takes the login without a weekly limit first")
+    }
 }
 
 func keychainCommandChecks() throws {

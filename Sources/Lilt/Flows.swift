@@ -401,7 +401,7 @@ struct SettingsView: View {
                 LabeledContent("自动排序") {
                     LiquidToggle(label: "自动排序", isOn: Binding(get: { model.autoSort }, set: { model.setAutoSort($0) }), width: 44)
                 }
-            } footer: { Text("按 7 天额度排接力顺序：先重置的在前，同一天重置的剩余多的在前。换号时先挑 5 小时额度最空的账号，一样空的按这个顺序，换上后一直用到阈值。和「先用快重置的周额度」二选一，关闭后恢复手动顺序。") }
+            } footer: { Text("不限 7 天额度的账号（如企业版）排最前，换号时最先用；其余按 7 天额度排：先重置的在前，同一天重置的剩余多的在前。同一组里先挑 5 小时额度最空的，一样空的按这个顺序，换上后一直用到阈值。和「先用快重置的周额度」二选一，关闭后恢复手动顺序。") }
             Section {
                 Picker("快速面板快捷键", selection: shortcut) { Text("⌘⌥L").tag(UInt32(37)); Text("⌘⌥J").tag(UInt32(38)); Text("⌘⌥K").tag(UInt32(40)) }
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }

@@ -590,7 +590,7 @@ public actor HeadlessEngine {
     private var active: Account? { library.accounts.first { $0.id == library.activeID } }
     private func policy(soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) -> RelayPolicy {
         RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: true, leftRecently: RelayPolicy.coolingDown(departedID, since: departedAt, at: now()),
-                    soonerWeekly: soonerWeekly, requiredMargin: requiredMargin)
+                    soonerWeekly: soonerWeekly, requiredMargin: requiredMargin, noWeeklyLimitFirst: library.preferences.autoSort == true)
     }
     private func lifetime(of snapshot: UsageSnapshot) -> TimeInterval { snapshot.source == UsageParser.statusLineSource ? 300 : 60 }
     /// What an account taking over from `active` must have above its threshold (see `UsagePace.candidateMargin`).

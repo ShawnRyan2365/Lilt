@@ -46,9 +46,14 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         guard sampledAt <= now, let window, window.resetsAt.map({ $0 > now }) ?? true else { return nil }
         return window.remaining
     }
-    /// Each window paired with its own threshold.
+    /// The reading has a 5-hour window and no 7-day one. Enterprise logins answer this way: the usage endpoint and the
+    /// status line report `seven_day` as null for them, and the screen shows the 7-day column as unknown. Their only
+    /// limit is the 5-hour window, so the weekly check passes and auto sort spends them first. A Pro or Max login always
+    /// reports a 7-day window, one that has not started included, and an unread account has no reading at all.
+    public var hasNoWeeklyLimit: Bool { fiveHour != nil && sevenDay == nil }
+    /// Each window paired with its own threshold. A login without a weekly limit is judged on its 5-hour window alone.
     private func windows(_ threshold: Thresholds) -> [(window: UsageWindow?, threshold: Double)] {
-        [(fiveHour, threshold.fiveHour), (sevenDay, threshold.sevenDay)]
+        hasNoWeeklyLimit ? [(fiveHour, threshold.fiveHour)] : [(fiveHour, threshold.fiveHour), (sevenDay, threshold.sevenDay)]
     }
     public func exhausted(threshold: Thresholds, at now: Date, lifetime: TimeInterval = 60) -> Bool {
         windows(threshold).contains { validRemaining($0.window, at: now, lifetime: lifetime).map { [t = $0.threshold] in $0 <= t + 0.000001 } ?? false }
@@ -146,6 +151,10 @@ public struct RelayPolicy: Sendable {
     /// What each window must still have after the expected reaction time. This comes from `UsagePace`; it is not
     /// a second exhaustion threshold and defaults to zero for callers without a pace history.
     public var requiredMargin: Thresholds
+    /// Auto sort is on: a hand-off takes a login without a weekly limit (`UsageSnapshot.hasNoWeeklyLimit`) before any
+    /// other, however empty the others' 5-hour windows are. Its quota costs no weekly reserve, while every point taken
+    /// from a Pro or Max login also comes off that login's week. Off, the user's order only breaks ties within `roomTier`.
+    public var noWeeklyLimitFirst: Bool
     /// How long before expiry a target account's access token is renewed.
     /// Claude Code refreshes on its own about five minutes ahead. Renewing unused accounts an hour ahead
     /// leaves ample time for retries, and a token written into the scope is not already inside the CLI's refresh window.
@@ -179,9 +188,10 @@ public struct RelayPolicy: Sendable {
     /// enables meanwhile is not left waiting for hours.
     public static let maximumRetryWait: TimeInterval = 900
     public init(threshold: Thresholds = 1, allowUnverifiedHotSwitch: Bool = false, leftRecently: UUID? = nil,
-                soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) {
+                soonerWeekly: Bool = false, requiredMargin: Thresholds = 0, noWeeklyLimitFirst: Bool = false) {
         self.threshold = threshold; self.allowUnverifiedHotSwitch = allowUnverifiedHotSwitch
         self.leftRecently = leftRecently; self.soonerWeekly = soonerWeekly; self.requiredMargin = requiredMargin
+        self.noWeeklyLimitFirst = noWeeklyLimitFirst
     }
     /// Whether a candidate's reading should be renewed now, ahead of the hand-off, so that it is still within
     /// `confirmLifetime` when the hand-off comes and the hand-off does not have to read it first. With a measured pace
@@ -269,19 +279,22 @@ public struct RelayPolicy: Sendable {
     }
     /// Last readings set the order, however old they are; confirmation and the predicted margin decide who can actually
     /// take over. Within `roomTier` points the relay order decides. Unknown accounts follow in relay order so they can
-    /// be checked, while accounts that cannot improve on the active account are left out.
+    /// be checked, while accounts that cannot improve on the active account are left out. With `noWeeklyLimitFirst`,
+    /// logins without a weekly limit come before all others, the emptiest of them first.
     public func handOffOrder(_ candidates: [Account], leaving active: Account?, at now: Date) -> [Account] {
         let floor = floor(leaving: active, at: now)
-        var known: [(tier: Int, position: Int, account: Account)] = [], unknown: [Account] = []
+        var known: [(group: Int, tier: Int, position: Int, account: Account)] = [], unknown: [Account] = []
         for (position, candidate) in candidates.enumerated()
         where candidate.id != active?.id && candidate.id != leftRecently && barrier(for: candidate, at: now) == nil {
             guard let usage = candidate.usage, let five = Self.expected(usage.fiveHour, of: usage, at: now),
-                  let week = Self.expected(usage.sevenDay, of: usage, at: now) else { unknown.append(candidate); continue }
+                  let week = usage.hasNoWeeklyLimit ? .infinity : Self.expected(usage.sevenDay, of: usage, at: now)
+            else { unknown.append(candidate); continue }
             guard five - threshold.fiveHour > max(floor, requiredMargin.fiveHour) + 0.000001,
                   week - threshold.sevenDay > max(floor, requiredMargin.sevenDay) + 0.000001 else { continue }
-            known.append((Int((100 - five) / Self.roomTier), position, candidate))
+            let group = noWeeklyLimitFirst && usage.hasNoWeeklyLimit ? 0 : 1
+            known.append((group, Int((100 - five) / Self.roomTier), position, candidate))
         }
-        return known.sorted { ($0.tier, $0.position) < ($1.tier, $1.position) }.map(\.account) + unknown
+        return known.sorted { ($0.group, $0.tier, $0.position) < ($1.group, $1.tier, $1.position) }.map(\.account) + unknown
     }
     /// The account a hand-off reads next, or nil once it should read no more: the best placed account is ready on a
     /// recent reading, or every account placed above it was already asked this time (`asked`) or cannot be asked now.
@@ -338,9 +351,10 @@ public struct RelayPolicy: Sendable {
         return .wait
     }
 }
-/// The relay order when automatic sorting is on. Weekly quota that resets sooner is spent first, because whatever is
-/// left of it is lost at the reset; accounts that reset later stay in reserve, so a large job has more to draw on.
-/// The 5-hour window plays no part in the order. It only steers which ready account a hand-off picks.
+/// The relay order when automatic sorting is on. Logins without a weekly limit come first: using them costs no weekly
+/// reserve at all. Then weekly quota that resets sooner is spent first, because whatever is left of it is lost at the
+/// reset; accounts that reset later stay in reserve, so a large job has more to draw on. The 5-hour window plays no
+/// part in the order. It only steers which ready account a hand-off picks.
 public enum RelayOrder {
     /// Days until a 7-day reset, as the day figure on screen: under a day counts as 0, otherwise rounded to the
     /// nearest day. Accounts that both read “2 天后” share a day and are then ranked by what they have left.
@@ -348,19 +362,21 @@ public enum RelayOrder {
         let seconds = reset.timeIntervalSince(now)
         return seconds < 86400 ? 0 : Int((seconds / 86400).rounded())
     }
-    /// Sooner reset day first; within a day more left first, then the earlier reset. A window that has not started
-    /// runs the full seven days once it is used, so it sorts as day 7. Accounts without a usable 7-day reading come
-    /// after those, including a window that has reset since it was read, which is read again rather than assumed
-    /// full. Disabled accounts go last. Ties keep the user's own order, so turning sorting off restores it unchanged.
+    /// Logins without a weekly limit first, in the user's order among themselves. Then sooner reset day first; within a
+    /// day more left first, then the earlier reset. A window that has not started runs the full seven days once it is
+    /// used, so it sorts as day 7. Accounts without a usable 7-day reading come after those, including a window that has
+    /// reset since it was read, which is read again rather than assumed full. Disabled accounts go last. Ties keep the
+    /// user's own order, so turning sorting off restores it unchanged.
     public static func sorted(_ accounts: [Account], at now: Date) -> [Account] {
         typealias Key = (group: Int, day: Int, remaining: Double, reset: Date)
         func key(_ account: Account) -> Key {
-            guard account.enabled else { return (2, 0, 0, .distantFuture) }
+            guard account.enabled else { return (3, 0, 0, .distantFuture) }
+            if account.usage?.hasNoWeeklyLimit == true { return (0, 0, 0, .distantFuture) }
             guard let usage = account.usage, let window = usage.sevenDay, let remaining = usage.lastKnownRemaining(window, at: now) else {
-                return (1, 0, 0, .distantFuture)
+                return (2, 0, 0, .distantFuture)
             }
-            guard let reset = window.resetsAt else { return (0, 7, remaining, .distantFuture) }
-            return (0, day(until: reset, at: now), remaining, reset)
+            guard let reset = window.resetsAt else { return (1, 7, remaining, .distantFuture) }
+            return (1, day(until: reset, at: now), remaining, reset)
         }
         let ranked = accounts.enumerated().map { (key: key($0.element), position: $0.offset, account: $0.element) }
         return ranked.sorted { a, b in
