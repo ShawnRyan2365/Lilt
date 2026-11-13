@@ -14,15 +14,66 @@ final class ConcurrencyChecks: Sendable {
                       sampledAt: now.addingTimeInterval(-ago), source: UsageParser.statusLineSource)
     }
 
-    /// A burst shows within seconds, but only from three readings with two real drops: one jump is not a pace.
+    /// A burst shows within seconds, but only from three readings with two real drops: one jump is not a pace. Three
+    /// points in eight seconds is 22.5 a minute, which the standard tiers turn into ten points early, not 22.5.
     func testBurstChannel() {
-        let latest = reading(20, ago: 0)
-        expect(UsagePace.nearing(latest, after: [reading(23, ago: 8), reading(22, ago: 4)], threshold: 5, at: now, lifetime: 300))
-        expectEqual(UsagePace.projectedMargin(latest, after: [reading(23, ago: 8), reading(22, ago: 4)], at: now, lifetime: 300).fiveHour, 22.5)
-        expectFalse(UsagePace.nearing(latest, after: [reading(23, ago: 8)], threshold: 5, at: now, lifetime: 300))
-        expectFalse(UsagePace.nearing(latest, after: [reading(23, ago: 8), reading(23, ago: 4)], threshold: 5, at: now, lifetime: 300))
+        let latest = reading(14, ago: 0)
+        let burst = [reading(17, ago: 8), reading(16, ago: 4)]
+        expect(UsagePace.nearing(latest, after: burst, threshold: 5, at: now, lifetime: 300))
+        expectEqual(UsagePace.perMinute(latest, after: burst, at: now, lifetime: 300).fiveHour, 22.5)
+        expectEqual(UsagePace.earlyPoints(latest, after: burst, at: now, lifetime: 300, rules: .standard).fiveHour, 10)
+        expectFalse(UsagePace.nearing(reading(20, ago: 0), after: [reading(23, ago: 8), reading(22, ago: 4)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [reading(17, ago: 8)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [reading(17, ago: 8), reading(17, ago: 4)], threshold: 5, at: now, lifetime: 300))
         // Readings more than ten seconds back are the long channel's, which needs 30 seconds.
-        expectFalse(UsagePace.nearing(latest, after: [reading(26, ago: 20), reading(23, ago: 15)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [reading(20, ago: 20), reading(17, ago: 15)], threshold: 5, at: now, lifetime: 300))
+    }
+
+    /// The tiers: the largest margin among those the pace reaches, nothing below the first or when switched off, and
+    /// values out of range clamped, also when read from a file. Older preference files get the standard tiers.
+    func testEarlyHandOffTiers() throws {
+        let rules = EarlyHandOff.standard
+        expectEqual(rules.points(perMinute: 0), 0); expectEqual(rules.points(perMinute: 4.9), 0)
+        expectEqual(rules.points(perMinute: 5), 2); expectEqual(rules.points(perMinute: 12), 5)
+        expectEqual(rules.points(perMinute: 20), 10); expectEqual(rules.points(perMinute: 300), 10)
+        expectEqual(rules.points(perMinute: .nan), 0); expectEqual(rules.maximum, 10)
+        // Out of order, a faster pace still never goes later than a slower one.
+        let shuffled = EarlyHandOff(tiers: [EarlyHandOffTier(perMinute: 20, points: 3), EarlyHandOffTier(perMinute: 5, points: 6)])
+        expectEqual(shuffled.points(perMinute: 25), 6)
+        var off = rules; off.enabled = false
+        expectEqual(off.points(perMinute: 50), 0); expectEqual(off.maximum, 0)
+        expectEqual(EarlyHandOffTier(perMinute: 0, points: -4), EarlyHandOffTier(perMinute: 1, points: 0))
+        let file = Data(#"{"enabled":true,"tiers":[{"perMinute":0,"points":99}]}"#.utf8)
+        expectEqual(try JSONDecoder().decode(EarlyHandOff.self, from: file).tiers, [EarlyHandOffTier(perMinute: 1, points: 30)])
+        let old = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8))
+        expectEqual(old.earlyRules, .standard); expect(old.relayPool == nil)
+        // The candidate taking over needs the early margin too, or the same sessions would hand off again at once.
+        let latest = reading(14, ago: 0)
+        let early = UsagePace.earlyPoints(latest, after: [reading(17, ago: 8), reading(16, ago: 4)], at: now, lifetime: 300, rules: rules)
+        expectEqual(UsagePace.candidateMargin(pace: early, allowance: 0).fiveHour, 10)
+    }
+
+    /// `lilt` finds an account the way `ccl` finds a provider, except that an exact name comes before a number, and a
+    /// pool keeps only accounts that still exist.
+    func testCommandLineAccountQuery() {
+        let labels = ["Team-Enterprise", "Fixture Max", "001", "002", "010"]
+        expectEqual(AccountQuery.match("001", labels: labels), .one(2))
+        expectEqual(AccountQuery.match("2", labels: labels), .one(1))
+        expectEqual(AccountQuery.match("5", labels: labels), .one(4))
+        expectEqual(AccountQuery.match("team", labels: labels), .one(0))
+        expectEqual(AccountQuery.match("MAX", labels: labels), .one(1))
+        expectEqual(AccountQuery.match("tent", labels: labels), .one(0))
+        expectEqual(AccountQuery.match("00", labels: labels), .several([2, 3]))
+        // A number past the end is looked up as a name instead.
+        expectEqual(AccountQuery.match("10", labels: labels), .one(4))
+        expectEqual(AccountQuery.match("9", labels: labels), .none)
+        expectEqual(AccountQuery.match("  ", labels: labels), .none)
+        expectEqual(AccountQuery.match("zzz", labels: labels), .none)
+        let a = Account(label: "Fixture A", kind: .oauth), b = Account(label: "Fixture B", kind: .oauth)
+        expect(RelayPool.effective(nil, accounts: [a, b]) == nil)
+        expectEqual(RelayPool.effective([a.id, UUID()], accounts: [a, b]), [a.id])
+        expect(RelayPool.effective([UUID()], accounts: [a, b]) == nil)
+        expectEqual(RelayPool.effective([], accounts: [a, b]), nil)
     }
 
     /// An account taking over must cover the pace during a hand-off and what the last switch cost, and never less
@@ -45,12 +96,6 @@ final class ConcurrencyChecks: Sendable {
         let otherWindow = UsageSnapshot(fiveHour: UsageWindow(used: 90, resetsAt: reset5.addingTimeInterval(7200)), sampledAt: now)
         expectEqual(UsagePace.switchAllowance(confirmed: reading(30, ago: 60), first: otherWindow).fiveHour, 0)
         expectEqual(UsagePace.switchAllowance(confirmed: reading(20, ago: 60), first: reading(25, ago: 0)).fiveHour, 0)
-        // The time a hand-off took sets the reaction budget, within one to five minutes.
-        expectEqual(UsagePace.reactionTime(measured: nil), 60)
-        expectEqual(UsagePace.reactionTime(measured: 20), 60)
-        expectEqual(UsagePace.reactionTime(measured: 90), 90)
-        expectEqual(UsagePace.reactionTime(measured: 1000), 300)
-        expectEqual(UsagePace.reactionTime(measured: .infinity), 60)
     }
 
     /// Candidates are read ahead so that one is still confirmed when the hand-off comes, and an idle account near its

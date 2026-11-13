@@ -53,8 +53,6 @@ public actor HeadlessEngine {
     private var relayAgain = false
     private var relayGeneration = 0
     private var noCandidateFailures = 0
-    /// How long the last hand-off took from trigger to written login (see `UsagePace.reactionTime`).
-    private var reactionTime = UsagePace.lead
     /// What the last switch was seen to cost (see `UsagePace.switchAllowance`), and the reading it is measured from.
     private var switchAllowance: Thresholds = 0
     private var pendingJump: (account: UUID, confirmed: UsageSnapshot)?
@@ -597,7 +595,7 @@ public actor HeadlessEngine {
     private func candidateMargin(_ active: Account) -> Thresholds {
         var pace: Thresholds = 0
         if paceAccount == active.id, let usage = active.usage {
-            pace = UsagePace.projectedMargin(usage, after: paceReadings, at: now(), lifetime: lifetime(of: usage), reactionTime: reactionTime)
+            pace = UsagePace.earlyPoints(usage, after: paceReadings, at: now(), lifetime: lifetime(of: usage), rules: library.preferences.earlyRules)
         }
         return UsagePace.candidateMargin(pace: pace, allowance: switchAllowance)
     }
@@ -705,7 +703,7 @@ public actor HeadlessEngine {
         let generation = relayGeneration, started = ContinuousClock.now
         let triggered = snapshot.exhausted(threshold: thresholds, at: now(), lifetime: lifetime(of: snapshot))
         let ahead = !triggered && paceAccount == active.id
-            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: now(), lifetime: lifetime(of: snapshot), reactionTime: reactionTime)
+            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: now(), lifetime: lifetime(of: snapshot), rules: library.preferences.earlyRules)
         let due = triggered || ahead
         let early = library.preferences.soonerWeekly == true && !due && snapshot.isFresh(at: now())
         guard due || early else {
@@ -743,8 +741,9 @@ public actor HeadlessEngine {
         // Decided on the newest reading of the account in use: readings that kept arriving during the reads are
         // taken into account rather than making the hand-off give up and start over.
         guard let current = self.active, let latest = current.usage else { return }
-        let aheadNow = !triggered && paceAccount == current.id
-            && UsagePace.nearing(latest, after: paceReadings, threshold: thresholds, at: now(), lifetime: lifetime(of: latest), reactionTime: reactionTime)
+        let paceTrigger = !triggered && paceAccount == current.id
+            ? UsagePace.trigger(latest, after: paceReadings, threshold: thresholds, at: now(), lifetime: lifetime(of: latest), rules: library.preferences.earlyRules) : nil
+        let aheadNow = paceTrigger?.due == true
         switch policy.decide(active: current, candidates: relayCandidates(policy, besides: current.id), at: now(), holdActiveReading: triggered, ahead: aheadNow) {
         case .select(let id):
             guard latch.claim(account: current.id, snapshot: latest) else { return }
@@ -753,9 +752,9 @@ public actor HeadlessEngine {
             let confirming = (ContinuousClock.now - started).seconds, writing = ContinuousClock.now
             do {
                 if try await apply(id, automatically: true) {
-                    reactionTime = UsagePace.reactionTime(measured: (ContinuousClock.now - started).seconds)
                     store.log("auto-timing", detail: relayTiming(paced: !triggered, readingAge: now().timeIntervalSince(latest.sampledAt),
-                                                                 confirm: confirming, write: (ContinuousClock.now - writing).seconds))
+                                                                 confirm: confirming, write: (ContinuousClock.now - writing).seconds,
+                                                                 pace: paceTrigger.map { ($0.left, $0.perMinute, $0.early) }))
                     departedID = current.id; departedAt = now(); lastEvent = "已自动接力"; message = "已自动接力"
                     pendingJump = confirmed.map { (id, $0) }
                 } else if !runtime.transactionPending { latch.release(account: current.id, snapshot: latest) }

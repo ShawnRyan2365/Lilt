@@ -203,6 +203,7 @@ struct MainView: View {
             }
             Text(model.relayExplanation ?? blocker ?? model.handOffRule)
                 .font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)
+            if let pool = model.relayPoolSummary { PoolRow(model: model, summary: pool) }
             if model.demo || model.lastEvent != "尚无接力记录" {
                 Spacer(minLength: 6)
                 Text(model.lastEvent).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)

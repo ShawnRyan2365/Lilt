@@ -80,15 +80,13 @@ public extension UsageSnapshot {
 /// Readings arrive some seconds apart and a hand-off takes a few more; a busy account, several sessions at once, can
 /// spend several points in that time and run into its limit, which stops the session mid-task.
 ///
-/// Until 0.2.5 a hand-off started at most ten points early, and only on readings at least 30 seconds apart. With four
-/// or five projects at once an account can spend more than ten points in a minute, and the first 30 seconds of such a
-/// burst had no pace at all. Now the margin follows the measured rate with no point cap, and a second, short channel
-/// sees a burst within seconds.
+/// Until 0.2.5 a hand-off started at most ten points early, and only on readings at least 30 seconds apart; the first
+/// 30 seconds of a burst had no pace at all. A second, short channel now sees a burst within seconds. From 0.2.5 to
+/// 0.3.9 the margin was one minute's spend at the measured pace with no cap, which handed off with 20–30% left; how
+/// many points early a pace hands off is now the user's tiers (`EarlyHandOff`).
 public enum UsagePace {
-    /// The reaction budget until a hand-off has been timed: the next readings plus a hand-off.
+    /// The span a pace is expressed over: points a minute.
     public static let lead: TimeInterval = 60
-    /// However long one hand-off took (a keychain that stalled, say), the budget never grows past this.
-    public static let maximumReaction: TimeInterval = 300
     /// The long channel needs two readings at least this far apart, so one figure rounded up is not a burst.
     public static let minimumSpan: TimeInterval = 30
     /// Readings older than this say little about the pace now.
@@ -104,14 +102,9 @@ public enum UsagePace {
     /// cannot rule out every account.
     public static let maximumSwitchAllowance: Double = 10
 
-    /// The reaction budget after a hand-off that took `measured` seconds from trigger to written login.
-    public static func reactionTime(measured: TimeInterval?) -> TimeInterval {
-        guard let measured, measured.isFinite else { return lead }
-        return min(maximumReaction, max(lead, measured))
-    }
-
-    /// What an account taking over must have above its threshold: what the account in use would spend during a
-    /// hand-off at its pace, plus what the last switch was seen to cost, and never less than `initialCandidateMargin`.
+    /// What an account taking over must have above its threshold: the points the account in use hands off early at
+    /// its pace (`earlyPoints`), plus what the last switch was seen to cost, and never less than `initialCandidateMargin`.
+    /// Less than the early margin and the same sessions would set off another hand-off at once.
     public static func candidateMargin(pace: Thresholds, allowance: Thresholds) -> Thresholds {
         Thresholds(fiveHour: max(initialCandidateMargin, pace.fiveHour + allowance.fiveHour),
                    sevenDay: max(initialCandidateMargin, pace.sevenDay + allowance.sevenDay))
@@ -143,7 +136,7 @@ public enum UsagePace {
         return soonest
     }
 
-    /// The points each window may spend during `reactionTime` at the faster of the two channels, with no fixed cap.
+    /// The points each window may spend during `reactionTime` at the faster of the two channels.
     public static func projectedMargin(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], at now: Date,
                                        lifetime: TimeInterval, reactionTime: TimeInterval = lead) -> Thresholds {
         Thresholds(fiveHour: margin(latest, after: earlier, window: latest.fiveHour, pick: \.fiveHour,
@@ -152,17 +145,43 @@ public enum UsagePace {
                                     at: now, lifetime: lifetime, reactionTime: reactionTime))
     }
 
-    /// True when a window of `latest` would reach its threshold within `reactionTime` at the measured pace. Only
-    /// readings of the same window count: one from before a reset says nothing about now.
+    /// Points each window is being spent a minute, at the faster of the two channels; zero where no pace is measured.
+    public static func perMinute(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], at now: Date,
+                                 lifetime: TimeInterval) -> Thresholds {
+        projectedMargin(latest, after: earlier, at: now, lifetime: lifetime, reactionTime: lead)
+    }
+
+    /// How many points above its threshold each window hands off: its pace a minute put through `rules`.
+    public static func earlyPoints(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], at now: Date,
+                                   lifetime: TimeInterval, rules: EarlyHandOff) -> Thresholds {
+        rules.points(byWindow: perMinute(latest, after: earlier, at: now, lifetime: lifetime))
+    }
+
+    /// True when a window of `latest` is within its early margin of its threshold (`earlyPoints`). Only readings of
+    /// the same window count: one from before a reset says nothing about now.
     public static func nearing(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], threshold: Thresholds,
-                               at now: Date, lifetime: TimeInterval, reactionTime: TimeInterval = lead) -> Bool {
-        let margin = projectedMargin(latest, after: earlier, at: now, lifetime: lifetime, reactionTime: reactionTime)
-        for (window, limit, reserve) in [(latest.fiveHour, threshold.fiveHour, margin.fiveHour),
-                                         (latest.sevenDay, threshold.sevenDay, margin.sevenDay)] {
-            guard reserve > 0, let remaining = latest.validRemaining(window, at: now, lifetime: lifetime) else { continue }
-            if remaining - reserve <= limit + 0.000001 { return true }
+                               at now: Date, lifetime: TimeInterval, rules: EarlyHandOff = .standard) -> Bool {
+        trigger(latest, after: earlier, threshold: threshold, at: now, lifetime: lifetime, rules: rules)?.due == true
+    }
+
+    /// The window closest to its early trigger, for `switches.log`: what it had left, its pace a minute and the points
+    /// it hands off early. Nil when no window has a measured pace.
+    public static func trigger(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], threshold: Thresholds,
+                               at now: Date, lifetime: TimeInterval, rules: EarlyHandOff)
+        -> (left: Double, perMinute: Double, early: Double, due: Bool)? {
+        let rate = perMinute(latest, after: earlier, at: now, lifetime: lifetime)
+        var closest: (left: Double, perMinute: Double, early: Double, distance: Double)?
+        var due = false
+        for (window, limit, pace) in [(latest.fiveHour, threshold.fiveHour, rate.fiveHour),
+                                      (latest.sevenDay, threshold.sevenDay, rate.sevenDay)] {
+            guard pace > 0, let remaining = latest.validRemaining(window, at: now, lifetime: lifetime) else { continue }
+            let early = rules.points(perMinute: pace)
+            let distance = remaining - early - limit
+            if early > 0 && distance <= 0.000001 { due = true }
+            if let current = closest, current.distance <= distance { continue }
+            closest = (remaining, pace, early, distance)
         }
-        return false
+        return closest.map { (left: $0.left, perMinute: $0.perMinute, early: $0.early, due: due) }
     }
 
     private static func margin(_ latest: UsageSnapshot, after earlier: [UsageSnapshot], window: UsageWindow?,

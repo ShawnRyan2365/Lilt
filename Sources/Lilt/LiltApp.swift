@@ -1,10 +1,29 @@
 import SwiftUI
 import Carbon
 
+/// One binary for both: started with `LiltCommand.flag` it is the `lilt` command in a terminal and never touches
+/// AppKit; otherwise it is the app.
 @main
+enum LiltMain {
+    @MainActor static func main() {
+        let arguments = CommandLine.arguments
+        if arguments.count > 1, arguments[1] == LiltCommand.flag { exit(LiltCommand.run(Array(arguments.dropFirst(2)))) }
+        LiltApp.main()
+    }
+}
+
 struct LiltApp: App {
-    @State private var model = AppModel()
+    @State private var model: AppModel
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    init() {
+        let model = AppModel()
+        _model = State(initialValue: model)
+        // After launch has begun: a second copy that is about to quit finds the first one answering and leaves it be.
+        DispatchQueue.main.async {
+            ControlServer.shared.start(model: model)
+            DispatchQueue.global(qos: .utility).async { CommandLineInstall.followMove() }
+        }
+    }
     var body: some Scene {
         Window(AppBuild.title, id: "main") {
             RootView(model: model)
@@ -77,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-    func applicationWillTerminate(_ notification: Notification) { model?.login.cancel(); model?.flushSaves() }
+    func applicationWillTerminate(_ notification: Notification) { model?.login.cancel(); model?.flushSaves(); ControlServer.shared.stop() }
     /// The process has to be alive as well: the list of running applications lags a quit by a moment, and a copy opened
     /// right after an update quit the old one found it still listed and closed itself.
     static func otherInstance() -> NSRunningApplication? {

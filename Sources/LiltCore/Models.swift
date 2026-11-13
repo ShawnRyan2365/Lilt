@@ -126,6 +126,13 @@ public struct Preferences: Codable, Sendable {
     /// Ask GitHub every few hours whether a newer Lilt is out. Nil means on. Optional so preference files written
     /// before the choice existed still load.
     public var autoUpdateCheck: Bool?
+    /// How many points early relay hands off at a given pace (`EarlyHandOff`). Nil means `EarlyHandOff.standard`.
+    public var earlyHandOff: EarlyHandOff?
+    /// The accounts automatic relay may hand off to, set by `lilt <account>…` in a terminal. Nil means every account.
+    /// One account locks the default login on it: relay never hands off from it. Ids of accounts since removed are
+    /// ignored (`RelayPool`).
+    public var relayPool: [UUID]?
+    public var earlyRules: EarlyHandOff { earlyHandOff ?? .standard }
     public init() {}
 }
 public struct Library: Codable, Sendable {
@@ -317,8 +324,8 @@ public struct RelayPolicy: Sendable {
             }.max()
         }.min()
     }
-    /// `ahead` says the account in use will reach the threshold within `UsagePace.lead` at the pace it is being spent;
-    /// the hand-off then starts as if it had.
+    /// `ahead` says the account in use is within its early margin of the threshold at the pace it is being spent
+    /// (`UsagePace.nearing`); the hand-off then starts as if it had reached it.
     public func decide(active: Account?, candidates: [Account], at now: Date, holdActiveReading: Bool = false, ahead: Bool = false) -> RelayDecision {
         guard let active, let usage = active.usage else { return .wait }
         let triggered = ahead || (holdActiveReading ? usage.remainsExhausted(threshold: threshold, at: now) : usage.exhausted(threshold: threshold, at: now))

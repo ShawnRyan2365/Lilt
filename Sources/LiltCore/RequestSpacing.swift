@@ -21,8 +21,15 @@ public extension Duration {
 }
 
 /// One line for `switches.log` about an automatic hand-off: why it started, how old the reading was, how long the
-/// candidate reads and the write took. Numbers only; no names, ids or secrets.
-public func relayTiming(paced: Bool, readingAge: TimeInterval, confirm: TimeInterval, write: TimeInterval) -> String {
-    "trigger=\(paced ? "pace" : "threshold") age=\(String(format: "%.0f", max(0, readingAge)))s "
+/// candidate reads and the write took. A hand-off ahead of the threshold also says what the window closest to its
+/// trigger had left, its pace a minute and how many points early it went (`UsagePace.trigger`), so the early tiers
+/// can be checked against what happened. Numbers only; no names, ids or secrets.
+public func relayTiming(paced: Bool, readingAge: TimeInterval, confirm: TimeInterval, write: TimeInterval,
+                        pace: (left: Double, perMinute: Double, early: Double)? = nil) -> String {
+    var line = "trigger=\(paced ? "pace" : "threshold") age=\(String(format: "%.0f", max(0, readingAge)))s "
         + "confirm=\(String(format: "%.1f", confirm))s write=\(String(format: "%.1f", write))s"
+    if let pace {
+        line += " left=\(String(format: "%.1f", pace.left))% rate=\(String(format: "%.1f", pace.perMinute))/min early=\(String(format: "%.0f", pace.early))"
+    }
+    return line
 }

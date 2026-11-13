@@ -140,8 +140,6 @@ final class AppModel {
     private var relayAgain = false
     private var relayGeneration = 0
     private var noCandidateFailures = 0
-    /// How long the last hand-off took from trigger to written login (see `UsagePace.reactionTime`).
-    private var relayReactionTime = UsagePace.lead
     /// What the last switch was seen to cost (see `UsagePace.switchAllowance`), and the reading it is measured from.
     private var switchAllowance: Thresholds = 0
     private var pendingJump: (account: UUID, confirmed: UsageSnapshot)?
@@ -327,6 +325,110 @@ final class AppModel {
     /// On unless the user turns it off. Nil in an older preferences file means on.
     var autoUpdateCheck: Bool { library.preferences.autoUpdateCheck != false }
     func setAutoUpdateCheck(_ on: Bool) { updatePreferences { $0.autoUpdateCheck = on } }
+    /// The early hand-off tiers in force (`EarlyHandOff`).
+    var earlyRules: EarlyHandOff { library.preferences.earlyRules }
+    func setEarlyHandOff(_ rules: EarlyHandOff) { updatePreferences { $0.earlyHandOff = rules } }
+    /// Points a minute the account in use is being spent, as relay measures it; nil while no pace is measured.
+    var activePace: Thresholds? {
+        let now = max(clock, .now)
+        guard !demo, let active, paceAccount == active.id, let usage = active.usage else { return nil }
+        let rate = UsagePace.perMinute(usage, after: paceReadings, at: now, lifetime: lifetime(of: usage))
+        return rate.fiveHour > 0 || rate.sevenDay > 0 ? rate : nil
+    }
+
+    // MARK: Relay pool and the `lilt` command
+
+    /// The accounts relay may hand off to, when a terminal set a pool (`lilt <account>…`); nil means all of them.
+    var relayPool: Set<UUID>? { RelayPool.effective(library.preferences.relayPool, accounts: library.accounts) }
+    /// The pool in a few words for the relay card and the panel; nil without one.
+    var relayPoolSummary: String? {
+        guard let pool = relayPool else { return nil }
+        let names = accounts.filter { pool.contains($0.id) }.map(\.label)
+        if names.count == 1 { return "已锁定“\(names[0])”，不换号" }
+        return names.count <= 3 ? "只在 \(names.joined(separator: "、")) 间接力" : "只在 \(names.count) 个账号间接力"
+    }
+    func clearRelayPool() {
+        updatePreferences { $0.relayPool = nil }
+        relayRetryAt = nil; noCandidateFailures = 0
+        status = "接力范围恢复全部账号"
+    }
+    /// Why the last switch asked for from a terminal did not happen, for the terminal to print.
+    private var commandLineFailure: String?
+    /// What `lilt ls` prints: every account in relay order, the pool and what relay is doing.
+    func commandLineList() -> ControlReply {
+        let pool = relayPool, reserved = projectCatalog.reservedAccountIDs, now = Date.now
+        let rows = accounts.map { account in
+            let usage = account.usage
+            return ControlAccount(id: account.id, label: account.label, active: account.id == library.activeID,
+                                  enabled: account.enabled, project: reserved.contains(account.id),
+                                  inPool: pool?.contains(account.id) ?? true,
+                                  fiveHour: usage.flatMap { $0.lastKnownRemaining($0.fiveHour, at: now) },
+                                  sevenDay: usage.flatMap { $0.lastKnownRemaining($0.sevenDay, at: now) },
+                                  noWeeklyLimit: usage?.hasNoWeeklyLimit == true, sampledAt: usage?.sampledAt)
+        }
+        return ControlReply(ok: true, accounts: rows, pool: pool.map { pool in accounts.map(\.id).filter(pool.contains) },
+                            autoRelay: autoRelay, relayNote: relayExplanation ?? (autoRelay ? handOffRule : relayBlocker))
+    }
+    /// `lilt <account>…` in a terminal. From now on relay hands off only among these accounts, and the default login
+    /// moves into them unless it is on one already: to the first listed whose last reading has room, else the first
+    /// listed. One account locks the default login on it, so relay never hands off from it; several turn relay on.
+    func useAccounts(_ requested: [UUID]) async -> ControlReply {
+        var ids: [UUID] = []
+        for id in requested where !ids.contains(id) { ids.append(id) }
+        guard !ids.isEmpty else { return .failure("没有指定账号。") }
+        guard storageAvailable else { return .failure("Lilt 的本地数据不可用，没有切换。") }
+        guard demo || library.preferences.scopeEnabled else { return .failure("Lilt 还没接管 Claude Code 默认登录；先在 Lilt 的「接入」页接管。") }
+        var chosen: [Account] = []
+        for id in ids {
+            guard let account = library.accounts.first(where: { $0.id == id }) else { return .failure("有账号已被删除；运行 lilt ls 重新查看。") }
+            if !account.enabled { return .failure("“\(account.label)”已停用；先在 Lilt 里启用它。") }
+            if projectCatalog.reservedAccountIDs.contains(id) { return .failure("“\(account.label)”已固定给项目，默认登录不能用它。") }
+            chosen.append(account)
+        }
+        guard !busy else { return .failure("Lilt 正在切换或登录，稍后再试。") }
+        var lines: [String] = []
+        if let current = active, ids.contains(current.id) {
+            if ids.count > 1 { lines.append("当前账号“\(current.label)”已在范围内，没有切换。") }
+        } else {
+            let now = Date.now
+            let target = chosen.first { account in
+                guard let usage = account.usage, usage.lastKnownRemaining(usage.fiveHour, at: now) != nil else { return false }
+                return !usage.remainsExhausted(threshold: thresholds, at: now)
+            } ?? chosen[0]
+            commandLineFailure = nil
+            guard await apply(target.id, fromCommandLine: true) else {
+                return .failure(commandLineFailure ?? "没能切换到“\(target.label)”，范围没有改动。")
+            }
+            lines.append("已切换到“\(target.label)”。")
+            if !demo { lines.append("凭据已写入\(scopeName)；运行中的会话是否已换号，以会话里的 /status 为准。") }
+        }
+        updatePreferences { $0.relayPool = ids }
+        relayRetryAt = nil; noCandidateFailures = 0
+        if ids.count == 1 {
+            lines.append("已锁定“\(chosen[0].label)”：自动接力不会换到其他账号。lilt all 恢复全部账号。")
+        } else {
+            let names = accounts.filter { ids.contains($0.id) }.map(\.label).joined(separator: "、")
+            lines.append("只在 \(names) 之间接力（\(ids.count) 个）。lilt all 恢复全部账号。")
+            if !autoRelay {
+                if let relayBlocker { lines.append("自动接力没开：\(relayBlocker)。") }
+                else { setAutoRelay(true); lines.append("已开启自动接力。") }
+            }
+        }
+        status = relayPoolSummary ?? status
+        // The account in use may already be at its threshold; relay need not wait for the next pass to hand off.
+        Task { await self.relay() }
+        var reply = commandLineList()
+        reply.lines = lines
+        return reply
+    }
+    /// `lilt all`: relay may use every account again.
+    func useAllAccounts() -> ControlReply {
+        let had = relayPool != nil
+        if had { clearRelayPool() }
+        var reply = commandLineList()
+        reply.lines = [had ? "接力范围已恢复全部账号。" : "接力范围本来就是全部账号。"]
+        return reply
+    }
     /// Work that quitting for an update must not cut off. A token renewal runs under both flags, and stopping halfway
     /// through one could lose the only copy of a newly issued refresh token.
     var updateBlocker: String? {
@@ -491,7 +593,12 @@ final class AppModel {
         do {
             if !demo { try AccountVault.delete(account: id.uuidString) }
             if !demo { try? AccountVault.delete(account: Keychain.identityAccount(id)) }
-            library.accounts.removeAll { $0.id == id }; backoffs[id] = nil; failures[id] = nil; save()
+            library.accounts.removeAll { $0.id == id }; backoffs[id] = nil; failures[id] = nil
+            if let pool = library.preferences.relayPool {
+                let kept = pool.filter { $0 != id }
+                library.preferences.relayPool = kept.isEmpty ? nil : kept
+            }
+            save()
         } catch { message = "本地凭据未能删除。" }
     }
     /// Returns the reason when nothing was saved, so the sheet can show it in place.
@@ -1019,8 +1126,10 @@ final class AppModel {
         guard !demo else { return }
         await pollUsage(activeStaleness: 120)
     }
+    /// `fromCommandLine`: asked by `lilt` in a terminal (`useAccounts`), which prints a failure instead of raising an
+    /// alert in the app, and sets the relay pool itself.
     @discardableResult
-    func apply(_ id: UUID, automatically: Bool = false) async -> Bool {
+    func apply(_ id: UUID, automatically: Bool = false, fromCommandLine: Bool = false) async -> Bool {
         // A quota read running in the background is no reason to hold up the user's own switch. Earlier versions waited
         // up to 30 seconds for it with nothing on screen; the two now share any renewal (`renewals`) and take turns at
         // the scope (`exclusively`), which is all the waiting was for.
@@ -1068,6 +1177,10 @@ final class AppModel {
             library.activeID = id; appliedPending = !demo; sessionConfirmed = false; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
             noCandidateFailures = 0
             apiModeDetected = false; library.preferences.keepAPIMode = nil
+            // Picking an account outside the pool a terminal set, in the app, ends that pool: otherwise relay would
+            // later hand back to accounts the user just turned away from, or never leave one they locked.
+            let poolEnded = !automatically && !fromCommandLine && relayPool.map { !$0.contains(id) } == true
+            if poolEnded { library.preferences.relayPool = nil }
             library.preferences.autoRelayStopReason = nil; save()
             if !demo {
                 lastSwitchAt = .now
@@ -1077,13 +1190,15 @@ final class AppModel {
                 // place needs one current reading of its own.
                 if !(target.usage?.isFresh(at: .now) ?? false) { Task { await self.refresh(id) } }
             }
-            status = demo ? "演示账号已应用" : "已切换到“\(target.label)”"
+            status = (demo ? "演示账号已应用" : "已切换到“\(target.label)”") + (poolEnded ? " · 接力范围恢复全部账号" : "")
             // The relay card records relays; a switch made by hand is not one.
             if demo { lastEvent = "演示：已接力至 \(target.label)" }
             dualConflict = false
             return true
         } catch let conflict as DualRuntimeConflict {
-            noteDualConflict(conflict); message = conflict.message; return false
+            noteDualConflict(conflict); message = conflict.message
+            if fromCommandLine { commandLineFailure = conflict.message }
+            return false
         } catch {
             let reason = Self.reason(error) ?? "凭据应用失败。"
             logFailure(automatically ? "auto-failed" : "manual-failed", reason)
@@ -1094,6 +1209,7 @@ final class AppModel {
             // stops relay when the scope holds a login Lilt cannot account for. Earlier versions stopped relay here,
             // and it stayed off until the user came back.
             if automatically { waitForRelay(because: "没能换到“\(target.label)”：\(reason)稍后自动重试。", until: retryClock().addingTimeInterval(15)) }
+            else if fromCommandLine { commandLineFailure = reason }
             else { message = reason }
             return false
         }
@@ -1483,7 +1599,7 @@ final class AppModel {
         // At the pace the account is being spent it would pass the threshold before the next readings and the hand-off
         // are through, and a session that runs into the limit stops mid-task. Starting now keeps it running.
         let ahead = !demo && !triggered && paceAccount == active.id
-            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: snapshot), reactionTime: relayReactionTime)
+            && UsagePace.nearing(snapshot, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: snapshot), rules: earlyRules)
         let due = triggered || ahead
         // The weekly preference may move before the threshold, but only off a fresh reading of the account in use.
         // Once a hand-off is due that preference stays out of the decision.
@@ -1531,8 +1647,9 @@ final class AppModel {
         // Decided on the newest reading of the account in use: readings that arrived during the reads are taken into
         // account, rather than making the hand-off give up and start over each time one comes in.
         guard let current = self.active, let latest = current.usage else { return }
-        let aheadNow = !demo && !triggered && paceAccount == current.id
-            && UsagePace.nearing(latest, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: latest), reactionTime: relayReactionTime)
+        let paceTrigger = !demo && !triggered && paceAccount == current.id
+            ? UsagePace.trigger(latest, after: paceReadings, threshold: thresholds, at: .now, lifetime: lifetime(of: latest), rules: earlyRules) : nil
+        let aheadNow = paceTrigger?.due == true
         switch policy.decide(active: current, candidates: relayCandidates(policy, besides: current.id), at: .now,
                              holdActiveReading: !demo && triggered, ahead: aheadNow) {
         case .select(let id):
@@ -1546,9 +1663,9 @@ final class AppModel {
             if applied {
                 departedID = current.id; departedAt = .now
                 if !demo {
-                    relayReactionTime = UsagePace.reactionTime(measured: (ContinuousClock.now - started).seconds)
                     SwitchLog.record("auto-timing", detail: relayTiming(paced: !triggered, readingAge: Date.now.timeIntervalSince(latest.sampledAt),
-                                                                        confirm: confirming, write: (ContinuousClock.now - writing).seconds))
+                                                                        confirm: confirming, write: (ContinuousClock.now - writing).seconds,
+                                                                        pace: paceTrigger.map { ($0.left, $0.perMinute, $0.early) }))
                     pendingJump = confirmed.map { (id, $0) }
                     lastEvent = "已自动接力至 \(name)"; status = "已自动接力至 \(name)"
                 }
@@ -1558,11 +1675,15 @@ final class AppModel {
         case .pause(let reason):
             guard due else { break }
             noCandidateFailures += 1
-            let others = accounts.filter { $0.id != current.id && !projectCatalog.reservedAccountIDs.contains($0.id) }
+            let pool = relayPool
+            let others = accounts.filter { $0.id != current.id && !projectCatalog.reservedAccountIDs.contains($0.id) && pool?.contains($0.id) != false }
             let blocked = others.compactMap { account in policy.obstacle(for: account, at: .now).map { (account.label, $0) } }
             // With many accounts, one line per account is a wall of text that mostly repeats one reason.
             let detail: String
-            if blocked.isEmpty { detail = reason }
+            // Locked from a terminal on this one account: that is the user's choice, not something to wait out.
+            let locked = pool != nil && others.isEmpty
+            if locked { detail = "已锁定“\(current.label)”，用完也不换号" }
+            else if blocked.isEmpty { detail = reason }
             else if blocked.count <= 3 { detail = blocked.map { "\($0.0)：\($0.1)" }.joined(separator: "；") }
             else {
                 detail = Dictionary(grouping: blocked, by: \.1).sorted { ($0.value.count, $1.key) > ($1.value.count, $0.key) }
@@ -1574,7 +1695,8 @@ final class AppModel {
             let retry = policy.retryAt(others, at: retryClock(), ordinary: ordinary, backoffUntil: { self.backoffs[$0]?.nextAttempt },
                                        cooldownEnds: departedAt?.addingTimeInterval(RelayPolicy.departureCooldown))
             let reset = policy.nextReset(of: others, at: .now)
-            let next = reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时重新确认。" } ?? "保持开启，稍后自动重查。"
+            let next = locked ? "恢复全部账号后才会接力。"
+                : reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时重新确认。" } ?? "保持开启，稍后自动重查。"
             let sentence = detail.hasSuffix("。") ? detail : detail + "。"
             waitForRelay(because: sentence + next, until: retry)
         case .wait: break
@@ -1593,16 +1715,17 @@ final class AppModel {
     private func candidateMargin(_ active: Account) -> Thresholds {
         var pace: Thresholds = 0
         if paceAccount == active.id, let usage = active.usage {
-            pace = UsagePace.projectedMargin(usage, after: paceReadings, at: .now, lifetime: lifetime(of: usage), reactionTime: relayReactionTime)
+            pace = UsagePace.earlyPoints(usage, after: paceReadings, at: .now, lifetime: lifetime(of: usage), rules: earlyRules)
         }
         return UsagePace.candidateMargin(pace: pace, allowance: switchAllowance)
     }
     /// Who may take over from the account in use, in relay order. A rejected refresh token stays out until the user
-    /// authorizes again, the account just left is not read in order to come back to it, and accounts fixed to a
-    /// project never serve the default login.
+    /// authorizes again, the account just left is not read in order to come back to it, accounts fixed to a project
+    /// never serve the default login, and with a pool set from a terminal (`relayPool`) only its accounts take part.
     private func relayCandidates(_ policy: RelayPolicy, besides activeID: UUID) -> [Account] {
-        accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true
-            && $0.id != policy.leftRecently && !projectCatalog.reservedAccountIDs.contains($0.id) }
+        let pool = relayPool
+        return accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true
+            && $0.id != policy.leftRecently && !projectCatalog.reservedAccountIDs.contains($0.id) && pool?.contains($0.id) != false }
     }
     private func relayPolicy(soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) -> RelayPolicy {
         RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: !demo,

@@ -381,6 +381,8 @@ struct ScopeView: View {
 struct SettingsView: View {
     @Bindable var model: AppModel
     @State private var transfer: CredentialTransferRequest?
+    @State private var command: CommandLineInstall.State = .unavailable
+    @State private var commandIssue: String?
     private var fiveHourThreshold: Binding<Double> { Binding(get: { model.thresholds.fiveHour }, set: { model.setFiveHourThreshold($0) }) }
     private var sevenDayThreshold: Binding<Double> { Binding(get: { model.thresholds.sevenDay }, set: { model.setSevenDayThreshold($0) }) }
     private var shortcut: Binding<UInt32> {
@@ -391,7 +393,8 @@ struct SettingsView: View {
             Section {
                 thresholdRow("5 小时阈值", fiveHourThreshold)
                 thresholdRow("7 天阈值", sevenDayThreshold)
-            } footer: { Text("默认都是 1%，可设 0–20%。任一窗口剩余到阈值就换号；高并发下按实际消耗速度和接力耗时提前，不再固定封顶 10 点。未知额度不作为可用候选。") }
+            } footer: { Text("默认都是 1%，可设 0–20%。任一窗口剩余到阈值就换号；用得快时按下面的「提前接力」提前换。未知额度不作为可用候选。") }
+            earlySection
             Section {
                 LabeledContent("先用快重置的周额度") {
                     LiquidToggle(label: "先用快重置的周额度", isOn: Binding(get: { model.soonerWeekly }, set: { model.setSoonerWeekly($0) }), width: 44)
@@ -406,6 +409,7 @@ struct SettingsView: View {
                 Picker("快速面板快捷键", selection: shortcut) { Text("⌘⌥L").tag(UInt32(37)); Text("⌘⌥J").tag(UInt32(38)); Text("⌘⌥K").tag(UInt32(40)) }
                 if let issue = model.shortcutIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
             } footer: { Text("在任何应用里按下，打开或收起菜单栏面板。Lilt 无法得知其他应用是否占用了同一组合；按下没有反应时请换一个。") }
+            commandSection
             Section {
                 Button("加密导出账号库…") {
                     if let url = CredentialTransferPanels.exportURL() { transfer = CredentialTransferRequest(mode: .export, url: url) }
@@ -432,6 +436,98 @@ struct SettingsView: View {
         }
         .formStyle(.grouped).tint(Tokens.accentTint)
         .sheet(item: $transfer) { CredentialTransferView(model: model, request: $0) }
+    }
+    // MARK: Early hand-off
+
+    private var earlySection: some View {
+        let rules = model.earlyRules
+        return Section {
+            LabeledContent("按速度提前换号") {
+                LiquidToggle(label: "按速度提前换号", isOn: Binding(get: { model.earlyRules.enabled }, set: { on in
+                    var rules = model.earlyRules; rules.enabled = on; model.setEarlyHandOff(rules)
+                }), width: 44)
+            }
+            if rules.enabled {
+                ForEach(rules.tiers.indices, id: \.self) { tierRow($0) }
+            }
+            LabeledContent("当前速度") { Text(paceText).foregroundStyle(.secondary).multilineTextAlignment(.trailing) }
+            if rules != .standard {
+                Button("恢复默认（≥5→2、≥10→5、≥20→10）") { model.setEarlyHandOff(.standard) }
+            }
+        } header: { Text("提前接力") }
+        footer: { Text("当前账号每分钟用掉的额度达到某一档，就在阈值之上提前对应的点数换号，免得会话在请求中途撞到上限。提前越多越稳，但当前账号剩下的额度留着不用；低于第一档不提前。") }
+    }
+    private func tierRow(_ index: Int) -> some View {
+        HStack(spacing: 6) {
+            Text("每分钟用掉 ≥")
+            tierField(index, \.perMinute, range: EarlyHandOff.perMinuteRange, step: 1, width: 44)
+            Text("%").foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text("提前")
+            tierField(index, \.points, range: EarlyHandOff.pointsRange, step: 1, width: 38)
+            Text("点").foregroundStyle(.secondary)
+        }
+    }
+    private func tierField(_ index: Int, _ key: WritableKeyPath<EarlyHandOffTier, Double>, range: ClosedRange<Double>, step: Double, width: CGFloat) -> some View {
+        let value = Binding<Double>(get: {
+            let tiers = model.earlyRules.tiers
+            return tiers.indices.contains(index) ? tiers[index][keyPath: key] : range.lowerBound
+        }, set: { newValue in
+            var rules = model.earlyRules
+            guard rules.tiers.indices.contains(index) else { return }
+            var tier = rules.tiers[index]; tier[keyPath: key] = newValue
+            rules.tiers[index] = EarlyHandOffTier(perMinute: tier.perMinute, points: tier.points)
+            model.setEarlyHandOff(rules)
+        })
+        return HStack(spacing: 2) {
+            TextField("", value: value, format: .number.precision(.fractionLength(0...1)))
+                .labelsHidden().multilineTextAlignment(.trailing).frame(width: width)
+            Stepper("", value: value, in: range, step: step).labelsHidden()
+        }
+    }
+    /// The pace relay measures for the account in use, and where that puts the hand-off now.
+    private var paceText: String {
+        guard let pace = model.activePace else { return "没有测到 · 剩 ≤\(model.thresholds.fiveHour.formatted())% 时换" }
+        let early = model.earlyRules.points(byWindow: pace)
+        var text = "每分钟 \(pace.fiveHour.formatted(.number.precision(.fractionLength(1))))%"
+        text += " · 剩 ≤\((model.thresholds.fiveHour + early.fiveHour).formatted())% 时换"
+        if early.sevenDay > 0 { text += "（7 天 ≤\((model.thresholds.sevenDay + early.sevenDay).formatted())%）" }
+        return text
+    }
+
+    // MARK: Command line
+
+    private var commandSection: some View {
+        Section {
+            LabeledContent("lilt 命令") {
+                HStack(spacing: 8) {
+                    switch command {
+                    case .installed:
+                        Text("已安装").foregroundStyle(.secondary)
+                        Button("移除") { changeCommand(install: false) }
+                    case .absent, .moved:
+                        Button("安装") { changeCommand(install: true) }
+                    case .foreign:
+                        Text("~/.local/bin/lilt 已被占用").foregroundStyle(.secondary)
+                    case .unavailable:
+                        Text("仅打包版可用").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let commandIssue { Label(commandIssue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
+        } header: { Text("命令行") }
+        footer: { Text("终端里输入 lilt 选账号；lilt 001 换到并锁定 001；lilt 001 002 003 只在这几个账号间接力；lilt all 恢复全部。装在 ~/.local/bin/lilt，这个目录要在 PATH 里。") }
+        .task { command = await Task.detached { CommandLineInstall.state() }.value }
+    }
+    private func changeCommand(install: Bool) {
+        Task {
+            let failure: String? = await Task.detached {
+                do { if install { try CommandLineInstall.install() } else { try CommandLineInstall.uninstall() }; return nil }
+                catch { return (error as? AppFailure)?.message ?? "没能写入 ~/.local/bin/lilt。" }
+            }.value
+            commandIssue = failure
+            command = await Task.detached { CommandLineInstall.state() }.value
+        }
     }
     private func thresholdRow(_ title: String, _ value: Binding<Double>) -> some View {
         LabeledContent(title) {
@@ -510,6 +606,7 @@ struct MenuPanel: View {
                 LiquidToggle(label: "默认登录自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }), width: 44)
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")
             }
+            if let pool = model.relayPoolSummary { PoolRow(model: model, summary: pool) }
             HStack(spacing: 2) {
                 Button("管理账号") { model.selectedPage = .accounts; openMain() }.buttonStyle(.lilt(.ghost, size: .small))
                 Button("项目") { model.selectedPage = .projects; openMain() }.buttonStyle(.lilt(.ghost, size: .small))

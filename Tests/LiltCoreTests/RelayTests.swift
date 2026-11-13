@@ -662,12 +662,13 @@ final class RelayTests {
         guard case .pause = live.decide(active: active, candidates: [weekly], at: now, ahead: true) else { fatalError("Expected pause") }
         weekly.usage = snapshot(100, 30)
         expectEqual(live.decide(active: active, candidates: [weekly], at: now, ahead: true), .select(weekly.id))
-        // The early hand-off counts toward each window's own threshold: four points a minute from 20% reaches 15%.
+        // The early hand-off counts toward each window's own threshold: four points early from 19% reaches 15%.
         let reading = { (left: Double, ago: TimeInterval) in
             UsageSnapshot(fiveHour: UsageWindow(used: 100 - left, resetsAt: self.now.addingTimeInterval(3600)), sevenDay: UsageWindow(used: 60, resetsAt: self.now.addingTimeInterval(86400)), sampledAt: self.now.addingTimeInterval(-ago))
         }
-        expect(UsagePace.nearing(reading(19, 0), after: [reading(23, 60)], threshold: t, at: now, lifetime: 300))
-        expectFalse(UsagePace.nearing(reading(19, 0), after: [reading(23, 60)], threshold: 5, at: now, lifetime: 300))
+        let four = EarlyHandOff(tiers: [EarlyHandOffTier(perMinute: 4, points: 4)])
+        expect(UsagePace.nearing(reading(19, 0), after: [reading(23, 60)], threshold: t, at: now, lifetime: 300, rules: four))
+        expectFalse(UsagePace.nearing(reading(19, 0), after: [reading(23, 60)], threshold: 5, at: now, lifetime: 300, rules: four))
         // Retry after a pause waits for the window that is at its own threshold.
         var waiting = Account(label: "Fixture D", kind: .oauth)
         waiting.usage = UsageSnapshot(fiveHour: UsageWindow(used: 86, resetsAt: now.addingTimeInterval(900)), sevenDay: UsageWindow(used: 50, resetsAt: now.addingTimeInterval(86400)), sampledAt: now)
@@ -688,36 +689,47 @@ final class RelayTests {
         expectEqual(live.nextReset(of: [both, soon, spare], at: now), now.addingTimeInterval(7200))
         expectEqual(live.nextReset(of: [spare], at: now), nil)
     }
-    /// A hand-off starts ahead of the threshold when the pace of spending would carry the account past it within the
-    /// reaction time, as early as that pace requires, and only on readings of the same window far enough apart.
+    /// A hand-off starts ahead of the threshold when the pace of spending reaches one of the early tiers, as many points
+    /// early as that tier says, and only on readings of the same window far enough apart.
     func testPaceStartsTheHandOffAhead() {
         func reading(_ remaining: Double, ago: TimeInterval, resetsIn: TimeInterval = 3600) -> UsageSnapshot {
             UsageSnapshot(fiveHour: UsageWindow(used: 100 - remaining, resetsAt: now.addingTimeInterval(resetsIn)),
                           sevenDay: UsageWindow(used: 30, resetsAt: now.addingTimeInterval(86400)), sampledAt: now.addingTimeInterval(-ago), source: UsageParser.statusLineSource)
         }
-        let latest = reading(8, ago: 0)
-        // Four points in the last minute: four more in the next one reaches 5%.
+        let latest = reading(7, ago: 0)
+        // Five points in the last minute reaches the first standard tier: two points early, and 7% is 2 above 5%.
         expect(UsagePace.nearing(latest, after: [reading(12, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(reading(8, ago: 0), after: [reading(13, ago: 60)], threshold: 5, at: now, lifetime: 300))
+        // Below the first tier nothing goes early: four points a minute waits for the threshold itself.
+        expectFalse(UsagePace.nearing(latest, after: [reading(11, ago: 60)], threshold: 5, at: now, lifetime: 300))
         // One point in ten minutes is no reason to leave early.
-        expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 590)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [reading(8, ago: 590)], threshold: 5, at: now, lifetime: 300))
         // Readings seconds apart do not measure a pace, and neither does one from before the window reset.
         expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 10)], threshold: 5, at: now, lifetime: 300))
         expectFalse(UsagePace.nearing(latest, after: [reading(40, ago: 60, resetsIn: 3600 - 18000)], threshold: 5, at: now, lifetime: 300))
         expectFalse(UsagePace.nearing(latest, after: [], threshold: 5, at: now, lifetime: 300))
-        // There is no fixed cap: 44 points in the last minute is 44 more in the next, so 16% left is already late.
-        // Until 0.2.5 the hand-off started at most ten points early and came too late for bursts like this.
-        expect(UsagePace.nearing(reading(16, ago: 0), after: [reading(60, ago: 60)], threshold: 5, at: now, lifetime: 300))
-        expect(UsagePace.projectedMargin(reading(16, ago: 0), after: [reading(60, ago: 60)], at: now, lifetime: 300).fiveHour > 40)
-        // A measured hand-off that took longer widens the margin in proportion.
-        let slow = UsagePace.projectedMargin(latest, after: [reading(12, ago: 60)], at: now, lifetime: 300, reactionTime: 120)
-        expectEqual(slow.fiveHour.rounded(), 8)
+        // However fast the pace, the margin stops at the top tier. 44 points a minute used to hand off 44 points early
+        // (2026-11: accounts left with 20–30% at a 1% threshold); the standard tiers stop at ten.
+        let burst = [reading(60, ago: 60)]
+        expect(UsagePace.perMinute(reading(16, ago: 0), after: burst, at: now, lifetime: 300).fiveHour > 40)
+        expectEqual(UsagePace.earlyPoints(reading(16, ago: 0), after: burst, at: now, lifetime: 300, rules: .standard).fiveHour, 10)
+        expectFalse(UsagePace.nearing(reading(16, ago: 0), after: burst, threshold: 5, at: now, lifetime: 300))
+        expect(UsagePace.nearing(reading(15, ago: 0), after: burst, threshold: 5, at: now, lifetime: 300))
+        // Switched off, a pace never hands off early.
+        var off = EarlyHandOff.standard; off.enabled = false
+        expectFalse(UsagePace.nearing(reading(6, ago: 0), after: burst, threshold: 5, at: now, lifetime: 300, rules: off))
         // A point rounded up between two recent readings is no burst.
-        expectFalse(UsagePace.nearing(latest, after: [reading(9, ago: 590), reading(9, ago: 40)], threshold: 5, at: now, lifetime: 300))
-        // A burst after a quiet stretch counts at its own pace: three points in the last 40 seconds, whatever the
-        // ten-minute average says. Sessions started all at once on an idle account spend like this.
-        expect(UsagePace.nearing(latest, after: [reading(9, ago: 590), reading(11, ago: 40)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(latest, after: [reading(8, ago: 590), reading(8, ago: 40)], threshold: 5, at: now, lifetime: 300))
+        // A burst after a quiet stretch counts at its own pace: four points in the last 40 seconds (six a minute),
+        // whatever the ten-minute average says. Sessions started all at once on an idle account spend like this.
+        expect(UsagePace.nearing(latest, after: [reading(8, ago: 590), reading(11, ago: 40)], threshold: 5, at: now, lifetime: 300))
         // A reading too old to act on is not acted on early either.
-        expectFalse(UsagePace.nearing(reading(8, ago: 301), after: [reading(12, ago: 361)], threshold: 5, at: now, lifetime: 300))
+        expectFalse(UsagePace.nearing(reading(7, ago: 301), after: [reading(12, ago: 361)], threshold: 5, at: now, lifetime: 300))
+        // The log line names the window, its pace and the margin taken.
+        let seen = UsagePace.trigger(latest, after: [reading(12, ago: 60)], threshold: 5, at: now, lifetime: 300, rules: .standard)
+        expectEqual(seen?.left, 7); expectEqual(seen?.early, 2); expectEqual(seen?.due, true)
+        expectEqual(relayTiming(paced: true, readingAge: 2, confirm: 0, write: 0.5, pace: (7, 5, 2)),
+                    "trigger=pace age=2s confirm=0.0s write=0.5s left=7.0% rate=5.0/min early=2")
         // The policy takes the hand-off as due.
         var active = Account(label: "Fixture A", kind: .oauth); active.usage = latest
         var ready = Account(label: "Fixture B", kind: .oauth); ready.usage = snapshot(50, 50)
@@ -862,6 +874,8 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try storageChecks()
         let concurrency = ConcurrencyChecks()
         concurrency.testBurstChannel()
+        try concurrency.testEarlyHandOffTiers()
+        concurrency.testCommandLineAccountQuery()
         concurrency.testCandidateMarginCoversPaceAndSwitchCost()
         concurrency.testPreparationTiming()
         concurrency.testRetryAtTheEarliestApplicableTime()
@@ -872,7 +886,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 48 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 50 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, early hand-off tiers, lilt account lookup and pool, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 
