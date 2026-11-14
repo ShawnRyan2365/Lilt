@@ -190,18 +190,6 @@ extension AppModel {
     func spriteSlot(_ id: UUID) -> Int { spriteSlots[id] ?? Sprite.slot(for: id) }
     func mood(of account: Account) -> Mood { QuotaSummary(snapshot: account.usage, thresholds: thresholds, now: max(clock, .now)).mood }
 }
-/// The relay pool a terminal set (`lilt <account>…`), in a few words, with the way back to every account.
-struct PoolRow: View {
-    @Bindable var model: AppModel
-    let summary: String
-    var body: some View {
-        HStack(spacing: 6) {
-            Pill(text: summary, symbol: model.relayPool?.count == 1 ? "lock.fill" : "line.3.horizontal.decrease")
-                .help("在终端用 lilt 设定；lilt all 或点「恢复全部」回到全部账号")
-            Button("恢复全部") { model.clearRelayPool() }.buttonStyle(.lilt(.ghost, size: .small))
-        }
-    }
-}
 /// Drag-and-drop reordering of an account row, left off entirely while the order is sorted automatically.
 struct Reorderable: ViewModifier {
     let id: UUID
@@ -378,11 +366,6 @@ struct AccountRow: View {
                         Text(account.label).font(Typo.label).lineLimit(1)
                         if projectCount > 0 { Pill(text: "项目专用") }
                         if !account.enabled { Pill(text: "已停用") }
-                        // Only the accounts a terminal picked are marked: marking every other one repeats the same word down the list.
-                        if let pool = model.relayPool, pool.contains(account.id) {
-                            Pill(text: pool.count == 1 ? "已锁定" : "接力范围", symbol: pool.count == 1 ? "lock.fill" : nil)
-                                .help(pool.count == 1 ? "终端里用 lilt 锁定在这个账号，自动接力不会换走" : "终端里用 lilt 设了接力范围，只在带这个标记的账号之间接力")
-                        }
                         // An old reading stays on screen, receded, and says how old it is.
                         if summary.stale, let age = summary.state?.text { Pill(text: age) }
                     }
@@ -407,6 +390,9 @@ struct AccountRow: View {
                         .accessibilityHidden(true)
                 } else if projectCount > 0 {
                     Pill(text: "项目专用").help("在项目页更换或解绑后，才能用于默认登录")
+                } else if let role = model.sessionRole(account.id) {
+                    Pill(text: role)
+                        .help(role == "独立会话" ? "终端里用 lilt 打开的独立会话正在用它；会话结束前默认登录不会用它" : "在终端独立会话的接力名单里；会话结束前默认登录不会用它")
                 } else {
                     Button("切换") { Task { await model.apply(account.id) } }
                         .buttonStyle(.lilt(.secondary, size: .small)).disabled(!canSwitch)
@@ -423,7 +409,9 @@ struct AccountRow: View {
                 Button("下移") { model.move(account.id, by: 1) }.disabled(model.autoSort || index == model.accounts.count - 1)
                 Divider()
                 Button("重新授权 / 替换 Token") { model.requestAdd(replacing: account.id) }.disabled(!model.canAdd)
-                Button(active ? "删除（需先切换到其他账号）" : projectCount > 0 ? "删除（需先解绑项目）" : "删除…", role: .destructive, action: onDelete).disabled(active || projectCount > 0)
+                let inSession = model.sessionRole(account.id) != nil
+                Button(active ? "删除（需先切换到其他账号）" : projectCount > 0 ? "删除（需先解绑项目）" : inSession ? "删除（独立会话结束后）" : "删除…", role: .destructive, action: onDelete)
+                    .disabled(active || projectCount > 0 || inSession)
             } label: {
                 Image(systemName: "ellipsis").font(.system(size: 13, weight: .medium)).foregroundStyle(Tokens.ink)
                     .frame(width: AccountColumns.menu, height: 30).contentShape(Circle())

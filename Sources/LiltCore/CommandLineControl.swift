@@ -1,35 +1,64 @@
 import Foundation
 
 /// What the `lilt` command in a terminal asks the running Lilt app: one JSON line each way over a socket in Lilt's own
-/// directory. The app does the work, so a switch from a terminal goes through the same journal, renewal and relay rules
-/// as a click. Nothing here carries a credential.
+/// directory. The app writes the session's login, so a session goes through the same journal, renewal and relay rules
+/// as the default login. Nothing here carries a credential: the reply names a directory, never what is in it.
 public struct ControlRequest: Codable, Equatable, Sendable {
-    /// `list`, `use` (with `ids`) or `all`.
+    /// `list`, `session` (with `ids`) or `bypass` (with `bypass` to change it, without to ask).
     public var action: String
     public var ids: [UUID]?
-    public init(action: String, ids: [UUID]? = nil) { self.action = action; self.ids = ids }
+    public var bypass: Bool?
+    public init(action: String, ids: [UUID]? = nil, bypass: Bool? = nil) { self.action = action; self.ids = ids; self.bypass = bypass }
 }
 
 /// One account as `lilt` lists it, in the relay order the app shows.
 public struct ControlAccount: Codable, Equatable, Sendable {
     public var id: UUID
     public var label: String
+    /// The account the default login is on.
     public var active: Bool
     public var enabled: Bool
-    /// Fixed to a project; the default login never takes it.
+    /// Fixed to a project; sessions never take it.
     public var project: Bool
-    /// Relay may hand off to it: inside the pool `lilt` set, or there is none.
-    public var inPool: Bool
+    /// In a terminal session's scope right now.
+    public var sessionHeld: Bool
+    /// Waiting in a terminal session's pool.
+    public var sessionSpare: Bool
     /// What the last reading left, however old it is; nil when unknown.
     public var fiveHour: Double?
     public var sevenDay: Double?
     public var noWeeklyLimit: Bool
     public var sampledAt: Date?
-    public init(id: UUID, label: String, active: Bool, enabled: Bool, project: Bool, inPool: Bool,
+    public init(id: UUID, label: String, active: Bool, enabled: Bool, project: Bool, sessionHeld: Bool = false, sessionSpare: Bool = false,
                 fiveHour: Double?, sevenDay: Double?, noWeeklyLimit: Bool, sampledAt: Date?) {
         self.id = id; self.label = label; self.active = active; self.enabled = enabled; self.project = project
-        self.inPool = inPool; self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.noWeeklyLimit = noWeeklyLimit
-        self.sampledAt = sampledAt
+        self.sessionHeld = sessionHeld; self.sessionSpare = sessionSpare
+        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.noWeeklyLimit = noWeeklyLimit; self.sampledAt = sampledAt
+    }
+}
+
+/// A running terminal session as `lilt ls` lists it.
+public struct ControlSessionSummary: Codable, Equatable, Sendable {
+    public var pool: [String]
+    public var holding: String?
+    public var terminals: Int
+    public var note: String?
+    public init(pool: [String], holding: String?, terminals: Int, note: String?) {
+        self.pool = pool; self.holding = holding; self.terminals = terminals; self.note = note
+    }
+}
+
+/// What a terminal needs to start Claude Code on a session: where the CLI keeps the session's login, which account is
+/// in it, and whether to skip permission prompts.
+public struct ControlLaunch: Codable, Equatable, Sendable {
+    public var secureDirectory: String
+    public var account: String
+    public var pool: [String]
+    /// Another terminal already runs on these accounts; this one joins it.
+    public var joined: Bool
+    public var bypass: Bool
+    public init(secureDirectory: String, account: String, pool: [String], joined: Bool, bypass: Bool) {
+        self.secureDirectory = secureDirectory; self.account = account; self.pool = pool; self.joined = joined; self.bypass = bypass
     }
 }
 
@@ -38,29 +67,15 @@ public struct ControlReply: Codable, Equatable, Sendable {
     /// What the terminal prints, one sentence per line.
     public var lines: [String]
     public var accounts: [ControlAccount]?
-    /// The pool in force, or nil when relay may use every account.
-    public var pool: [UUID]?
-    public var autoRelay: Bool?
-    /// Why relay waits or cannot be switched on, or when it hands off.
-    public var relayNote: String?
-    public init(ok: Bool, lines: [String] = [], accounts: [ControlAccount]? = nil, pool: [UUID]? = nil,
-                autoRelay: Bool? = nil, relayNote: String? = nil) {
-        self.ok = ok; self.lines = lines; self.accounts = accounts; self.pool = pool; self.autoRelay = autoRelay
-        self.relayNote = relayNote
+    public var sessions: [ControlSessionSummary]?
+    public var launch: ControlLaunch?
+    /// Whether sessions skip permission prompts (`lilt bypass`).
+    public var bypass: Bool?
+    public init(ok: Bool, lines: [String] = [], accounts: [ControlAccount]? = nil, sessions: [ControlSessionSummary]? = nil,
+                launch: ControlLaunch? = nil, bypass: Bool? = nil) {
+        self.ok = ok; self.lines = lines; self.accounts = accounts; self.sessions = sessions; self.launch = launch; self.bypass = bypass
     }
     public static func failure(_ text: String) -> ControlReply { ControlReply(ok: false, lines: [text]) }
-}
-
-/// The accounts relay may hand off to.
-public enum RelayPool {
-    /// The pool as relay applies it: the ids of accounts that still exist. Nil when none was set, or when none of it
-    /// is left, so removing every account of a pool frees relay rather than locking it on nothing.
-    public static func effective(_ pool: [UUID]?, accounts: [Account]) -> Set<UUID>? {
-        guard let pool else { return nil }
-        let existing = Set(accounts.map(\.id))
-        let kept = Set(pool).intersection(existing)
-        return kept.isEmpty ? nil : kept
-    }
 }
 
 public enum AccountMatch: Equatable, Sendable { case one(Int), several([Int]), none }

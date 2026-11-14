@@ -128,10 +128,8 @@ public struct Preferences: Codable, Sendable {
     public var autoUpdateCheck: Bool?
     /// How many points early relay hands off at a given pace (`EarlyHandOff`). Nil means `EarlyHandOff.standard`.
     public var earlyHandOff: EarlyHandOff?
-    /// The accounts automatic relay may hand off to, set by `lilt <account>…` in a terminal. Nil means every account.
-    /// One account locks the default login on it: relay never hands off from it. Ids of accounts since removed are
-    /// ignored (`RelayPool`).
-    public var relayPool: [UUID]?
+    /// Terminal sessions (`lilt`) start Claude Code with `--dangerously-skip-permissions`, as `ccl` does. Nil means on.
+    public var sessionBypass: Bool?
     public var earlyRules: EarlyHandOff { earlyHandOff ?? .standard }
     public init() {}
 }

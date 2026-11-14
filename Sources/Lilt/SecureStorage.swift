@@ -208,6 +208,15 @@ struct Disk {
         if !FileManager.default.fileExists(atPath: path.path) { return ProjectCatalog() }
         return try JSONDecoder().decode(ProjectCatalog.self, from: Data(contentsOf: path))
     }
+    static func loadSessions() throws -> SessionCatalog {
+        let path = file("sessions.json")
+        guard FileManager.default.fileExists(atPath: path.path) else { return SessionCatalog() }
+        return try JSONDecoder().decode(SessionCatalog.self, from: Data(contentsOf: path))
+    }
+    static func saveSessions(_ catalog: SessionCatalog) throws {
+        try Disk.directory(root)
+        try write(JSONEncoder().encode(catalog), to: file("sessions.json"))
+    }
     static func saveProjects(_ catalog: ProjectCatalog) throws {
         try directory(root)
         try write(JSONEncoder().encode(catalog), to: file("projects.json"))
@@ -261,6 +270,8 @@ final class RuntimeScope: @unchecked Sendable {
     enum DualAuthority { case keychain, file }
     let target: ScopeTarget
     let projectID: UUID?
+    /// A terminal session's scope (`TerminalSession`).
+    let sessionID: UUID?
     let directory: URL
     private let root: URL
     private let home: URL
@@ -268,7 +279,7 @@ final class RuntimeScope: @unchecked Sendable {
     private let credentialAccess: CredentialAccess?
     init(target: ScopeTarget) {
         self.target = target
-        projectID = nil; projectRoot = nil
+        projectID = nil; sessionID = nil; projectRoot = nil
         root = Disk.root; home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
         directory = target == .system ? FileManager.default.homeDirectoryForCurrentUser.appending(component: ".claude", directoryHint: .isDirectory)
                                        : Disk.root.appending(component: "scope", directoryHint: .isDirectory)
@@ -277,7 +288,7 @@ final class RuntimeScope: @unchecked Sendable {
     /// `projects/<id>/state`. Its keychain item is the CLI's item for that directory, reached through `CLIKeychain`,
     /// and `.credentials.json` only ever holds the `{}` signal, as for the default login.
     init(project: ProjectBinding) {
-        target = .dedicated; projectID = project.id; projectRoot = project.rootPath
+        target = .dedicated; projectID = project.id; sessionID = nil; projectRoot = project.rootPath
         home = FileManager.default.homeDirectoryForCurrentUser; credentialAccess = nil
         let base = Disk.root.appendingPathComponent("projects", isDirectory: true).appendingPathComponent(project.id.uuidString, isDirectory: true)
         root = base.appendingPathComponent("state", isDirectory: true)
@@ -285,15 +296,29 @@ final class RuntimeScope: @unchecked Sendable {
     }
     /// A project scope at its usual place under `Disk.root` (a fixture home in checks), with an in-memory keychain.
     init(fixtureHome: URL, project: ProjectBinding, credentials: CredentialAccess) {
-        target = .dedicated; projectID = project.id; projectRoot = project.rootPath
+        target = .dedicated; projectID = project.id; sessionID = nil; projectRoot = project.rootPath
         home = fixtureHome; credentialAccess = credentials
         let base = Disk.root.appendingPathComponent("projects", isDirectory: true).appendingPathComponent(project.id.uuidString, isDirectory: true)
         root = base.appendingPathComponent("state", isDirectory: true)
         directory = base.appendingPathComponent("claude", isDirectory: true)
     }
+    /// A terminal session's login, `sessions/<id>/secure`: the directory `CLAUDE_SECURESTORAGE_CONFIG_DIR` names for the
+    /// session's CLI, so its keychain item is the CLI's item for that directory, reached through `CLIKeychain`, and
+    /// `.credentials.json` there only ever holds the `{}` signal. The session's configuration stays `~/.claude`; nothing
+    /// else is in this directory. The journal and lock state are in `sessions/<id>/state`.
+    init(session id: UUID, fixtureHome: URL? = nil, credentials: CredentialAccess? = nil) {
+        target = .dedicated; projectID = nil; sessionID = id; projectRoot = nil
+        home = fixtureHome ?? FileManager.default.homeDirectoryForCurrentUser; credentialAccess = credentials
+        let base = Self.sessionBase(id)
+        root = base.appendingPathComponent("state", isDirectory: true)
+        directory = base.appendingPathComponent("secure", isDirectory: true)
+    }
+    static func sessionBase(_ id: UUID) -> URL {
+        Disk.root.appendingPathComponent("sessions", isDirectory: true).appendingPathComponent(id.uuidString, isDirectory: true)
+    }
     /// Isolated transaction checks use an in-memory credential store, never a macOS keychain item.
     init(fixtureHome: URL, credentials: CredentialAccess) {
-        target = .system; projectID = nil; projectRoot = nil; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
+        target = .system; projectID = nil; sessionID = nil; projectRoot = nil; home = fixtureHome; root = fixtureHome.appendingPathComponent("lilt")
         directory = fixtureHome.appendingPathComponent(".claude"); credentialAccess = credentials
     }
     /// What Lilt keeps in `.credentials.json` when the file holds no login of its own: an empty document. The CLI reads
@@ -332,7 +357,7 @@ final class RuntimeScope: @unchecked Sendable {
     }
     // Project and default items are written through the CLI's own keychain tool so the CLI can read them.
     // Legacy dedicated items keep the access control under which they were created.
-    private var usesCLIKeychain: Bool { target == .system || projectID != nil }
+    private var usesCLIKeychain: Bool { target == .system || projectID != nil || sessionID != nil }
     private func keychainRead() throws -> Data? {
         do {
             if let credentialAccess { return try credentialAccess.read() }
@@ -401,6 +426,13 @@ final class RuntimeScope: @unchecked Sendable {
     func removeSignal() {
         guard target == .system, (try? readFile()) == Self.signal else { return }
         try? FileManager.default.removeItem(at: file)
+    }
+    /// Ends a terminal session's scope once its login has been read back: the keychain item, the signal, the journal
+    /// and the rest of `sessions/<id>` go. Only for sessions; no other scope is ever removed.
+    func discard() throws {
+        guard let sessionID else { return }
+        if try keychainRead() != nil { try keychainDelete() }
+        try? FileManager.default.removeItem(at: Self.sessionBase(sessionID))
     }
     /// A switch that started and did not finish. Nothing is taken in automatically while this is set, except by `settle`.
     var transactionPending: Bool { ((try? expected()) ?? nil)?.pending == true }

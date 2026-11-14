@@ -46,15 +46,17 @@ final class ConcurrencyChecks: Sendable {
         let file = Data(#"{"enabled":true,"tiers":[{"perMinute":0,"points":99}]}"#.utf8)
         expectEqual(try JSONDecoder().decode(EarlyHandOff.self, from: file).tiers, [EarlyHandOffTier(perMinute: 1, points: 30)])
         let old = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304}"#.utf8))
-        expectEqual(old.earlyRules, .standard); expect(old.relayPool == nil)
+        expectEqual(old.earlyRules, .standard); expect(old.sessionBypass == nil)
+        // A file 0.4.0 wrote with a pool set from a terminal still loads; the pool is simply gone.
+        let pooled = try JSONDecoder().decode(Preferences.self, from: Data(#"{"threshold":1,"scopeEnabled":true,"shortcutKey":37,"shortcutModifiers":2304,"relayPool":["00000000-0000-0000-0000-000000000001"]}"#.utf8))
+        expectEqual(pooled.threshold, 1)
         // The candidate taking over needs the early margin too, or the same sessions would hand off again at once.
         let latest = reading(14, ago: 0)
         let early = UsagePace.earlyPoints(latest, after: [reading(17, ago: 8), reading(16, ago: 4)], at: now, lifetime: 300, rules: rules)
         expectEqual(UsagePace.candidateMargin(pace: early, allowance: 0).fiveHour, 10)
     }
 
-    /// `lilt` finds an account the way `ccl` finds a provider, except that an exact name comes before a number, and a
-    /// pool keeps only accounts that still exist.
+    /// `lilt` finds an account the way `ccl` finds a provider, except that an exact name comes before a number.
     func testCommandLineAccountQuery() {
         let labels = ["Team-Enterprise", "Fixture Max", "001", "002", "010"]
         expectEqual(AccountQuery.match("001", labels: labels), .one(2))
@@ -69,11 +71,54 @@ final class ConcurrencyChecks: Sendable {
         expectEqual(AccountQuery.match("9", labels: labels), .none)
         expectEqual(AccountQuery.match("  ", labels: labels), .none)
         expectEqual(AccountQuery.match("zzz", labels: labels), .none)
-        let a = Account(label: "Fixture A", kind: .oauth), b = Account(label: "Fixture B", kind: .oauth)
-        expect(RelayPool.effective(nil, accounts: [a, b]) == nil)
-        expectEqual(RelayPool.effective([a.id, UUID()], accounts: [a, b]), [a.id])
-        expect(RelayPool.effective([UUID()], accounts: [a, b]) == nil)
-        expectEqual(RelayPool.effective([], accounts: [a, b]), nil)
+    }
+
+    /// Terminal sessions: one scope per set of accounts whatever the order, accounts the default login, a project or
+    /// another session uses are refused, the first listed with room starts, relay goes down the list, arguments are
+    /// split between accounts and `claude`, and permission prompts are skipped as `ccl` does.
+    func testTerminalSessionRules() {
+        var a = Account(label: "Fixture A", kind: .oauth), b = Account(label: "Fixture B", kind: .oauth)
+        let c = Account(label: "Fixture C", kind: .oauth), d = Account(label: "Fixture D", kind: .oauth)
+        expectEqual(SessionRules.scopeID(pool: [a.id, b.id]), SessionRules.scopeID(pool: [b.id, a.id, b.id]))
+        expect(SessionRules.scopeID(pool: [a.id]) != SessionRules.scopeID(pool: [a.id, b.id]))
+        let session = TerminalSession(pool: [a.id, b.id], holding: a.id)
+        let catalog = SessionCatalog(sessions: [session])
+        expectEqual(catalog.reservedAccountIDs, [a.id, b.id]); expectEqual(catalog.heldAccountIDs, [a.id]); expect(catalog.problem == nil)
+        var twice = catalog; twice.sessions.append(TerminalSession(pool: [b.id, c.id]))
+        expect(twice.problem != nil)
+        var forged = catalog; forged.sessions[0].id = UUID()
+        expect(forged.problem != nil)
+        expect(session.eventScope == "session-" + session.id.uuidString && session.relays)
+        let projects = ProjectCatalog(projects: [ProjectBinding(name: "fixture", rootPath: "/fixture/project", accountID: d.id)])
+        let all = [a, b, c, d]
+        expect(SessionRules.startProblem(pool: [a.id, b.id], accounts: all, sessions: catalog, projects: projects, defaultLogin: c.id) == nil)
+        expect(SessionRules.startProblem(pool: [b.id, c.id], accounts: all, sessions: catalog, projects: projects, defaultLogin: nil)?.contains("另一个独立会话") == true)
+        expect(SessionRules.startProblem(pool: [c.id], accounts: all, sessions: catalog, projects: projects, defaultLogin: c.id)?.contains("默认登录") == true)
+        expect(SessionRules.startProblem(pool: [d.id], accounts: all, sessions: catalog, projects: projects, defaultLogin: nil)?.contains("项目") == true)
+        expect(SessionRules.startProblem(pool: [UUID()], accounts: all, sessions: catalog, projects: projects, defaultLogin: nil) != nil)
+        expect(SessionRules.startProblem(pool: [], accounts: all, sessions: catalog, projects: projects, defaultLogin: nil) != nil)
+        // The first listed whose last reading is not used up starts; an unknown reading is worth a try.
+        let soon = Date.now.addingTimeInterval(3600)
+        a.usage = UsageSnapshot(fiveHour: UsageWindow(used: 100, resetsAt: soon), sevenDay: UsageWindow(used: 10, resetsAt: soon), sampledAt: .now)
+        b.usage = UsageSnapshot(fiveHour: UsageWindow(used: 20, resetsAt: soon), sevenDay: UsageWindow(used: 10, resetsAt: soon), sampledAt: .now)
+        expectEqual(SessionRules.firstHolder([a, b], threshold: 1, at: .now)?.id, b.id)
+        expectEqual(SessionRules.firstHolder([a, c], threshold: 1, at: .now)?.id, c.id)
+        expectEqual(SessionRules.firstHolder([a], threshold: 1, at: .now)?.id, a.id)
+        expectEqual(SessionRules.relayOrder([a.id, b.id, c.id, d.id], after: c.id), [d.id, a.id, b.id])
+        expectEqual(SessionRules.relayOrder([a.id, b.id], after: nil), [a.id, b.id])
+        let split = SessionRules.split(["001", "ent", "-c", "--model", "opus"])
+        expectEqual(split.selectors, ["001", "ent"]); expectEqual(split.passthrough, ["-c", "--model", "opus"])
+        let prompt = SessionRules.split(["001", "--", "fix the build", "-p"])
+        expectEqual(prompt.selectors, ["001"]); expectEqual(prompt.passthrough, ["fix the build", "-p"])
+        expectEqual(SessionRules.split(["-c"]).selectors, []); expectEqual(SessionRules.split([]).passthrough, [])
+        expectEqual(SessionRules.claudeArguments(["-c"], bypass: true).arguments, ["-c", "--dangerously-skip-permissions"])
+        expect(SessionRules.claudeArguments(["-c"], bypass: false) == (["-c"], false))
+        expect(!SessionRules.claudeArguments(["--permission-mode", "default"], bypass: true).bypassed)
+        expect(!SessionRules.claudeArguments(["--permission-mode=plan"], bypass: true).bypassed)
+        expectEqual(SessionRules.claudeArguments(["--dangerously-skip-permissions"], bypass: true).arguments, ["--dangerously-skip-permissions"])
+        expect(!SessionRules.claudeArguments(["auth", "status"], bypass: true).bypassed)
+        expect(SessionRules.claudeArguments(["fix the build"], bypass: true).bypassed)
+        expect(LiveUsageEvent.sessionScope(a.id).hasPrefix("session-"))
     }
 
     /// An account taking over must cover the pace during a hand-off and what the last switch cost, and never less

@@ -46,6 +46,20 @@ public enum SHA256Digest {
         }
         return hash.map { String(format: "%08x", $0) }.joined()
     }
+
+    /// A UUID that always comes out the same for the same text, laid out as a version 5 (name-based) UUID so it reads
+    /// as an ordinary one: the stable id of a project directory or of a terminal session's accounts.
+    public static func nameUUID(_ text: String) -> UUID {
+        let digest = hex(Data(text.utf8))
+        var bytes = stride(from: 0, to: 32, by: 2).map { index -> UInt8 in
+            let start = digest.index(digest.startIndex, offsetBy: index)
+            return UInt8(digest[start..<digest.index(start, offsetBy: 2)], radix: 16)!
+        }
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
 }
 
 private extension UInt32 {

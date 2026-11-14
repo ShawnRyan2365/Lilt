@@ -101,7 +101,8 @@ import LiltCore
         try await projectModelChecks()
         try transferStoreChecks()
         try await oauthImportChecks()
-        try await relayPoolChecks()
+        try await sessionChecks()
+        try sessionStatusLineChecks()
         print("PASS: relay model — temporary unavailability, retry/recovery, stale/missing/partial quota, quarantine, persistent safety reason, manual off, retry timed to the next reset, grouped pause reasons, buttons usable during background reads, a switch by hand that does not wait for them, automatic order, scope and local reads that fail temporarily, switches the keychain stops halfway, quota refresh independent of the scope lock, ordinary retry vs per-account server 429, a saved 429 wait served out after relaunch, every read paused after two accounts refused in a row, renewal while reads wait, a refused spare token renewed at once (once an hour on its own, never the active account, a dead refresh token marked for re-authorization), quiet background retries and relay hold, the signal file for running CLIs, a threshold per window, observation independent of reads and switches, one hand-off per trigger, project scopes, account import, OAuth JSON import (scope without user:profile marked unreadable, left out of refreshing everything, its reason kept through a 429). No live credentials or requests.")
     }
 }

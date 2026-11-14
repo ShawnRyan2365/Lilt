@@ -86,30 +86,78 @@ enum StatusLineBridge {
     }
 
     private static func writeScript() throws {
-        let condition = #"[ -z "${CLAUDE_CONFIG_DIR-}" ] || [ "${CLAUDE_CONFIG_DIR%/}" = "$HOME/.claude" ]"#
-        try Disk.write(Data(script(root: Disk.root.path, spool: spoolDirectory.path, scope: LiveUsageEvent.defaultScope,
-                                   condition: condition, chain: chain.path, label: label.path).utf8), to: script)
+        try Disk.write(Data(defaultScript(root: Disk.root.path, spool: spoolDirectory.path, chain: chain.path, label: label.path).utf8), to: script)
     }
 
-    /// The status line script for one scope. It keeps only `rate_limits`, writes each report as a file of its own
-    /// (a hidden temporary file renamed into place, so concurrent sessions never overwrite one another), drops the
-    /// oldest beyond `LiveUsageSpool.maximumEvents` and marks that as a gap, then hands the unchanged input to the
-    /// status line that was there before. `condition` limits recording to sessions on this scope's configuration.
+    /// The default login's script, which terminal sessions run too: they share `~/.claude/settings.json`. A session of
+    /// Lilt's own (`CLAUDE_SECURESTORAGE_CONFIG_DIR` is `<root>/sessions/<uuid>/secure`, and that directory still
+    /// exists) records into its own spool with its own scope and shows its own account; any other session with a login
+    /// directory of its own is on some other login and records nothing. Everything else is the default login, as before.
+    static func defaultScript(root: String, spool: String, chain: String, label: String) -> String {
+        let sessions = root.hasSuffix("/") ? root + "sessions/" : root + "/sessions/"
+        let defaultCondition = #"[ -z "${CLAUDE_CONFIG_DIR-}" ] || [ "${CLAUDE_CONFIG_DIR%/}" = "$HOME/.claude" ]"#
+        let route = #"""
+        record=
+        spool=\#(shellQuote(spool))
+        scope=\#(shellQuote(LiveUsageEvent.defaultScope))
+        label=\#(shellQuote(label))
+        secure="${CLAUDE_SECURESTORAGE_CONFIG_DIR-}"
+        secure="${secure%/}"
+        if [ -n "$secure" ] && [ "$secure" != "$HOME/.claude" ]; then
+          sessions=\#(shellQuote(sessions))
+          case "$secure" in
+            "$sessions"*/secure)
+              sid="${secure#"$sessions"}"
+              sid="${sid%/secure}"
+              case "$sid" in
+                *[!0-9A-F-]*) ;;
+                ????????-????-????-????-????????????)
+                  if [ -d "$sessions$sid/secure" ]; then
+                    record=1
+                    spool="$sessions$sid/spool"
+                    scope="session-$sid"
+                    label="$sessions$sid/statusline-label.txt"
+                  fi ;;
+              esac ;;
+          esac
+        elif { \#(defaultCondition); }; then
+          record=1
+        fi
+        """#
+        return body(route: route, root: root, chain: chain)
+    }
+
+    /// The status line script for one scope. `condition` limits recording to sessions on this scope's configuration.
     static func script(root: String, spool: String, scope: String, condition: String, chain: String, label: String) -> String {
+        let route = #"""
+        record=
+        spool=\#(shellQuote(spool))
+        scope=\#(shellQuote(scope))
+        label=\#(shellQuote(label))
+        if { \#(condition); }; then record=1; fi
+        """#
+        return body(route: route, root: root, chain: chain)
+    }
+
+    /// What every script does once `route` has set `record`, `spool`, `scope` and `label`: it keeps only
+    /// `rate_limits`, writes each report as a file of its own (a hidden temporary file renamed into place, so concurrent
+    /// sessions never overwrite one another), drops the oldest beyond `LiveUsageSpool.maximumEvents` and marks that as a
+    /// gap, then hands the unchanged input to the status line that was there before, or shows the account in use.
+    private static func body(route: String, root: String, chain: String) -> String {
         let limit = LiveUsageSpool.maximumEvents
         return #"""
         #!/bin/sh
         # Installed by Lilt. Keeps the quota windows of each report and nothing else of the session.
-        spool=\#(shellQuote(spool))
         input=$(cat)
-        if { \#(condition); } && [ -d \#(shellQuote(root)) ]; then
+        \#(route)
+        if [ -n "$record" ] && [ -d \#(shellQuote(root)) ]; then
           limits=$(printf '%s' "$input" | /usr/bin/plutil -extract rate_limits json -o - - 2>/dev/null)
           if [ -n "$limits" ]; then
             (umask 077; mkdir -p "$spool")
             id=$(/usr/bin/uuidgen)
             now=$(/bin/date +%s)
             tmp="$spool/.$id.tmp"
-            if (umask 077; printf '{"id":"%s","scope":"%s","at":%s,"rate_limits":%s}\n' "$id" \#(shellQuote(scope)) "$now" "$limits" > "$tmp") && /bin/mv -f "$tmp" "$spool/$now-$$-$id.json"; then
+            if (umask 077; printf '{"id":"%s","scope":"%s","at":%s,"rate_limits":%s}\n' "$id" "$scope" "$now" "$limits" > "$tmp") && /bin/mv -f "$tmp" "$spool/$now-$$-$id.json"; then
               count=$(/bin/ls -1 "$spool" | /usr/bin/grep -c '\.json$')
               if [ "$count" -gt \#(limit) ] && /bin/mkdir "$spool/.lock" 2>/dev/null; then
                 /bin/ls -1 "$spool" | /usr/bin/grep '\.json$' | /usr/bin/sort | /usr/bin/head -n "$((count - \#(limit)))" | while IFS= read -r old; do /bin/rm -f "$spool/$old"; done
@@ -123,8 +171,8 @@ enum StatusLineBridge {
         fi
         if [ -f \#(shellQuote(chain)) ]; then
           printf '%s' "$input" | /bin/sh \#(shellQuote(chain))
-        elif [ -f \#(shellQuote(label)) ]; then
-          /bin/cat \#(shellQuote(label))
+        elif [ -f "$label" ]; then
+          /bin/cat "$label"
         fi
         """# + "\n"
     }

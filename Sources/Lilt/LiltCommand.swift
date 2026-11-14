@@ -3,70 +3,127 @@ import Darwin
 import LiltCore
 
 /// `lilt` in a terminal, run by the script `CommandLineInstall` puts on the PATH. It is this app's own binary started
-/// with `flag`: it never opens a window, it asks the running Lilt over `ControlSocket` and prints the answer, and it
-/// opens Lilt in the background first when Lilt is not running. Lookups work like `ccl`: a number from `lilt ls`, or
-/// a name matched exactly, by prefix, inside, or by its letters in order.
+/// with `flag`: it never opens a window. `lilt 001` asks the running Lilt for a terminal session on that account
+/// (`AppModel.startSession`), then replaces itself with Claude Code on the session's own login, in this terminal, the
+/// way `ccl` starts a provider. The default login is not touched. Lilt is opened in the background first when it is
+/// not running. Accounts are found like `ccl` finds a provider: a number from `lilt ls`, or a name matched exactly,
+/// by prefix, inside, or by its letters in order.
 enum LiltCommand {
     static let flag = "--lilt-cli"
 
     static let usage = """
     用法：
-      lilt                 列出账号，输入编号或名字选择（可以选多个）
-      lilt 001             换到 001 并锁定：用完也不换到别的账号
-      lilt 3               按编号选（lilt ls 里的顺序，也是接力顺序）
+      lilt                 列出账号，输入编号或名字，在这个终端打开独立会话
+      lilt 001             用 001 在这个终端打开独立的 Claude Code 会话，不动本机默认登录
+      lilt 3 -c            按编号选（lilt ls 里的顺序）；从第一个 - 开头的参数起原样交给 claude
       lilt ent             按名字选（不分大小写；完全相同 > 编号 > 开头 > 包含 > 缩写）
-      lilt 001 002 003     只在这几个账号之间自动接力；当前账号不在其中就先换过去
-      lilt all             恢复在全部账号之间接力
-      lilt ls              列出账号、额度和接力范围
+      lilt 001 002 003     独立会话在这几个账号之间自动接力，先用写在前面的
+      lilt 001 -- 提示词    -- 后面的全部交给 claude
+      lilt ls              列出账号、额度和正在运行的独立会话
+      lilt bypass on|off   开/关自动跳过权限确认（--dangerously-skip-permissions），默认开
+      lilt 001 --permission-mode default   只这一次不跳过权限确认
+      lilt -n 001          只打印将要执行的命令，不启动
+    独立会话共用 ~/.claude 的设置、MCP 和历史，只有登录是它自己的；同一个账号同时只给一个会话用。
     """
 
     static func run(_ arguments: [String]) -> Int32 {
+        var arguments = arguments
+        var dry = false
         switch arguments.first {
         case "-h", "--help", "help": print(usage); return 0
         case "_names": printNames(); return 0
         case "ls", "list":
             guard arguments.count == 1 else { return fail("ls 后面不带参数。") }
             guard let reply = exchange(ControlRequest(action: "list")) else { return 1 }
-            printList(reply); return reply.ok ? 0 : 1
-        case "all":
-            guard arguments.count == 1 else { return fail("all 后面不带参数；要指定账号就直接写 lilt 001 002。") }
-            guard let reply = exchange(ControlRequest(action: "all")) else { return 1 }
-            printOutcome(reply); return reply.ok ? 0 : 1
-        case nil:
-            guard let reply = exchange(ControlRequest(action: "list")) else { return 1 }
-            printList(reply)
-            guard reply.ok else { return 1 }
-            guard isatty(STDIN_FILENO) == 1 else { return 0 }
-            print("选择编号或名字（多个用空格隔开，回车取消）: ", terminator: "")
-            fflush(stdout)
-            let words = (readLine() ?? "").split(whereSeparator: \.isWhitespace).map(String.init)
-            guard !words.isEmpty else { return 0 }
-            return use(words, among: reply.accounts ?? [])
-        default:
-            if let option = arguments.first(where: { $0.hasPrefix("-") }) { return fail("不认识的选项 \(option)；lilt -h 查看用法。") }
-            guard let reply = exchange(ControlRequest(action: "list")) else { return 1 }
             guard reply.ok else { printOutcome(reply); return 1 }
-            return use(arguments, among: reply.accounts ?? [])
+            printBypass(reply.bypass ?? true); printList(reply); return 0
+        case "bypass":
+            let value: Bool?
+            switch arguments.count > 1 ? arguments[1] : nil {
+            case "on": value = true
+            case "off": value = false
+            case nil: value = nil
+            default: return fail("用法：lilt bypass on|off")
+            }
+            guard arguments.count <= 2 else { return fail("用法：lilt bypass on|off") }
+            guard let reply = exchange(ControlRequest(action: "bypass", bypass: value)) else { return 1 }
+            guard reply.ok else { printOutcome(reply); return 1 }
+            printBypass(reply.bypass ?? true); return 0
+        case "-n", "--dry-run": dry = true; arguments.removeFirst()
+        default: break
         }
-    }
-
-    private static func use(_ words: [String], among accounts: [ControlAccount]) -> Int32 {
-        guard !accounts.isEmpty else { return fail("Lilt 里还没有账号。") }
+        let (selectors, passthrough) = SessionRules.split(arguments)
+        guard let claude = claudeExecutable() else { return fail("找不到 claude；先安装 Claude Code。") }
+        guard let list = exchange(ControlRequest(action: "list")) else { return 1 }
+        guard list.ok else { printOutcome(list); return 1 }
+        let accounts = list.accounts ?? []
+        guard !accounts.isEmpty else { return fail("Lilt 里还没有账号；先在 Lilt 里添加。") }
+        var words = selectors
+        if words.isEmpty {
+            guard isatty(STDIN_FILENO) == 1 else { return fail("要指定账号，比如 lilt 001；或者在终端里直接运行 lilt 选择。") }
+            printBypass(list.bypass ?? true); printList(list)
+            print("选择编号或名字（多个用空格隔开，在它们之间接力；回车取消）: ", terminator: "")
+            fflush(stdout)
+            words = (readLine() ?? "").split(whereSeparator: \.isWhitespace).map(String.init)
+            guard !words.isEmpty else { return 0 }
+        }
         var ids: [UUID] = []
         for word in words {
-            guard let index = resolve(word, among: accounts) else { return 1 }
+            guard let index = resolve(word, among: accounts, typed: !selectors.isEmpty) else { return 1 }
             if !ids.contains(accounts[index].id) { ids.append(accounts[index].id) }
         }
-        guard let reply = exchange(ControlRequest(action: "use", ids: ids)) else { return 1 }
-        printOutcome(reply)
-        return reply.ok ? 0 : 1
+        if dry {
+            let directory = RuntimeScope(session: SessionRules.scopeID(pool: ids)).directory.path
+            let (arguments, _) = SessionRules.claudeArguments(passthrough, bypass: list.bypass ?? true)
+            let names = ids.compactMap { id in accounts.first { $0.id == id }?.label }.joined(separator: "、")
+            print("账号：\(names)")
+            print((["env"] + ProjectRules.clearedEnvironment.map { "-u \($0)" } + ["CLAUDE_SECURESTORAGE_CONFIG_DIR=" + shellQuote(directory), shellQuote(claude)]
+                   + arguments.map(shellQuote)).joined(separator: " "))
+            return 0
+        }
+        guard let reply = exchange(ControlRequest(action: "session", ids: ids)) else { return 1 }
+        guard reply.ok, let launch = reply.launch else { printOutcome(reply); return 1 }
+        return start(claude, launch, passthrough: passthrough)
     }
 
-    private static func resolve(_ word: String, among accounts: [ControlAccount]) -> Int? {
+    /// Replaces this process with Claude Code on the session's login. Only on failure does it return.
+    private static func start(_ claude: String, _ launch: ControlLaunch, passthrough: [String]) -> Int32 {
+        var environment = ProcessInfo.processInfo.environment
+        // A token, provider or configuration directory in the shell would win over the session's login.
+        for key in ProjectRules.clearedEnvironment { environment.removeValue(forKey: key) }
+        environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = launch.secureDirectory
+        let (arguments, bypassed) = SessionRules.claudeArguments(passthrough, bypass: launch.bypass)
+        var detail = "独立会话"
+        if launch.pool.count > 1 { detail += " · 在 \(launch.pool.joined(separator: "、")) 间接力" }
+        if launch.joined { detail += " · 和已开的终端共用" }
+        var line = paint("▶", "36", stderr: true) + " " + launch.account + "  " + paint(detail, "2", stderr: true)
+        if bypassed { line += "  " + paint("⚡ 跳过权限确认", "31", stderr: true) }
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+        let argv = ([claude] + arguments).map { strdup($0) } + [nil]
+        let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        execve(claude, argv, envp)
+        let code = errno
+        return fail("没能启动 claude（\(String(cString: strerror(code)))）。")
+    }
+
+    /// `claude` as this shell finds it, the way `ccl` runs it; the usual install places when the PATH has none.
+    private static func claudeExecutable() -> String? {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        for directory in path.split(separator: ":") where !directory.isEmpty {
+            let candidate = String(directory) + "/claude"
+            var info = stat()
+            if stat(candidate, &info) == 0, info.st_mode & S_IFMT == S_IFREG, access(candidate, X_OK) == 0 { return candidate }
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return [home + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"].first { access($0, X_OK) == 0 }
+    }
+
+    private static func resolve(_ word: String, among accounts: [ControlAccount], typed: Bool) -> Int? {
         switch AccountQuery.match(word, labels: accounts.map(\.label)) {
         case .one(let index): return index
         case .none:
-            _ = fail("没有匹配「\(word)」的账号；运行 lilt ls 查看。"); return nil
+            let hint = typed ? "要把它交给 claude，写在 -- 后面：lilt <账号> -- \(word)" : "运行 lilt ls 查看。"
+            _ = fail("没有匹配「\(word)」的账号；\(hint)"); return nil
         case .several(let hits):
             guard isatty(STDIN_FILENO) == 1 else {
                 _ = fail("「\(word)」匹配到多个账号：\(hits.map { accounts[$0].label }.joined(separator: "、"))；写完整一些。"); return nil
@@ -98,12 +155,12 @@ enum LiltCommand {
         }
         guard case .success(let fd) = connection else { _ = fail("连不上 Lilt；确认 Lilt 已打开并且版本支持 lilt 命令。"); return nil }
         defer { close(fd) }
-        // A switch may wait for a token renewal or a slow keychain; two minutes is past anything Lilt would wait.
+        // A session may wait for a token renewal or a slow keychain; two minutes is past anything Lilt would wait.
         ControlSocket.timeout(fd, seconds: 120)
         guard let data = try? JSONEncoder().encode(request), ControlSocket.writeAll(fd, data) else { _ = fail("发送失败。"); return nil }
         shutdown(fd, SHUT_WR)
         guard let line = ControlSocket.readLine(fd), let reply = try? JSONDecoder().decode(ControlReply.self, from: line) else {
-            _ = fail("Lilt 没有回应；切换可能仍在进行，稍后用 lilt ls 查看。"); return nil
+            _ = fail("Lilt 没有回应；稍后用 lilt ls 查看。"); return nil
         }
         return reply
     }
@@ -133,7 +190,10 @@ enum LiltCommand {
     // MARK: Output
 
     private static let colour = isatty(STDOUT_FILENO) == 1 && ProcessInfo.processInfo.environment["NO_COLOR"] == nil
-    private static func paint(_ text: String, _ code: String) -> String { colour ? "\u{1B}[\(code)m\(text)\u{1B}[0m" : text }
+    private static let colourErrors = isatty(STDERR_FILENO) == 1 && ProcessInfo.processInfo.environment["NO_COLOR"] == nil
+    private static func paint(_ text: String, _ code: String, stderr: Bool = false) -> String {
+        (stderr ? colourErrors : colour) ? "\u{1B}[\(code)m\(text)\u{1B}[0m" : text
+    }
 
     private static func fail(_ text: String) -> Int32 {
         FileHandle.standardError.write(Data("lilt: \(text)\n".utf8)); return 1
@@ -141,24 +201,25 @@ enum LiltCommand {
 
     private static func printOutcome(_ reply: ControlReply) {
         guard reply.ok else { for line in reply.lines { _ = fail(line) }; return }
-        for (index, line) in reply.lines.enumerated() {
-            print(index == 0 ? paint("▶", "36") + " " + line : "  " + paint(line, "2"))
-        }
+        for line in reply.lines { print(line) }
+    }
+
+    private static func printBypass(_ on: Bool) {
+        print(on ? paint("⚡ 跳过权限确认：开", "31") + paint("（lilt bypass off 关闭）", "2") : paint("跳过权限确认：关（lilt bypass on 打开）", "2"))
     }
 
     private static func printList(_ reply: ControlReply) {
-        guard reply.ok else { printOutcome(reply); return }
         let accounts = reply.accounts ?? []
         guard !accounts.isEmpty else { print("Lilt 里还没有账号；在 Lilt 里添加。"); return }
-        var header = "自动接力：" + (reply.autoRelay == true ? "开" : "关")
-        if let pool = reply.pool {
-            let names = accounts.filter { pool.contains($0.id) }.map(\.label)
-            header += names.count == 1 ? " · 已锁定 \(names[0])（lilt all 恢复全部）" : " · 只在 \(names.joined(separator: "、")) 之间接力（lilt all 恢复全部）"
-        }
-        print(header)
-        if let note = reply.relayNote, !note.isEmpty { print(paint(note, "2")) }
         let width = accounts.map { displayWidth($0.label) }.max() ?? 0
         for (index, account) in accounts.enumerated() { print(row(account, number: index + 1, width: width)) }
+        for session in reply.sessions ?? [] {
+            var line = "独立会话：" + (session.holding ?? "准备中")
+            if session.pool.count > 1 { line += " · 在 \(session.pool.joined(separator: "、")) 间接力" }
+            line += session.terminals > 0 ? " · \(session.terminals) 个终端" : " · 已结束，正在收尾"
+            print(paint(line, "36"))
+            if let note = session.note { print("  " + paint(note, "2")) }
+        }
     }
 
     private static func row(_ account: ControlAccount, number: Int, width: Int) -> String {
@@ -168,12 +229,13 @@ enum LiltCommand {
         var notes: [String] = []
         if !account.enabled { notes.append("已停用") }
         if account.project { notes.append("项目专用") }
-        if account.enabled && !account.project && !account.inPool { notes.append("不接力") }
+        if account.sessionSpare { notes.append("会话备用") }
         if let sampled = account.sampledAt, Date.now.timeIntervalSince(sampled) > 1800 { notes.append(Wording.age(sampled, now: .now)) }
         var line = String(format: "%2d", number) + "  " + name + "  " + paint(five + "  " + week, "2")
         if !notes.isEmpty { line += "  " + paint(notes.joined(separator: " · "), "2") }
-        if account.active { line += "  " + paint("← 使用中", "33") }
-        return account.enabled ? line : paint(line, "2")
+        if account.sessionHeld { line += "  " + paint("← 独立会话", "36") }
+        if account.active { line += "  " + paint("← 默认登录", "33") }
+        return account.enabled || account.sessionHeld ? line : paint(line, "2")
     }
 
     private static func percent(_ value: Double?) -> String { value.map { "\(Int($0.rounded()))%" } ?? "—" }

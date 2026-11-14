@@ -172,6 +172,7 @@ struct MainView: View {
         RunnerTrack(runners: model.runners, activeID: model.displayedActiveID, disabled: model.busy,
                     onSelect: { id in
                         if model.projectCatalog.reservedAccountIDs.contains(id) { model.selectedPage = .projects }
+                        else if model.sessionRole(id) != nil { model.status = "这个账号正在终端的独立会话里用" }
                         else { Task { await model.apply(id) } }
                     },
                     onAdd: model.canAdd ? { model.requestAdd() } : nil) { runner in
@@ -183,12 +184,14 @@ struct MainView: View {
         if let account = model.accounts.first(where: { $0.id == id }) {
             let active = id == model.library.activeID
             let reserved = model.projectCatalog.reservedAccountIDs.contains(id)
+            let inSession = model.sessionRole(id) != nil
             Button("刷新额度") { Task { await model.refresh(id, manually: true) } }
             Button("修改备注") { rename = account.label; renameID = id }
             Button(account.enabled ? "停用" : "启用") { model.setEnabled(!account.enabled, id: id) }
             Divider()
             Button("重新授权 / 替换 Token") { model.requestAdd(replacing: id) }.disabled(!model.canAdd)
-            Button(active ? "删除（需先切换到其他账号）" : reserved ? "删除（需先解绑项目）" : "删除…", role: .destructive) { deleteAccount = account }.disabled(active || reserved)
+            Button(active ? "删除（需先切换到其他账号）" : reserved ? "删除（需先解绑项目）" : inSession ? "删除（独立会话结束后）" : "删除…", role: .destructive) { deleteAccount = account }
+                .disabled(active || reserved || inSession)
         }
     }
     private var relay: some View {
@@ -203,7 +206,6 @@ struct MainView: View {
             }
             Text(model.relayExplanation ?? blocker ?? model.handOffRule)
                 .font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)
-            if let pool = model.relayPoolSummary { PoolRow(model: model, summary: pool) }
             if model.demo || model.lastEvent != "尚无接力记录" {
                 Spacer(minLength: 6)
                 Text(model.lastEvent).font(Typo.caption).foregroundStyle(Tokens.muted).lineLimit(3)

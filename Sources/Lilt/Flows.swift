@@ -515,8 +515,11 @@ struct SettingsView: View {
                 }
             }
             if let commandIssue { Label(commandIssue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Tone.warning.text) }
+            LabeledContent("跳过权限确认") {
+                LiquidToggle(label: "跳过权限确认", isOn: Binding(get: { model.sessionBypass }, set: { model.setSessionBypass($0) }), width: 44)
+            }
         } header: { Text("命令行") }
-        footer: { Text("终端里输入 lilt 选账号；lilt 001 换到并锁定 001；lilt 001 002 003 只在这几个账号间接力；lilt all 恢复全部。装在 ~/.local/bin/lilt，这个目录要在 PATH 里。") }
+        footer: { Text("lilt 001 在当前终端用 001 打开独立的 Claude Code 会话，不动本机默认登录；lilt 001 002 让它在这几个账号间接力。设置、MCP 和历史共用 ~/.claude。跳过权限确认打开时，会话带 --dangerously-skip-permissions 启动。装在 ~/.local/bin/lilt，这个目录要在 PATH 里。") }
         .task { command = await Task.detached { CommandLineInstall.state() }.value }
     }
     private func changeCommand(install: Bool) {
@@ -606,7 +609,6 @@ struct MenuPanel: View {
                 LiquidToggle(label: "默认登录自动接力", isOn: Binding(get: { model.autoRelay }, set: { model.setAutoRelay($0) }), width: 44)
                     .disabled(blocker != nil).accessibilityHint(blocker ?? "")
             }
-            if let pool = model.relayPoolSummary { PoolRow(model: model, summary: pool) }
             HStack(spacing: 2) {
                 Button("管理账号") { model.selectedPage = .accounts; openMain() }.buttonStyle(.lilt(.ghost, size: .small))
                 Button("项目") { model.selectedPage = .projects; openMain() }.buttonStyle(.lilt(.ghost, size: .small))

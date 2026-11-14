@@ -30,7 +30,7 @@ enum DebugLaunch {
     /// LILT_APPEARANCE=dark|light, LILT_DEMO=1, LILT_PANEL=1 / LILT_SETTINGS=1 (that view inside the window), LILT_PAGE=overview|accounts|projects|scope|diagnostics, LILT_RELAY=1,
     /// LILT_SIMULATE=1 (demo quota reaches the threshold), LILT_SIMULATE_AFTER=<seconds> (the same, later),
     /// LILT_PENDING=1 (shows the "applied, not yet verified" notice),
-    /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>, LILT_POOL=<count>,
+    /// LILT_ROSTER=1 (seven demo accounts), LILT_SWITCH=<index>, LILT_STOPPED=1, LILT_UNREAD=1, LILT_AGE=<seconds>, LILT_SESSION=<count>,
     /// LILT_AUTOSORT=1 (automatic relay order), LILT_UPDATE=available|downloading|installing|failed|current (an update
     /// state with a fictional release), LILT_UPDATE=check|install (asks GitHub, and installs what it finds).
     /// LILT_UPDATE_FROM and LILT_UPDATE_TARGET are read by `Updater` itself.
@@ -90,11 +90,8 @@ enum DebugLaunch {
         // LILT_STOPPED=1 stops the last demo account, LILT_UNREAD=1 drops the second-to-last one's reading.
         if environment["LILT_STOPPED"] == "1", let last = model.accounts.last, model.demo { model.update(last.id) { $0.enabled = false } }
         if environment["LILT_UNREAD"] == "1", model.accounts.count > 1, model.demo { model.update(model.accounts[model.accounts.count - 2].id) { $0.usage = nil } }
-        // LILT_POOL=<count> keeps demo relay among the first accounts, as `lilt 1 2` would; 1 locks the first. Set on
-        // the demo library directly: `updatePreferences` would carry it into the real one.
-        if let count = environment["LILT_POOL"].flatMap(Int.init), count > 0, model.demo {
-            model.library.preferences.relayPool = Array(model.accounts.prefix(count).map(\.id))
-        }
+        // LILT_SESSION=<count> shows a terminal session on the first accounts, the first of them held, as `lilt 1 2` would.
+        if let count = environment["LILT_SESSION"].flatMap(Int.init), model.demo { model.showDemoSession(count: count) }
         // LILT_AGE=<seconds> backdates the demo readings, to look at how old readings are shown.
         if let age = environment["LILT_AGE"].flatMap(Double.init), model.demo {
             for account in model.accounts { model.update(account.id) { $0.usage?.sampledAt = Date.now.addingTimeInterval(-age) } }

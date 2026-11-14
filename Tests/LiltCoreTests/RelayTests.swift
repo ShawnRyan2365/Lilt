@@ -876,6 +876,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         concurrency.testBurstChannel()
         try concurrency.testEarlyHandOffTiers()
         concurrency.testCommandLineAccountQuery()
+        concurrency.testTerminalSessionRules()
         concurrency.testCandidateMarginCoversPaceAndSwitchCost()
         concurrency.testPreparationTiming()
         concurrency.testRetryAtTheEarliestApplicableTime()
@@ -886,7 +887,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 50 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, early hand-off tiers, lilt account lookup and pool, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 51 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, early hand-off tiers, lilt account lookup, terminal session rules, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 

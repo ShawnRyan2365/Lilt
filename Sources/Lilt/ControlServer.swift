@@ -4,8 +4,8 @@ import LiltCore
 
 /// The socket the `lilt` command talks to: `control.sock` in Lilt's own directory. Only this user's processes reach it:
 /// the directory is 0700, the socket 0600, and every connection's peer is checked with `getpeereid`. One JSON request
-/// line in, one reply line out, and neither carries a credential; a switch asked for here goes through `AppModel` like
-/// a click.
+/// line in, one reply line out, and neither carries a credential. A session asked for here is prepared by `AppModel`,
+/// for the process on the other end of the connection, which the kernel names (`LOCAL_PEERPID`).
 enum ControlSocket {
     static var path: String { Disk.file("control.sock").path }
     static let maximumMessage = 256 * 1024
@@ -137,8 +137,12 @@ final class ControlServer {
         ControlSocket.timeout(client, seconds: 5)
         var uid: uid_t = 0, gid: gid_t = 0
         guard getpeereid(client, &uid, &gid) == 0, uid == getuid(), let line = ControlSocket.readLine(client) else { close(client); return }
+        // Taken now, while the terminal's process is certainly the one connected.
+        var pid: pid_t = 0
+        var length = socklen_t(MemoryLayout<pid_t>.size)
+        let lease = getsockopt(client, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0 ? ProcessLease.lease(pid: pid) : nil
         Task { @MainActor in
-            let reply = await handle(line)
+            let reply = await handle(line, lease: lease)
             let data = (try? JSONEncoder().encode(reply)) ?? Data()
             DispatchQueue.global(qos: .userInitiated).async {
                 ControlSocket.writeAll(client, data)
@@ -147,14 +151,16 @@ final class ControlServer {
         }
     }
 
-    private static func handle(_ line: Data) async -> ControlReply {
+    private static func handle(_ line: Data, lease: SessionLease?) async -> ControlReply {
         guard let request = try? JSONDecoder().decode(ControlRequest.self, from: line) else { return .failure("请求无法识别。") }
         guard let model = shared.model else { return .failure("Lilt 还没准备好，稍后再试。") }
         if model.demo { return .failure("Lilt 正在演示模式；先在 Lilt 里退出演示。") }
         switch request.action {
         case "list": return model.commandLineList()
-        case "use": return await model.useAccounts(request.ids ?? [])
-        case "all": return model.useAllAccounts()
+        case "session": return await model.startSession(request.ids ?? [], lease: lease)
+        case "bypass":
+            if let on = request.bypass { model.setSessionBypass(on) }
+            return ControlReply(ok: true, bypass: model.sessionBypass)
         default: return .failure("正在运行的 Lilt 不认识“\(request.action)”；重新打开 Lilt 后再试。")
         }
     }

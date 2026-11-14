@@ -13,6 +13,8 @@ import Musl
 public struct LiveUsageEvent: Codable, Equatable, Sendable {
     public static let defaultScope = "default"
     public static func projectScope(_ id: UUID) -> String { "project-" + id.uuidString }
+    /// A terminal session `lilt` opened (`TerminalSession`).
+    public static func sessionScope(_ id: UUID) -> String { "session-" + id.uuidString }
 
     public let id: String
     public let scope: String

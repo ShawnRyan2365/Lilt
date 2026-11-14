@@ -174,6 +174,14 @@ final class AppModel {
     private var tokenRenew: (Credential) async throws -> Credential = { try await TokenRenewer().renew($0) }
     /// Where a project's login goes. Regression checks replace it with in-memory credential stores.
     private var projectRuntime: (ProjectBinding) -> RuntimeScope = { RuntimeScope(project: $0) }
+    /// Terminal sessions `lilt` opened (`sessions.json`); see the extension at the end of this file.
+    private(set) var sessionCatalog = SessionCatalog()
+    private(set) var sessionsAvailable = true
+    private var sessionBusy: Set<UUID> = []
+    /// Recent readings of the account each session holds, for the session's own pace (`UsagePace`).
+    private var sessionPace: [UUID: (account: UUID, readings: [UsageSnapshot])] = [:]
+    private var sessionRuntime: (UUID) -> RuntimeScope = { RuntimeScope(session: $0) }
+    private var leaseAlive: (SessionLease) -> Bool = { ProcessLease.alive($0) }
     private var requestGap: TimeInterval = 2
     /// The profile endpoint, asked only when a scope's own records cannot say whose login it holds. Regression checks
     /// replace it so that no fixture token ever leaves the machine.
@@ -192,6 +200,7 @@ final class AppModel {
         do { try AccountVaultTransfer.recover() } catch { message = (error as? ImportFailure)?.message ?? "上次导入的现场无法自动收尾，请检查后再导入。" }
         do { library = try Disk.load() } catch { storageAvailable = false; message = "账号资料无法读取，已停止写入。请先检查本地数据；不会以空列表覆盖。" }
         loadProjects()
+        loadSessions()
         let held = restoreUsageHolds()
         // Being told to wait, or a dropped connection, is not a lasting problem with an account; earlier versions kept it as one.
         // An account still serving a server 429's wait keeps saying so.
@@ -237,11 +246,16 @@ final class AppModel {
     /// files still go under `Disk.root`, so the caller must point the home directory at a fixture first.
     init(fixture library: Library, runtime: RuntimeScope, usageFetch: ((Credential) async throws -> UsageSnapshot)? = nil,
          projects: ProjectCatalog = ProjectCatalog(), projectRuntime: ((ProjectBinding) -> RuntimeScope)? = nil,
-         identityFetch: ((Credential) async -> Data?)? = nil, tokenRenew: ((Credential) async throws -> Credential)? = nil) {
+         identityFetch: ((Credential) async -> Data?)? = nil, tokenRenew: ((Credential) async throws -> Credential)? = nil,
+         sessions: SessionCatalog = SessionCatalog(), sessionRuntime: ((UUID) -> RuntimeScope)? = nil,
+         leaseAlive: ((SessionLease) -> Bool)? = nil) {
         retryClock = { .now }
         self.library = library
         fixtureRuntime = runtime
         projectCatalog = projects
+        sessionCatalog = sessions
+        if let sessionRuntime { self.sessionRuntime = sessionRuntime }
+        if let leaseAlive { self.leaseAlive = leaseAlive }
         if let usageFetch { self.usageFetch = usageFetch }
         if let tokenRenew { self.tokenRenew = tokenRenew }
         if let projectRuntime { self.projectRuntime = projectRuntime }
@@ -336,98 +350,33 @@ final class AppModel {
         return rate.fiveHour > 0 || rate.sevenDay > 0 ? rate : nil
     }
 
-    // MARK: Relay pool and the `lilt` command
+    // MARK: Accounts other CLIs hold, and the `lilt` command
 
-    /// The accounts relay may hand off to, when a terminal set a pool (`lilt <account>…`); nil means all of them.
-    var relayPool: Set<UUID>? { RelayPool.effective(library.preferences.relayPool, accounts: library.accounts) }
-    /// The pool in a few words for the relay card and the panel; nil without one.
-    var relayPoolSummary: String? {
-        guard let pool = relayPool else { return nil }
-        let names = accounts.filter { pool.contains($0.id) }.map(\.label)
-        if names.count == 1 { return "已锁定“\(names[0])”，不换号" }
-        return names.count <= 3 ? "只在 \(names.joined(separator: "、")) 间接力" : "只在 \(names.count) 个账号间接力"
+    /// Accounts the default login leaves alone: fixed to a project, or taken by a terminal session (`lilt`), whether
+    /// in its scope or waiting in its pool. Relay never hands off to them and a manual switch to one is refused.
+    var reservedAccountIDs: Set<UUID> { projectCatalog.reservedAccountIDs.union(sessionCatalog.reservedAccountIDs) }
+    /// A CLI holds this account's login and renews it itself: the default login's, a project's or a terminal session's.
+    /// Lilt never renews such a login, so the two never spend the same refresh token; it reads back what the CLI renewed.
+    func heldByCLI(_ id: UUID) -> Bool {
+        id == library.activeID || projectCatalog.reservedAccountIDs.contains(id) || sessionCatalog.heldAccountIDs.contains(id)
     }
-    func clearRelayPool() {
-        updatePreferences { $0.relayPool = nil }
-        relayRetryAt = nil; noCandidateFailures = 0
-        status = "接力范围恢复全部账号"
-    }
-    /// Why the last switch asked for from a terminal did not happen, for the terminal to print.
-    private var commandLineFailure: String?
-    /// What `lilt ls` prints: every account in relay order, the pool and what relay is doing.
+    /// Whether terminal sessions skip permission prompts (`lilt bypass`), as `ccl` does by default.
+    var sessionBypass: Bool { library.preferences.sessionBypass != false }
+    func setSessionBypass(_ on: Bool) { updatePreferences { $0.sessionBypass = on } }
+    /// What `lilt ls` prints: every account in relay order, and the terminal sessions running.
     func commandLineList() -> ControlReply {
-        let pool = relayPool, reserved = projectCatalog.reservedAccountIDs, now = Date.now
+        let projects = projectCatalog.reservedAccountIDs, held = sessionCatalog.heldAccountIDs, pooled = sessionCatalog.reservedAccountIDs
+        let now = Date.now
         let rows = accounts.map { account in
             let usage = account.usage
-            return ControlAccount(id: account.id, label: account.label, active: account.id == library.activeID,
-                                  enabled: account.enabled, project: reserved.contains(account.id),
-                                  inPool: pool?.contains(account.id) ?? true,
+            return ControlAccount(id: account.id, label: account.label, active: account.id == displayedActiveID && managesDefaultLogin,
+                                  enabled: account.enabled, project: projects.contains(account.id),
+                                  sessionHeld: held.contains(account.id), sessionSpare: pooled.contains(account.id) && !held.contains(account.id),
                                   fiveHour: usage.flatMap { $0.lastKnownRemaining($0.fiveHour, at: now) },
                                   sevenDay: usage.flatMap { $0.lastKnownRemaining($0.sevenDay, at: now) },
                                   noWeeklyLimit: usage?.hasNoWeeklyLimit == true, sampledAt: usage?.sampledAt)
         }
-        return ControlReply(ok: true, accounts: rows, pool: pool.map { pool in accounts.map(\.id).filter(pool.contains) },
-                            autoRelay: autoRelay, relayNote: relayExplanation ?? (autoRelay ? handOffRule : relayBlocker))
-    }
-    /// `lilt <account>…` in a terminal. From now on relay hands off only among these accounts, and the default login
-    /// moves into them unless it is on one already: to the first listed whose last reading has room, else the first
-    /// listed. One account locks the default login on it, so relay never hands off from it; several turn relay on.
-    func useAccounts(_ requested: [UUID]) async -> ControlReply {
-        var ids: [UUID] = []
-        for id in requested where !ids.contains(id) { ids.append(id) }
-        guard !ids.isEmpty else { return .failure("没有指定账号。") }
-        guard storageAvailable else { return .failure("Lilt 的本地数据不可用，没有切换。") }
-        guard demo || library.preferences.scopeEnabled else { return .failure("Lilt 还没接管 Claude Code 默认登录；先在 Lilt 的「接入」页接管。") }
-        var chosen: [Account] = []
-        for id in ids {
-            guard let account = library.accounts.first(where: { $0.id == id }) else { return .failure("有账号已被删除；运行 lilt ls 重新查看。") }
-            if !account.enabled { return .failure("“\(account.label)”已停用；先在 Lilt 里启用它。") }
-            if projectCatalog.reservedAccountIDs.contains(id) { return .failure("“\(account.label)”已固定给项目，默认登录不能用它。") }
-            chosen.append(account)
-        }
-        guard !busy else { return .failure("Lilt 正在切换或登录，稍后再试。") }
-        var lines: [String] = []
-        if let current = active, ids.contains(current.id) {
-            if ids.count > 1 { lines.append("当前账号“\(current.label)”已在范围内，没有切换。") }
-        } else {
-            let now = Date.now
-            let target = chosen.first { account in
-                guard let usage = account.usage, usage.lastKnownRemaining(usage.fiveHour, at: now) != nil else { return false }
-                return !usage.remainsExhausted(threshold: thresholds, at: now)
-            } ?? chosen[0]
-            commandLineFailure = nil
-            guard await apply(target.id, fromCommandLine: true) else {
-                return .failure(commandLineFailure ?? "没能切换到“\(target.label)”，范围没有改动。")
-            }
-            lines.append("已切换到“\(target.label)”。")
-            if !demo { lines.append("凭据已写入\(scopeName)；运行中的会话是否已换号，以会话里的 /status 为准。") }
-        }
-        updatePreferences { $0.relayPool = ids }
-        relayRetryAt = nil; noCandidateFailures = 0
-        if ids.count == 1 {
-            lines.append("已锁定“\(chosen[0].label)”：自动接力不会换到其他账号。lilt all 恢复全部账号。")
-        } else {
-            let names = accounts.filter { ids.contains($0.id) }.map(\.label).joined(separator: "、")
-            lines.append("只在 \(names) 之间接力（\(ids.count) 个）。lilt all 恢复全部账号。")
-            if !autoRelay {
-                if let relayBlocker { lines.append("自动接力没开：\(relayBlocker)。") }
-                else { setAutoRelay(true); lines.append("已开启自动接力。") }
-            }
-        }
-        status = relayPoolSummary ?? status
-        // The account in use may already be at its threshold; relay need not wait for the next pass to hand off.
-        Task { await self.relay() }
-        var reply = commandLineList()
-        reply.lines = lines
-        return reply
-    }
-    /// `lilt all`: relay may use every account again.
-    func useAllAccounts() -> ControlReply {
-        let had = relayPool != nil
-        if had { clearRelayPool() }
-        var reply = commandLineList()
-        reply.lines = [had ? "接力范围已恢复全部账号。" : "接力范围本来就是全部账号。"]
-        return reply
+        return ControlReply(ok: true, accounts: rows, sessions: sessionSummaries, bypass: sessionBypass)
     }
     /// Work that quitting for an update must not cut off. A token renewal runs under both flags, and stopping halfway
     /// through one could lose the only copy of a newly issued refresh token.
@@ -466,7 +415,7 @@ final class AppModel {
         // Without a reading for the account in use there is nothing to tell Lilt when to hand off.
         if active.usageCapability == .unavailable { return "当前账号读不到额度" }
         // Accounts fixed to a project never take over the default login, so they do not count as spares.
-        if !accounts.contains(where: { $0.id != active.id && !projectCatalog.reservedAccountIDs.contains($0.id) && $0.enabled && $0.usageCapability != .unavailable }) { return "还需要一个能读额度的备用账号（项目专用账号不算）" }
+        if !accounts.contains(where: { $0.id != active.id && !reservedAccountIDs.contains($0.id) && $0.enabled && $0.usageCapability != .unavailable }) { return "还需要一个能读额度的备用账号（项目和独立会话用着的不算）" }
         return nil
     }
     /// Turning it on is the user's standing consent for Lilt to write the next account's credentials into the scope at the threshold.
@@ -590,14 +539,11 @@ final class AppModel {
         guard bound.isEmpty else {
             message = "这个账号固定给了 \(bound.count) 个项目（\(bound.map(\.name).joined(separator: "、"))）。先在项目页换绑或解绑，再删除。"; return
         }
+        guard sessionCatalog.session(containing: id) == nil else { message = "这个账号正在终端的独立会话里用；会话结束后再删除。"; return }
         do {
             if !demo { try AccountVault.delete(account: id.uuidString) }
             if !demo { try? AccountVault.delete(account: Keychain.identityAccount(id)) }
             library.accounts.removeAll { $0.id == id }; backoffs[id] = nil; failures[id] = nil
-            if let pool = library.preferences.relayPool {
-                let kept = pool.filter { $0 != id }
-                library.preferences.relayPool = kept.isEmpty ? nil : kept
-            }
             save()
         } catch { message = "本地凭据未能删除。" }
     }
@@ -779,8 +725,8 @@ final class AppModel {
         if let running = renewals[id] { renewal = running } else {
             let stored = try await credential(for: id)
             let due = refused.map { $0.data == stored.data } ?? stored.expires(within: RelayPolicy.renewalLead)
-            // An account in a project's scope is renewed by that project's CLI, like the one in the default login.
-            guard !demo, id != library.activeID, !projectCatalog.reservedAccountIDs.contains(id), stored.refreshable,
+            // An account in a project's or a terminal session's scope is renewed by that CLI, like the default login's.
+            guard !demo, !heldByCLI(id), stored.refreshable,
                   due else { return stored }
             if let running = renewals[id] { renewal = running } else {
                 let renew = tokenRenew
@@ -972,7 +918,7 @@ final class AppModel {
     /// to another endpoint, so it goes ahead: a long wait used to let these logins run out. It backs off on its own.
     private func renewWhileWaiting(_ id: UUID) async {
         guard !demo, let account = accounts.first(where: { $0.id == id }),
-              UsagePolling.renewalDue(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), at: .now),
+              UsagePolling.renewalDue(account, active: heldByCLI(id), at: .now),
               (renewalBackoffs[id]?.nextAttempt ?? .distantPast) <= .now else { return }
         do {
             _ = try await renewedCredential(for: id)
@@ -988,7 +934,7 @@ final class AppModel {
     /// Whether a token the usage endpoint refused is renewed before the read gives up (`UsagePolling.renewsAfterRefusal`).
     private func renewsAfterRefusal(_ id: UUID, _ credential: Credential, manually: Bool) -> Bool {
         guard !demo, credential.refreshable, let account = accounts.first(where: { $0.id == id }) else { return false }
-        return UsagePolling.renewsAfterRefusal(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id),
+        return UsagePolling.renewsAfterRefusal(account, active: heldByCLI(id),
                                                lastTried: manually ? nil : refusalRenewals[id], at: .now)
     }
     /// The usage endpoint refused `refused`, a spare login's token that had not expired. It is renewed at once and quota
@@ -1027,7 +973,7 @@ final class AppModel {
         }
         if pauseForRateLimit(announce: manually) { await renewWhileWaiting(id); return }
         if !manually, let account = accounts.first(where: { $0.id == id }),
-           UsagePolling.holdsForExhaustion(account, active: id == library.activeID || projectCatalog.reservedAccountIDs.contains(id), threshold: thresholds, at: .now) { return }
+           UsagePolling.holdsForExhaustion(account, active: heldByCLI(id), threshold: thresholds, at: .now) { return }
         // A request already out for this account answers this one too. Manual refresh may override an ordinary
         // backoff, never a server 429.
         if let running = refreshes[id] {
@@ -1060,6 +1006,8 @@ final class AppModel {
         if let project = projectCatalog.projects.first(where: { $0.accountID == id && $0.phase == .ready }), !projectBusy.contains(project.id) {
             try? await syncProject(project, target: nil)
         }
+        // Likewise a terminal session's CLI.
+        await readBackSession(holding: id)
         var asked: Credential?
         do {
             var credential = try await renewedCredential(for: id)
@@ -1074,6 +1022,7 @@ final class AppModel {
             guard accounts.contains(where: { $0.id == id }), await isCurrent(credential, for: id) else { return }
             update(id) { $0.usage = snapshot; $0.usageCapability = .verified; $0.lastChecked = .now; $0.issue = nil; $0.usageRetryAt = nil }
             if id == library.activeID { notePace(snapshot, for: id) }
+            if let session = sessionCatalog.session(holding: id) { noteSessionPace(snapshot, session: session.id, account: id) }
             if let backoff = backoffs[id], backoff.failures > 0 || backoff.nextAttempt != .distantPast { backoffs[id]?.succeed() }
             if failures[id] != nil { failures[id] = nil }
             rateLimit.answered()
@@ -1126,10 +1075,8 @@ final class AppModel {
         guard !demo else { return }
         await pollUsage(activeStaleness: 120)
     }
-    /// `fromCommandLine`: asked by `lilt` in a terminal (`useAccounts`), which prints a failure instead of raising an
-    /// alert in the app, and sets the relay pool itself.
     @discardableResult
-    func apply(_ id: UUID, automatically: Bool = false, fromCommandLine: Bool = false) async -> Bool {
+    func apply(_ id: UUID, automatically: Bool = false) async -> Bool {
         // A quota read running in the background is no reason to hold up the user's own switch. Earlier versions waited
         // up to 30 seconds for it with nothing on screen; the two now share any renewal (`renewals`) and take turns at
         // the scope (`exclusively`), which is all the waiting was for.
@@ -1139,6 +1086,11 @@ final class AppModel {
         // already in it (after a new login, say) is not a switch and stays allowed.
         if projectCatalog.reservedAccountIDs.contains(id), id != library.activeID {
             if !automatically { message = "“\(target.label)”已固定给项目，默认登录不能使用它。先在项目页换绑或解绑。"; selectedPage = .projects }
+            return false
+        }
+        // Nor one a terminal session holds or keeps in its pool: two places renewing one login log one of them out.
+        if sessionCatalog.reservedAccountIDs.contains(id), id != library.activeID {
+            if !automatically { message = "“\(target.label)”正在终端的独立会话里用；会话结束后才能给默认登录用。" }
             return false
         }
         if !demo && !library.preferences.scopeEnabled { selectedPage = .scope; message = "请先接管 Claude Code 默认登录。"; return false }
@@ -1177,10 +1129,6 @@ final class AppModel {
             library.activeID = id; appliedPending = !demo; sessionConfirmed = false; relayPause = nil; relayRetryAt = nil; scopeIssue = nil
             noCandidateFailures = 0
             apiModeDetected = false; library.preferences.keepAPIMode = nil
-            // Picking an account outside the pool a terminal set, in the app, ends that pool: otherwise relay would
-            // later hand back to accounts the user just turned away from, or never leave one they locked.
-            let poolEnded = !automatically && !fromCommandLine && relayPool.map { !$0.contains(id) } == true
-            if poolEnded { library.preferences.relayPool = nil }
             library.preferences.autoRelayStopReason = nil; save()
             if !demo {
                 lastSwitchAt = .now
@@ -1190,14 +1138,13 @@ final class AppModel {
                 // place needs one current reading of its own.
                 if !(target.usage?.isFresh(at: .now) ?? false) { Task { await self.refresh(id) } }
             }
-            status = (demo ? "演示账号已应用" : "已切换到“\(target.label)”") + (poolEnded ? " · 接力范围恢复全部账号" : "")
+            status = demo ? "演示账号已应用" : "已切换到“\(target.label)”"
             // The relay card records relays; a switch made by hand is not one.
             if demo { lastEvent = "演示：已接力至 \(target.label)" }
             dualConflict = false
             return true
         } catch let conflict as DualRuntimeConflict {
             noteDualConflict(conflict); message = conflict.message
-            if fromCommandLine { commandLineFailure = conflict.message }
             return false
         } catch {
             let reason = Self.reason(error) ?? "凭据应用失败。"
@@ -1209,7 +1156,6 @@ final class AppModel {
             // stops relay when the scope holds a login Lilt cannot account for. Earlier versions stopped relay here,
             // and it stayed off until the user came back.
             if automatically { waitForRelay(because: "没能换到“\(target.label)”：\(reason)稍后自动重试。", until: retryClock().addingTimeInterval(15)) }
-            else if fromCommandLine { commandLineFailure = reason }
             else { message = reason }
             return false
         }
@@ -1305,7 +1251,7 @@ final class AppModel {
     func saveCurrentLogin(label: String) async -> String? {
         guard canAdd else { return "当前无法保存凭据。" }
         let scope = fixtureRuntime ?? RuntimeScope(target: .system)
-        let managing = managesDefaultLogin, reserved = projectCatalog.reservedAccountIDs
+        let managing = managesDefaultLogin, reserved = projectCatalog.reservedAccountIDs, inSession = sessionCatalog.reservedAccountIDs
         busy = true; status = "正在读取当前登录…"
         defer { busy = false }
         var saved: (id: UUID, record: Data?, recorded: Data?)?
@@ -1344,6 +1290,9 @@ final class AppModel {
                     // A project's account stays out of the default login; its login lives in the project's own scope.
                     if reserved.contains(owner) {
                         return "这是固定给项目的“\(name(owner))”。项目账号不进默认登录，请到项目页更新它的授权。"
+                    }
+                    if inSession.contains(owner) {
+                        return "这是终端独立会话正在用的“\(name(owner))”；会话结束后再保存。"
                     }
                     if case .alreadySaved = plan, !managing || (owner == library.activeID && scopeIssue == nil) {
                         return "这份登录已经保存为“\(name(owner))”，不用再存。"
@@ -1477,10 +1426,11 @@ final class AppModel {
         let projects = projectCatalog.projects.filter { $0.phase == .ready }
         let defaultSpool = StatusLineBridge.spoolDirectory
         let spools = projects.map { ($0.id, ProjectStatusLineBridge.spool($0), $0.eventScope) }
+            + sessionCatalog.sessions.filter { $0.holding != nil }.map { ($0.id, Self.sessionSpool($0.id), $0.eventScope) }
         let (batch, projectBatches) = await Task.detached(priority: .userInitiated) { () -> (LiveUsageBatch?, [UUID: LiveUsageBatch]) in
             let batch = watchDefault ? LiveUsageSpool.drain(defaultSpool, scope: LiveUsageEvent.defaultScope) : nil
             var each: [UUID: LiveUsageBatch] = [:]
-            for (id, spool, scope) in spools { each[id] = LiveUsageSpool.drain(spool, scope: scope) }
+            for (id, spool, scope) in spools where FileManager.default.fileExists(atPath: spool.path) { each[id] = LiveUsageSpool.drain(spool, scope: scope) }
             return (batch, each)
         }.value
         var accepted = false
@@ -1518,6 +1468,7 @@ final class AppModel {
             }
         }
         if projectsChanged { saveProjects() }
+        if takeSessionUsage(projectBatches) { Task { await self.relaySessions() } }
         if accepted {
             Task { await self.relay() }
             Task { await self.prepareHandOff() }
@@ -1675,15 +1626,11 @@ final class AppModel {
         case .pause(let reason):
             guard due else { break }
             noCandidateFailures += 1
-            let pool = relayPool
-            let others = accounts.filter { $0.id != current.id && !projectCatalog.reservedAccountIDs.contains($0.id) && pool?.contains($0.id) != false }
+            let others = accounts.filter { $0.id != current.id && !reservedAccountIDs.contains($0.id) }
             let blocked = others.compactMap { account in policy.obstacle(for: account, at: .now).map { (account.label, $0) } }
             // With many accounts, one line per account is a wall of text that mostly repeats one reason.
             let detail: String
-            // Locked from a terminal on this one account: that is the user's choice, not something to wait out.
-            let locked = pool != nil && others.isEmpty
-            if locked { detail = "已锁定“\(current.label)”，用完也不换号" }
-            else if blocked.isEmpty { detail = reason }
+            if blocked.isEmpty { detail = reason }
             else if blocked.count <= 3 { detail = blocked.map { "\($0.0)：\($0.1)" }.joined(separator: "；") }
             else {
                 detail = Dictionary(grouping: blocked, by: \.1).sorted { ($0.value.count, $1.key) > ($1.value.count, $0.key) }
@@ -1695,8 +1642,7 @@ final class AppModel {
             let retry = policy.retryAt(others, at: retryClock(), ordinary: ordinary, backoffUntil: { self.backoffs[$0]?.nextAttempt },
                                        cooldownEnds: departedAt?.addingTimeInterval(RelayPolicy.departureCooldown))
             let reset = policy.nextReset(of: others, at: .now)
-            let next = locked ? "恢复全部账号后才会接力。"
-                : reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时重新确认。" } ?? "保持开启，稍后自动重查。"
+            let next = reset.flatMap { Wording.resetAmount($0, now: .now) }.map { "最早 \($0)后有账号恢复，到时重新确认。" } ?? "保持开启，稍后自动重查。"
             let sentence = detail.hasSuffix("。") ? detail : detail + "。"
             waitForRelay(because: sentence + next, until: retry)
         case .wait: break
@@ -1721,11 +1667,11 @@ final class AppModel {
     }
     /// Who may take over from the account in use, in relay order. A rejected refresh token stays out until the user
     /// authorizes again, the account just left is not read in order to come back to it, accounts fixed to a project
-    /// never serve the default login, and with a pool set from a terminal (`relayPool`) only its accounts take part.
+    /// never serve the default login, and neither do the accounts of a terminal session (`reservedAccountIDs`).
     private func relayCandidates(_ policy: RelayPolicy, besides activeID: UUID) -> [Account] {
-        let pool = relayPool
+        let reserved = reservedAccountIDs
         return accounts.filter { $0.id != activeID && $0.enabled && $0.usageCapability != .unavailable && $0.refreshRejected != true
-            && $0.id != policy.leftRecently && !projectCatalog.reservedAccountIDs.contains($0.id) && pool?.contains($0.id) != false }
+            && $0.id != policy.leftRecently && !reserved.contains($0.id) }
     }
     private func relayPolicy(soonerWeekly: Bool = false, requiredMargin: Thresholds = 0) -> RelayPolicy {
         RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: !demo,
@@ -1780,7 +1726,8 @@ final class AppModel {
                 await refresh(active.id)
             }
         }
-        let reserved = projectCatalog.reservedAccountIDs
+        // A session's waiting accounts are spares like any other; the one it holds is read by `pollSessions`.
+        let reserved = projectCatalog.reservedAccountIDs.union(sessionCatalog.heldAccountIDs)
         let alternates = UsagePolling.refreshOrder(accounts.filter { $0.id != library.activeID && !reserved.contains($0.id) }, at: .now)
         var reads = 0
         for account in alternates where reads < UsagePolling.alternatesPerPass {
@@ -1811,9 +1758,12 @@ final class AppModel {
             if writable { scopeCheckedAt = .now }
         }
         await checkStatusLine()
+        await reapSessions()
         await pollUsage()
         await pollProjects()
+        await pollSessions()
         if writable { await relay(); await prepareHandOff() }
+        await relaySessions()
     }
     func notice(at now: Date = .now) -> Notice? {
         if !storageAvailable { return Notice(symbol: "externaldrive.badge.exclamationmark", text: "本地数据不可用，已停止写入", detail: "检查 ~/Library/Application Support/Lilt 的权限后重新打开 Lilt。", warning: true) }
@@ -2070,6 +2020,7 @@ extension AppModel {
         do {
             let (normalized, name) = try ProjectSupport.validate(root: root)
             let account = library.accounts.first { $0.id == accountID }
+            if sessionCatalog.reservedAccountIDs.contains(accountID) { throw AppFailure("这个账号正在终端的独立会话里用；会话结束后再绑定。") }
             if let problem = ProjectRules.bindingProblem(root: normalized, account: account, catalog: projectCatalog,
                                                          defaultLoginAccount: managesDefaultLogin ? library.activeID : nil, allowShared: allowShared) {
                 throw AppFailure(problem)
@@ -2099,6 +2050,7 @@ extension AppModel {
             guard FileManager.default.fileExists(atPath: binding.rootPath) else { throw AppFailure("项目目录已不存在；请解绑后在新位置重新绑定。") }
             if let problem = ProjectRules.repositoryProblem(root: binding.rootPath) { throw AppFailure(problem) }
             let account = library.accounts.first { $0.id == accountID }
+            if sessionCatalog.reservedAccountIDs.contains(accountID) { throw AppFailure("这个账号正在终端的独立会话里用；会话结束后再绑定。") }
             if let problem = ProjectRules.bindingProblem(root: binding.rootPath, account: account, catalog: projectCatalog,
                                                          defaultLoginAccount: managesDefaultLogin ? library.activeID : nil,
                                                          allowShared: allowShared, replacing: id) {
@@ -2185,4 +2137,338 @@ extension AppModel {
             }
         }
     }
+}
+
+// MARK: - Terminal sessions (`lilt`)
+
+extension AppModel {
+    private func loadSessions() {
+        guard storageAvailable else { return }
+        do {
+            let catalog = try Disk.loadSessions()
+            sessionCatalog = catalog
+            // Its accounts stay reserved as recorded, so nothing else takes them; only new sessions wait for a fix.
+            if let problem = catalog.problem { sessionsAvailable = false; message = "sessions.json：\(problem)暂不打开新的独立会话。" }
+        } catch { sessionsAvailable = false; message = "独立会话记录无法读取；暂不打开新的独立会话。" }
+    }
+    private func saveSessions() {
+        guard !demo, storageAvailable, sessionsAvailable else { return }
+        let catalog = sessionCatalog
+        do { try IOQueue.sync { try Disk.saveSessions(catalog) } } catch { message = "独立会话记录保存失败，请检查本地存储。" }
+    }
+    private func updateSession(_ id: UUID, _ change: (inout TerminalSession) -> Void) {
+        guard let index = sessionCatalog.sessions.firstIndex(where: { $0.id == id }) else { return }
+        change(&sessionCatalog.sessions[index])
+    }
+    static func sessionSpool(_ id: UUID) -> URL { RuntimeScope.sessionBase(id).appendingPathComponent("spool", isDirectory: true) }
+    private static func sessionLabel(_ id: UUID) -> URL { RuntimeScope.sessionBase(id).appendingPathComponent("statusline-label.txt") }
+
+    /// An account as a session uses it. A session takes an account the user named even while it is switched off for
+    /// the default login, so it is treated as switched on here.
+    private func sessionAccount(_ id: UUID) -> Account? {
+        guard var account = library.accounts.first(where: { $0.id == id }) else { return nil }
+        account.enabled = true
+        return account
+    }
+    private func label(_ id: UUID) -> String { library.accounts.first { $0.id == id }?.label ?? "已删除的账号" }
+    var sessionSummaries: [ControlSessionSummary] {
+        sessionCatalog.sessions.map { session in
+            ControlSessionSummary(pool: session.pool.map(label), holding: session.holding.map(label),
+                                  terminals: session.leases.filter(leaseAlive).count, note: session.note)
+        }
+    }
+    /// How an account row names its part in a session: in its scope, or waiting in its pool. Nil for neither.
+    func sessionRole(_ id: UUID) -> String? {
+        if sessionCatalog.heldAccountIDs.contains(id) { return "独立会话" }
+        return sessionCatalog.reservedAccountIDs.contains(id) ? "会话备用" : nil
+    }
+
+    /// Who the default login is on when Lilt does not manage it: the account whose identity matches `~/.claude.json`.
+    private func defaultLoginOwner(among pool: [UUID]) async -> UUID? {
+        guard let theirs = OAuthDocument.Identity(oauthAccount: RuntimeScope.identity(at: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude.json"))).account else { return nil }
+        return pool.first { OAuthDocument.Identity(oauthAccount: identity(for: $0)).account == theirs }
+    }
+    /// A key, provider or base URL in `~/.claude/settings.json` would win over the session's login, as over the default one.
+    private func sessionAPIProblem() async -> String? {
+        let scope = RuntimeScope(target: .system)
+        do {
+            guard try await IOQueue.run({ try scope.hasAPIOverride() }) else { return nil }
+            return "~/.claude/settings.json 里设置了 API 或供应商，独立会话也会被它覆盖，用不上订阅账号。先在 Lilt 里切回订阅。"
+        } catch { return Self.reason(error) ?? "~/.claude/settings.json 暂时读不出来，稍后再试。" }
+    }
+
+    /// `lilt <account>…` in a terminal: a session on these accounts for the process `lease` names, which then replaces
+    /// itself with Claude Code. Accounts already running in a session together are joined; otherwise the first one with
+    /// room is written into a scope of the session's own. From here until the session ends, its accounts are out of the
+    /// default login's reach. The reply names the directory the terminal's CLI keeps its login in, never the login.
+    func startSession(_ requested: [UUID], lease: SessionLease?) async -> ControlReply {
+        var pool: [UUID] = []
+        for id in requested where !pool.contains(id) { pool.append(id) }
+        guard !demo else { return .failure("Lilt 正在演示模式；先在 Lilt 里退出演示。") }
+        guard storageAvailable, sessionsAvailable else { return .failure("Lilt 的本地数据不可用，没有打开独立会话。") }
+        guard let lease else { return .failure("认不出这个终端的进程，没有打开独立会话。") }
+        // A switch of the default login under way may be writing one of these accounts right now.
+        for _ in 0..<60 where busy { try? await Task.sleep(for: .milliseconds(500)) }
+        guard !busy else { return .failure("Lilt 正在切换默认登录，稍后再试。") }
+        // A terminal that just closed must not keep its accounts until the next pass: `lilt 001` again right after
+        // leaving a session is the usual case.
+        await reapSessions()
+        let owner = library.preferences.scopeEnabled ? library.activeID : await defaultLoginOwner(among: pool)
+        if let problem = SessionRules.startProblem(pool: pool, accounts: library.accounts, sessions: sessionCatalog,
+                                                   projects: projectCatalog, defaultLogin: owner) { return .failure(problem) }
+        if let problem = await sessionAPIProblem() { return .failure(problem) }
+        let id = SessionRules.scopeID(pool: pool)
+        guard sessionBusy.insert(id).inserted else { return .failure("这组账号的独立会话正在准备，稍后再试。") }
+        defer { sessionBusy.remove(id) }
+        let scope = sessionRuntime(id)
+        if let session = sessionCatalog.session(id: id), let holder = session.holding {
+            // Another terminal on the same accounts, or one that just ended and whose login is still in place. The
+            // order the first terminal gave stays: a terminal joining does not reorder the relay of one already running.
+            let alive = session.leases.filter(leaseAlive)
+            updateSession(id) { $0.leases = alive.filter { $0 != lease } + [lease]; $0.endedAt = nil }
+            saveSessions()
+            SwitchLog.record("session-join")
+            return launchReply(session: id, holder: holder, joined: !alive.isEmpty, scope: scope)
+        }
+        let members = pool.compactMap(sessionAccount)
+        guard let first = SessionRules.firstHolder(members, threshold: thresholds, at: .now) else { return .failure("没有指定账号。") }
+        // Reserved before anything is written, so the default login's relay stops considering these accounts now.
+        sessionCatalog.sessions.removeAll { $0.id == id }
+        sessionCatalog.sessions.append(TerminalSession(pool: pool, leases: [lease]))
+        relayGeneration += 1
+        saveSessions()
+        do {
+            // A scope left behind (sessions.json lost, say) is read back where it can be, then cleared.
+            try await clearLeftover(scope, pool: members)
+            try await writeSession(id, to: first, scope: scope)
+        } catch {
+            sessionCatalog.sessions.removeAll { $0.id == id }
+            saveSessions()
+            let reason = Self.reason(error) ?? "没能把登录写入独立会话。"
+            logFailure("session-failed", reason)
+            return .failure("没有打开独立会话：\(reason)")
+        }
+        saveSessions()
+        SwitchLog.record("session-start", detail: "accounts=\(pool.count)")
+        status = "已在终端打开“\(first.label)”的独立会话"
+        if !(first.usage?.isFresh(at: .now, lifetime: 300) ?? false) { Task { await self.refresh(first.id) } }
+        return launchReply(session: id, holder: first.id, joined: false, scope: scope)
+    }
+    private func launchReply(session id: UUID, holder: UUID, joined: Bool, scope: RuntimeScope) -> ControlReply {
+        let pool = sessionCatalog.session(id: id)?.pool ?? [holder]
+        let launch = ControlLaunch(secureDirectory: scope.directory.path, account: label(holder), pool: pool.map(label), joined: joined, bypass: sessionBypass)
+        return ControlReply(ok: true, launch: launch, bypass: sessionBypass)
+    }
+    private func clearLeftover(_ scope: RuntimeScope, pool: [Account]) async throws {
+        guard try await IOQueue.run({ try scope.currentCredential() }) != nil else {
+            try await IOQueue.run { try scope.discard() }
+            return
+        }
+        for account in pool {
+            if let verdict = try? await projectReadBack(account, in: scope), verdict == .adopt || verdict == .unchanged { break }
+        }
+        try await IOQueue.run { try scope.discard() }
+        SwitchLog.record("session-leftover")
+    }
+    /// Writes `account`'s login into the session's scope: renewed first if it is about to expire, while it is still a
+    /// spare Lilt renews; from the moment it is held, only the session's CLI renews it.
+    private func writeSession(_ id: UUID, to account: Account, scope: RuntimeScope) async throws {
+        let login: Credential
+        do { login = try await renewedCredential(for: account.id) } catch UsageFailure.network { login = try await credential(for: account.id) }
+        let previous = sessionCatalog.session(id: id)?.holding
+        updateSession(id) { $0.holding = account.id }
+        do {
+            let label = Data("Lilt · \(account.label)".utf8), labelFile = Self.sessionLabel(id)
+            try await IOQueue.run {
+                try scope.apply(login)
+                try? Disk.write(label, to: labelFile)
+            }
+        } catch {
+            updateSession(id) { $0.holding = previous }
+            throw error
+        }
+        updateSession(id) { $0.switchedAt = .now }
+        sessionPace[id] = nil
+    }
+
+    /// A read of an account a session holds starts from what the session's CLI renewed, as for a project.
+    private func readBackSession(holding account: UUID) async {
+        guard let session = sessionCatalog.session(holding: account), let held = library.accounts.first(where: { $0.id == account }),
+              sessionBusy.insert(session.id).inserted else { return }
+        defer { sessionBusy.remove(session.id) }
+        _ = try? await projectReadBack(held, in: sessionRuntime(session.id))
+    }
+
+    /// Terminals that ended leave their session. A session with none left has its login read back and its scope
+    /// cleared, and its accounts go back to the default login. A login that cannot be accounted for yet is tried again
+    /// on later passes, up to `SessionRules.readBackGrace`.
+    func reapSessions() async {
+        guard !demo, storageAvailable else { return }
+        var changed = false
+        for session in sessionCatalog.sessions where !sessionBusy.contains(session.id) {
+            let alive = session.leases.filter(leaseAlive)
+            if alive != session.leases || (alive.isEmpty && session.endedAt == nil) {
+                updateSession(session.id) { $0.leases = alive; if alive.isEmpty, $0.endedAt == nil { $0.endedAt = .now } }
+                changed = true
+            }
+            if alive.isEmpty, await endSession(session.id) { changed = true }
+        }
+        if changed { saveSessions() }
+    }
+    private func endSession(_ id: UUID) async -> Bool {
+        guard sessionBusy.insert(id).inserted else { return false }
+        defer { sessionBusy.remove(id) }
+        guard let session = sessionCatalog.session(id: id) else { return false }
+        let scope = sessionRuntime(id)
+        let held: Credential?
+        do { held = try await IOQueue.run { try scope.currentCredential() } } catch { return false }
+        if held != nil, let holder = session.holding, let account = library.accounts.first(where: { $0.id == holder }) {
+            guard let verdict = try? await projectReadBack(account, in: scope) else { return false }
+            if verdict == .unverifiable, Date.now.timeIntervalSince(session.endedAt ?? .now) < SessionRules.readBackGrace { return false }
+            if verdict == .unverifiable || verdict == .foreign { SwitchLog.record("session-unverified") }
+        }
+        do { try await IOQueue.run { try scope.discard() } } catch { return false }
+        sessionCatalog.sessions.removeAll { $0.id == id }
+        sessionPace[id] = nil
+        SwitchLog.record("session-end")
+        return true
+    }
+
+    /// Takes in the status line events of each session's terminals, as for the default login. True when one moved.
+    func takeSessionUsage(_ batches: [UUID: LiveUsageBatch]) -> Bool {
+        var moved = false
+        for session in sessionCatalog.sessions {
+            guard let batch = batches[session.id], let holder = session.holding,
+                  let account = library.accounts.first(where: { $0.id == holder }) else { continue }
+            if batch.hasGaps { forcePoll.insert(holder) }
+            let readings = LiveUsageFold.readings(batch.events, scope: session.eventScope, known: account.usage, since: session.switchedAt, at: .now)
+            guard let last = readings.last else { continue }
+            update(holder) { $0.usage = last; $0.usageCapability = .verified; $0.issue = nil }
+            for reading in readings { noteSessionPace(reading, session: session.id, account: holder) }
+            moved = true
+        }
+        return moved
+    }
+    func noteSessionPace(_ reading: UsageSnapshot, session: UUID, account: UUID) {
+        var readings = sessionPace[session].flatMap { $0.account == account ? $0.readings : nil } ?? []
+        readings.removeAll { $0.sampledAt >= reading.sampledAt || reading.sampledAt.timeIntervalSince($0.sampledAt) > UsagePace.span }
+        readings.append(reading)
+        sessionPace[session] = (account, readings)
+    }
+
+    /// The account each running session holds is read like the default login's: when its terminals have not reported
+    /// for a while, faster while the session relays.
+    private func pollSessions() async {
+        for session in sessionCatalog.sessions where session.endedAt == nil {
+            guard let holder = session.holding, let account = sessionAccount(holder), account.usageCapability != .unavailable else { continue }
+            if forcePoll.remove(holder) != nil
+                || UsagePolling.due(account, active: true, autoRelay: session.relays, urgent: false, watching: watching, at: .now) {
+                await refresh(holder)
+            }
+        }
+    }
+
+    /// A session on several accounts hands off down its list, by the same thresholds and early hand-off tiers as the
+    /// default login, whatever the default login's own relay is set to: the user asked for it by naming them.
+    func relaySessions() async {
+        guard !demo, storageAvailable else { return }
+        for session in sessionCatalog.sessions where session.relays && session.endedAt == nil { await relaySession(session.id) }
+    }
+    private func sessionCandidates(_ id: UUID, _ policy: RelayPolicy) -> [Account] {
+        guard let session = sessionCatalog.session(id: id) else { return [] }
+        return SessionRules.relayOrder(session.pool, after: session.holding).compactMap(sessionAccount)
+            .filter { $0.usageCapability != .unavailable && $0.refreshRejected != true && $0.id != policy.leftRecently }
+    }
+    private func relaySession(_ id: UUID) async {
+        guard !sessionBusy.contains(id), let session = sessionCatalog.session(id: id), let holder = session.holding,
+              let held = sessionAccount(holder), let usage = held.usage else { return }
+        let pace = sessionPace[id].flatMap { $0.account == holder ? $0.readings : nil } ?? []
+        let life = lifetime(of: usage)
+        let triggered = usage.exhausted(threshold: thresholds, at: .now, lifetime: life)
+        let ahead = !triggered && UsagePace.nearing(usage, after: pace, threshold: thresholds, at: .now, lifetime: life, rules: earlyRules)
+        guard triggered || ahead else {
+            if session.note != nil, usage.available(threshold: thresholds, at: .now) { updateSession(id) { $0.note = nil; $0.retryAt = nil } }
+            return
+        }
+        if let retryAt = session.retryAt, retryAt > retryClock() { return }
+        if globallyRateLimited() {
+            updateSession(id) { $0.note = "额度接口限流，稍后重新确认候选账号。"; $0.retryAt = self.rateLimitedUntil }
+            return
+        }
+        let margin = UsagePace.candidateMargin(pace: UsagePace.earlyPoints(usage, after: pace, at: .now, lifetime: life, rules: earlyRules), allowance: 0)
+        let policy = RelayPolicy(threshold: thresholds, allowUnverifiedHotSwitch: true,
+                                 leftRecently: RelayPolicy.coolingDown(session.departed, since: session.departedAt, at: .now), requiredMargin: margin)
+        var asked = Set<UUID>()
+        while asked.count < RelayPolicy.handOffReads, sessionCatalog.session(id: id)?.holding == holder,
+              let next = policy.nextRead(sessionCandidates(id, policy), leaving: held, asked: asked, readable: readable, at: .now) {
+            asked.insert(next.id)
+            await refresh(next.id)
+        }
+        guard !sessionBusy.contains(id), sessionCatalog.session(id: id)?.holding == holder, let current = sessionAccount(holder),
+              let latest = current.usage else { return }
+        let stillTriggered = latest.exhausted(threshold: thresholds, at: .now, lifetime: lifetime(of: latest))
+        let paceTrigger = stillTriggered ? nil
+            : UsagePace.trigger(latest, after: pace, threshold: thresholds, at: .now, lifetime: lifetime(of: latest), rules: earlyRules)
+        switch policy.decide(active: current, candidates: sessionCandidates(id, policy), at: .now, holdActiveReading: triggered,
+                             ahead: paceTrigger?.due == true) {
+        case .select(let target): await switchSession(id, from: current, to: target)
+        case .pause(let reason):
+            let others = sessionCandidates(id, policy)
+            let blocked = others.compactMap { account in policy.obstacle(for: account, at: .now).map { "\(account.label)：\($0)" } }
+            let detail = blocked.isEmpty ? reason : blocked.prefix(3).joined(separator: "；") + "。"
+            let retry = policy.retryAt(others, at: retryClock(), ordinary: 60, backoffUntil: { self.backoffs[$0]?.nextAttempt },
+                                       cooldownEnds: session.departedAt?.addingTimeInterval(RelayPolicy.departureCooldown))
+            updateSession(id) { $0.note = detail; $0.retryAt = retry }
+        case .wait: break
+        }
+    }
+    private func switchSession(_ id: UUID, from held: Account, to targetID: UUID) async {
+        guard sessionBusy.insert(id).inserted, let target = sessionAccount(targetID) else { return }
+        defer { sessionBusy.remove(id) }
+        let scope = sessionRuntime(id)
+        do {
+            // Whatever the session's CLI renewed for the account being left is kept; a login nobody can account for
+            // is never written over.
+            switch try await projectReadBack(held, in: scope) {
+            case .adopt, .unchanged: break
+            case .unverifiable, .foreign:
+                updateSession(id) { $0.note = "会话里的登录无法确认仍是“\(held.label)”，没有换号；结束这个会话后重新打开。"; $0.retryAt = self.retryClock().addingTimeInterval(120) }
+                logFailure("session-auto-failed", "unverified")
+                return
+            }
+            try await writeSession(id, to: target, scope: scope)
+            updateSession(id) { $0.departed = held.id; $0.departedAt = .now; $0.note = nil; $0.retryAt = nil }
+            saveSessions()
+            SwitchLog.record("session-auto")
+            status = "独立会话已接力至 \(target.label)"
+        } catch {
+            let reason = Self.reason(error) ?? "凭据应用失败。"
+            logFailure("session-auto-failed", reason)
+            updateSession(id) { $0.note = "没能换到“\(target.label)”：\(reason)稍后自动重试。"; $0.retryAt = self.retryClock().addingTimeInterval(15) }
+        }
+    }
+
+    /// Demo only (`LILT_SESSION`): a session on the first `count` accounts, to look at how rows show it.
+    func showDemoSession(count: Int) {
+        guard demo, count > 0 else { return }
+        let pool = Array(accounts.filter { $0.id != library.activeID }.prefix(count).map(\.id))
+        sessionCatalog = SessionCatalog(sessions: [TerminalSession(pool: pool, holding: pool.first, leases: [SessionLease(pid: 0, started: 0)])])
+    }
+}
+
+/// A terminal session's process, as the kernel knows it. `lilt` replaces itself with the CLI, which keeps the pid and
+/// the start time; a pid that comes back with a different start time is some other process.
+enum ProcessLease {
+    static func startTime(_ pid: pid_t) -> Double? {
+        guard pid > 0 else { return nil }
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let start = info.kp_proc.p_starttime
+        return Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
+    }
+    static func lease(pid: pid_t) -> SessionLease? { startTime(pid).map { SessionLease(pid: pid, started: $0) } }
+    static func alive(_ lease: SessionLease) -> Bool { startTime(lease.pid) == lease.started }
 }

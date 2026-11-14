@@ -185,7 +185,7 @@ func writeEvent(_ used: Double, scope: String, to spool: URL, at date: Date = .n
     precondition(step3 == false && model.active?.id == main.id, "default login took a project account")
     model.remove(first.id)
     precondition(model.accounts.contains { $0.id == first.id }, "a bound account was removed")
-    precondition(model.relayBlocker == "还需要一个能读额度的备用账号（项目专用账号不算）", "project accounts counted as spares")
+    precondition(model.relayBlocker == "还需要一个能读额度的备用账号（项目和独立会话用着的不算）", "project accounts counted as spares")
     let step4 = await model.bindProject(root: rootA.path, accountID: second.id, allowShared: true)
     precondition(step4 == false, "one directory bound twice")
     let step5 = await model.rebindProject(a.id, accountID: second.id, allowShared: false)

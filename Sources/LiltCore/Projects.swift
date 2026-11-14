@@ -44,16 +44,7 @@ public struct ProjectBinding: Identifiable, Codable, Equatable, Sendable {
     /// The same directory always gets the same id, on macOS and Linux alike, so unbinding and binding it again finds
     /// the configuration (and session history) it had. A moved directory is a different project.
     public static func stableID(forRoot rootPath: String) -> UUID {
-        let hex = SHA256Digest.hex(Data("app.lilt.project.root.v1\0\(normalizedRoot(rootPath))".utf8))
-        var bytes = stride(from: 0, to: 32, by: 2).map { index -> UInt8 in
-            let start = hex.index(hex.startIndex, offsetBy: index)
-            return UInt8(hex[start..<hex.index(start, offsetBy: 2)], radix: 16)!
-        }
-        // Version 5 layout (name-based), so the value reads as an ordinary UUID.
-        bytes[6] = (bytes[6] & 0x0f) | 0x50
-        bytes[8] = (bytes[8] & 0x3f) | 0x80
-        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+        SHA256Digest.nameUUID("app.lilt.project.root.v1\0\(normalizedRoot(rootPath))")
     }
 
     /// The `scope` field status line events from this project's sessions carry.
