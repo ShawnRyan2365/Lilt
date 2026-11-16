@@ -44,16 +44,33 @@ enum UsageState: Equatable {
         if shown <= threshold + 0.000001 { self = .reached } else if shown <= 10 { self = .low } else { return nil }
     }
 }
-/// One quota window of an account, drawn with the design layer's readout.
-/// The two quota windows. Each keeps one colour wherever it is drawn, so a ring, a clock hand, a ruler
-/// and a legend dot of the same window match without reading.
+/// The quota windows. Each keeps one colour wherever it is drawn, so a ring, a clock hand, a ruler and a legend dot
+/// of the same window match without reading. Relay and the rings know the first two only; Fable's own weekly window
+/// is shown where an account has one, and never decides anything.
 enum QuotaWindowKind: CaseIterable, Sendable {
-    case fiveHour, sevenDay
-    var title: String { self == .fiveHour ? "5 小时" : "7 天" }
+    case fiveHour, sevenDay, fable
+    /// The windows relay judges, the rings draw and every account has.
+    static let relayed: [QuotaWindowKind] = [.fiveHour, .sevenDay]
+    var title: String {
+        switch self { case .fiveHour: "5 小时"; case .sevenDay: "7 天"; case .fable: "Fable" }
+    }
     var length: TimeInterval { self == .fiveHour ? 5 * 3600 : 7 * 86400 }
-    var series: Paint { self == .fiveHour ? Tokens.fiveHour : Tokens.sevenDay }
-    func window(in snapshot: UsageSnapshot?) -> UsageWindow? { self == .fiveHour ? snapshot?.fiveHour : snapshot?.sevenDay }
-    func threshold(in thresholds: Thresholds) -> Double { self == .fiveHour ? thresholds.fiveHour : thresholds.sevenDay }
+    var series: Paint {
+        switch self { case .fiveHour: Tokens.fiveHour; case .sevenDay: Tokens.sevenDay; case .fable: Tokens.fable }
+    }
+    func window(in snapshot: UsageSnapshot?) -> UsageWindow? {
+        switch self { case .fiveHour: snapshot?.fiveHour; case .sevenDay: snapshot?.sevenDay; case .fable: snapshot?.fable }
+    }
+    /// When this window was read: Fable keeps its own time, since status line readings never carry it.
+    func sampledAt(in snapshot: UsageSnapshot?) -> Date? { self == .fable ? snapshot?.fableSampledAt ?? snapshot?.sampledAt : snapshot?.sampledAt }
+    /// Fable has no threshold of its own (relay never reads it): it only shows as used up at zero.
+    func threshold(in thresholds: Thresholds) -> Double {
+        switch self { case .fiveHour: thresholds.fiveHour; case .sevenDay: thresholds.sevenDay; case .fable: 0 }
+    }
+    /// What the window is, behind hover: Fable's needs saying, since it is part of the 7-day window, not beside it.
+    var explanation: String? {
+        self == .fable ? "Fable 专用的周额度：每周最多能把一半的周额度用在 Fable 上，这里是这一半还剩多少。Fable 同时也算进 7 天额度，两边任一用完都不能再用 Fable。不参与自动接力。" : nil
+    }
 }
 struct UsageMeter: View {
     let kind: QuotaWindowKind
@@ -68,7 +85,7 @@ struct UsageMeter: View {
         TimelineView(.periodic(from: .now, by: 15)) { context in
             let now = max(context.date, .now)
             let shown = snapshot?.lastKnownRemaining(window, at: now)
-            let state = UsageState(shown: shown, sampledAt: snapshot?.sampledAt, threshold: threshold, now: now)
+            let state = UsageState(shown: shown, sampledAt: kind.sampledAt(in: snapshot), threshold: threshold, now: now)
             let reset = Wording.reset(window?.resetsAt, now: now)
             QuotaReadout(title: title, remaining: shown, threshold: threshold, staleNote: state?.isOld == true ? state?.text : nil,
                          placeholder: snapshot == nil ? (unreadable ? "读不到" : "未获取") : "未知",
@@ -77,6 +94,7 @@ struct UsageMeter: View {
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(spoken(shown: shown, state: state, reset: reset))
         }
+        .help(kind.explanation ?? "")
     }
     private func spoken(shown: Double?, state: UsageState?, reset: String?) -> String {
         let name = "\(title)窗口"
@@ -119,6 +137,10 @@ struct WindowGlance: Equatable {
         } else {
             caption = nil
         }
+        // A Fable figure rides along with status line readings that cannot renew it; once it is old, its age shows.
+        if kind == .fable, remaining != nil, let read = snapshot.fableSampledAt, now.timeIntervalSince(read) > UsageState.oldAfter {
+            caption = Wording.age(read, now: now)
+        }
     }
     var figure: String { remaining.map(Wording.percent) ?? "未知" }
     var spoken: String {
@@ -139,9 +161,11 @@ struct QuotaSummary {
 
     init(snapshot: UsageSnapshot?, thresholds: Thresholds, now: Date) {
         guard let snapshot else { spoken = "尚未获取额度"; return }
-        windows = QuotaWindowKind.allCases.map { WindowGlance(kind: $0, snapshot: snapshot, thresholds: thresholds, now: now) }
+        let kinds = QuotaWindowKind.relayed + (snapshot.fable == nil ? [] : [.fable])
+        windows = kinds.map { WindowGlance(kind: $0, snapshot: snapshot, thresholds: thresholds, now: now) }
         spoken = windows.map(\.spoken).joined(separator: "，")
-        let states = windows.compactMap { glance in
+        // The account's state is what relay sees: Fable running out does not make the account low or used up.
+        let states = windows.filter { $0.kind != .fable }.compactMap { glance in
             glance.remaining.flatMap { UsageState(shown: $0, sampledAt: snapshot.sampledAt, threshold: glance.kind.threshold(in: thresholds), now: now) }
         }
         state = states.first(where: \.isOld) ?? states.first { $0 == .reached } ?? states.first { $0 == .low }
@@ -153,7 +177,7 @@ struct QuotaSummary {
 struct QuotaLegend: View {
     var body: some View {
         HStack(spacing: 12) {
-            ForEach(QuotaWindowKind.allCases, id: \.self) { kind in
+            ForEach(QuotaWindowKind.relayed, id: \.self) { kind in
                 HStack(spacing: 5) { SeriesDot(series: kind.series); Text(kind.title) }
             }
         }
@@ -184,6 +208,10 @@ extension AppModel {
                           detail: blocked.map { $0 == "读不到" ? "此凭据读不到额度" : $0 } ?? summary.spoken,
                           stopped: !account.enabled, mood: summary.mood)
         }
+    }
+    /// The quota columns of the accounts list: Fable joins when any account has a Fable window.
+    var quotaColumns: [QuotaWindowKind] {
+        QuotaWindowKind.relayed + (library.accounts.contains { $0.usage?.fable != nil } ? [.fable] : [])
     }
     /// Each account's sprite silhouette.
     var spriteSlots: [UUID: Int] { Sprite.slots(for: accounts.map(\.id)) }
@@ -309,6 +337,8 @@ struct EmptyAccounts: View {
 /// rulers line up down the list whatever the row's name or state.
 enum AccountColumns {
     static let cell: CGFloat = 132
+    /// Narrower with a third column (Fable), so a row still fits the window's minimum width.
+    static func cell(_ columns: Int) -> CGFloat { columns > 2 ? 104 : cell }
     static let cellGap: CGFloat = 22
     /// Holds 切换, or the 使用中 pill on the account in use, so the columns never shift.
     static let action: CGFloat = 60
@@ -316,15 +346,17 @@ enum AccountColumns {
     static let spacing: CGFloat = 12
     static let trailing: CGFloat = 10
 }
-/// The two column labels, said once above the list instead of on every row.
+/// The column labels, said once above the list instead of on every row.
 struct AccountColumnLabels: View {
+    var kinds: [QuotaWindowKind] = QuotaWindowKind.relayed
     var body: some View {
         HStack(spacing: AccountColumns.spacing) {
             Spacer(minLength: 0)
             HStack(spacing: AccountColumns.cellGap) {
-                ForEach(QuotaWindowKind.allCases, id: \.self) { kind in
+                ForEach(kinds, id: \.self) { kind in
                     HStack(spacing: 5) { SeriesDot(series: kind.series); Text(kind.title) }
-                        .frame(width: AccountColumns.cell, alignment: .leading)
+                        .frame(width: AccountColumns.cell(kinds.count), alignment: .leading)
+                        .help(kind.explanation ?? "")
                 }
             }
             Color.clear.frame(width: AccountColumns.action, height: 1)
@@ -422,22 +454,30 @@ struct AccountRow: View {
         .padding(.leading, 12).padding(.trailing, AccountColumns.trailing).padding(.vertical, 12)
         .object(radius: 18)
     }
-    /// The two windows in fixed columns. A credential that cannot read quota, or one not read yet, still
-    /// takes both columns, as dots, so the rows keep their rhythm.
+    /// The windows in fixed columns. A credential that cannot read quota, or one not read yet, still takes every
+    /// column, as dots, so the rows keep their rhythm. When any account has a Fable window the list gains that column;
+    /// an account without one leaves it as a dash (its plan pays for Fable with credits, or has no such limit).
     @ViewBuilder private func cells(_ summary: QuotaSummary) -> some View {
         let unreadable = account.usage == nil && account.usageCapability == .unavailable
         let dimmed = !account.enabled || summary.stale
+        let kinds = model.quotaColumns, width = AccountColumns.cell(kinds.count)
         HStack(spacing: AccountColumns.cellGap) {
             if summary.windows.isEmpty {
-                QuotaCell(remaining: nil, placeholder: unreadable ? "读不到" : "未获取", caption: unreadable ? "无额度权限" : nil, dimmed: dimmed)
-                    .frame(width: AccountColumns.cell)
-                QuotaCell(remaining: nil, placeholder: unreadable ? "读不到" : "未获取", dimmed: dimmed)
-                    .frame(width: AccountColumns.cell)
+                ForEach(Array(kinds.enumerated()), id: \.element) { index, _ in
+                    QuotaCell(remaining: nil, placeholder: unreadable ? "读不到" : "未获取", caption: unreadable && index == 0 ? "无额度权限" : nil, dimmed: dimmed)
+                        .frame(width: width)
+                }
             } else {
-                ForEach(summary.windows, id: \.name) { window in
-                    QuotaCell(remaining: window.remaining, caption: window.caption, threshold: window.kind.threshold(in: model.thresholds), series: window.kind.series, dimmed: dimmed)
-                        .frame(width: AccountColumns.cell)
-                        .help(window.spoken)
+                ForEach(kinds, id: \.self) { kind in
+                    if let window = summary.windows.first(where: { $0.kind == kind }) {
+                        QuotaCell(remaining: window.remaining, caption: window.caption, threshold: window.kind.threshold(in: model.thresholds), series: window.kind.series, dimmed: dimmed)
+                            .frame(width: width)
+                            .help(window.spoken)
+                    } else {
+                        QuotaCell(remaining: nil, placeholder: "—", dimmed: true)
+                            .frame(width: width)
+                            .help("这个账号没有 Fable 专用额度")
+                    }
                 }
             }
         }

@@ -160,7 +160,7 @@ public enum LiveUsageFold {
             let live = event.snapshot, age = now.timeIntervalSince(live.sampledAt)
             guard let base = current, live.sampledAt > switchAt, age >= 0, age < maximumAge,
                   live.sampledAt >= base.sampledAt, live.sharesWindows(with: base, at: now) else { continue }
-            let reading = live.keepingHigher(than: base)
+            let reading = live.keepingHigher(than: base).keepingFable(from: base)
             accepted.append(reading)
             current = reading
         }

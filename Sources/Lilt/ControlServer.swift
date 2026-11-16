@@ -161,6 +161,9 @@ final class ControlServer {
         case "bypass":
             if let on = request.bypass { model.setSessionBypass(on) }
             return ControlReply(ok: true, bypass: model.sessionBypass)
+        case "end":
+            guard let session = request.session else { return .failure("没有指定要结束的独立会话。") }
+            return await model.endSessionNow(session, closingTerminals: request.force == true)
         default: return .failure("正在运行的 Lilt 不认识“\(request.action)”；重新打开 Lilt 后再试。")
         }
     }

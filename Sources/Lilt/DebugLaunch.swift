@@ -99,21 +99,23 @@ enum DebugLaunch {
     }
     @MainActor private static func seedRoster(_ model: AppModel) {
         let hour: TimeInterval = 3600, day: TimeInterval = 86400
-        // (label, 5-hour used, 5-hour reset, 7-day used, 7-day reset). A nil reset with 0 used is a window that has not started.
-        let rows: [(String, Double?, TimeInterval?, Double?, TimeInterval?)] = [
-            ("001", 58, 3 * hour, 8, 6.9 * day),
-            ("003", 95, 28 * 60, 40, 5 * day),
-            ("004", 0, nil, 31, 4 * day),
-            ("005", 0, nil, 10, 6 * day),
-            ("006", 70, -10 * 60, 67, 1 * day),
-            ("007", 0, nil, 20, -5 * 60),
-            ("009", 0, nil, 0, 6 * day),
+        // (label, 5-hour used, 5-hour reset, 7-day used, 7-day reset, Fable used). A nil reset with 0 used is a window
+        // that has not started; a nil Fable is a plan without that window.
+        let rows: [(String, Double?, TimeInterval?, Double?, TimeInterval?, Double?)] = [
+            ("001", 58, 3 * hour, 8, 6.9 * day, 12),
+            ("003", 95, 28 * 60, 40, 5 * day, 100),
+            ("004", 0, nil, 31, 4 * day, nil),
+            ("005", 0, nil, 10, 6 * day, 20),
+            ("006", 70, -10 * 60, 67, 1 * day, 85),
+            ("007", 0, nil, 20, -5 * 60, nil),
+            ("009", 0, nil, 0, 6 * day, 0),
         ]
-        model.library.accounts = rows.map { label, fiveUsed, fiveReset, sevenUsed, sevenReset in
+        model.library.accounts = rows.map { label, fiveUsed, fiveReset, sevenUsed, sevenReset, fableUsed in
             var account = Account(label: label, kind: .oauth)
             account.usage = UsageSnapshot(fiveHour: fiveUsed.map { UsageWindow(used: $0, resetsAt: fiveReset.map { .now.addingTimeInterval($0) }) },
                                           sevenDay: sevenUsed.map { UsageWindow(used: $0, resetsAt: sevenReset.map { .now.addingTimeInterval($0) }) },
-                                          source: "本地演示数据")
+                                          source: "本地演示数据",
+                                          fable: fableUsed.map { UsageWindow(used: $0, resetsAt: sevenReset.map { .now.addingTimeInterval($0) }) })
             account.usageCapability = .verified; account.hotSwitchCapability = .verified
             return account
         }

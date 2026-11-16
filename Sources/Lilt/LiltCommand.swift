@@ -20,6 +20,7 @@ enum LiltCommand {
       lilt 001 002 003     独立会话在这几个账号之间自动接力，先用写在前面的
       lilt 001 -- 提示词    -- 后面的全部交给 claude
       lilt ls              列出账号、额度和正在运行的独立会话
+      lilt end [账号]      立即结束独立会话，账号放回 Lilt；还有终端在用时先问，-f 不问、直接关掉那里的 claude
       lilt bypass on|off   开/关自动跳过权限确认（--dangerously-skip-permissions），默认开
       lilt 001 --permission-mode default   只这一次不跳过权限确认
       lilt -n 001          只打印将要执行的命令，不启动
@@ -49,6 +50,7 @@ enum LiltCommand {
             guard let reply = exchange(ControlRequest(action: "bypass", bypass: value)) else { return 1 }
             guard reply.ok else { printOutcome(reply); return 1 }
             printBypass(reply.bypass ?? true); return 0
+        case "end": return end(Array(arguments.dropFirst()))
         case "-n", "--dry-run": dry = true; arguments.removeFirst()
         default: break
         }
@@ -84,6 +86,63 @@ enum LiltCommand {
         guard let reply = exchange(ControlRequest(action: "session", ids: ids)) else { return 1 }
         guard reply.ok, let launch = reply.launch else { printOutcome(reply); return 1 }
         return start(claude, launch, passthrough: passthrough)
+    }
+
+    /// `lilt end [账号…] [-f]`: closes terminal sessions now. Without an account it takes the only session, or asks which.
+    /// A session that still has terminals on it is closed only once the user confirms (or with `-f`), and the claude in
+    /// those terminals quits first.
+    private static func end(_ words: [String]) -> Int32 {
+        var force = false, names: [String] = []
+        for word in words {
+            if word == "-f" || word == "--force" { force = true }
+            else if word.hasPrefix("-") { return fail("用法：lilt end [账号] [-f]") }
+            else { names.append(word) }
+        }
+        guard let list = exchange(ControlRequest(action: "list")) else { return 1 }
+        guard list.ok else { printOutcome(list); return 1 }
+        let sessions = (list.sessions ?? []).filter { $0.id != nil }
+        guard !sessions.isEmpty else {
+            if !(list.sessions ?? []).isEmpty { return fail("正在运行的 Lilt 还不支持 lilt end；重新打开 Lilt 后再试。") }
+            print("没有独立会话。"); return 0
+        }
+        var targets: [ControlSessionSummary] = []
+        if names.isEmpty, sessions.count == 1 {
+            targets = sessions
+        } else if names.isEmpty {
+            guard isatty(STDIN_FILENO) == 1 else { return fail("有 \(sessions.count) 个独立会话；写上其中一个账号，比如 lilt end 001。") }
+            for (index, session) in sessions.enumerated() { print(String(format: "%2d", index + 1) + "  " + describe(session)) }
+            print("结束哪一个（编号；回车取消）: ", terminator: ""); fflush(stdout)
+            let answer = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
+            guard !answer.isEmpty else { return 0 }
+            guard let number = Int(answer), sessions.indices.contains(number - 1) else { return fail("无效编号。") }
+            targets = [sessions[number - 1]]
+        } else {
+            let accounts = list.accounts ?? []
+            for name in names {
+                guard let index = resolve(name, among: accounts, typed: false) else { return 1 }
+                guard let session = sessions.first(where: { $0.accounts?.contains(accounts[index].id) == true }) else {
+                    return fail("“\(accounts[index].label)”不在独立会话里。")
+                }
+                if !targets.contains(where: { $0.id == session.id }) { targets.append(session) }
+            }
+        }
+        var code: Int32 = 0
+        for session in targets {
+            var closing = force
+            if session.terminals > 0, !force {
+                let pids = (session.pids ?? []).map(String.init).joined(separator: "、")
+                let what = "还有 \(session.terminals) 个终端在用这个会话" + (pids.isEmpty ? "" : "（claude pid \(pids)）")
+                guard isatty(STDIN_FILENO) == 1 else { _ = fail(what + "；加 -f 连它们一起关掉。"); code = 1; continue }
+                print(describe(session))
+                print(what + "。关掉这些 claude 并结束会话？[y/N] ", terminator: ""); fflush(stdout)
+                guard ["y", "yes"].contains((readLine() ?? "").trimmingCharacters(in: .whitespaces).lowercased()) else { print("没有结束。"); continue }
+                closing = true
+            }
+            guard let reply = exchange(ControlRequest(action: "end", session: session.id, force: closing)) else { return 1 }
+            printOutcome(reply)
+            if !reply.ok { code = 1 }
+        }
+        return code
     }
 
     /// Replaces this process with Claude Code on the session's login. Only on failure does it return.
@@ -212,20 +271,29 @@ enum LiltCommand {
         let accounts = reply.accounts ?? []
         guard !accounts.isEmpty else { print("Lilt 里还没有账号；在 Lilt 里添加。"); return }
         let width = accounts.map { displayWidth($0.label) }.max() ?? 0
-        for (index, account) in accounts.enumerated() { print(row(account, number: index + 1, width: width)) }
+        let fable = accounts.contains { $0.fable != nil }
+        for (index, account) in accounts.enumerated() { print(row(account, number: index + 1, width: width, fable: fable)) }
         for session in reply.sessions ?? [] {
-            var line = "独立会话：" + (session.holding ?? "准备中")
-            if session.pool.count > 1 { line += " · 在 \(session.pool.joined(separator: "、")) 间接力" }
-            line += session.terminals > 0 ? " · \(session.terminals) 个终端" : " · 已结束，正在收尾"
-            print(paint(line, "36"))
+            var line = paint(describe(session), "36")
+            if session.terminals == 0, session.id != nil { line += paint("（lilt end 立即结束）", "2") }
+            print(line)
             if let note = session.note { print("  " + paint(note, "2")) }
         }
     }
 
-    private static func row(_ account: ControlAccount, number: Int, width: Int) -> String {
+    private static func describe(_ session: ControlSessionSummary) -> String {
+        var line = "独立会话：" + (session.holding ?? "准备中")
+        if session.pool.count > 1 { line += " · 在 \(session.pool.joined(separator: "、")) 间接力" }
+        line += session.terminals > 0 ? " · \(session.terminals) 个终端" : " · 已结束，正在收尾"
+        return line
+    }
+
+    /// `fable`: some account has a Fable weekly window, so every row gets that column (a dash where there is none).
+    private static func row(_ account: ControlAccount, number: Int, width: Int, fable: Bool = false) -> String {
         let name = account.label + String(repeating: " ", count: max(0, width - displayWidth(account.label)))
         let five = "5小时 " + leftPad(percent(account.fiveHour), 4)
-        let week = "7天 " + leftPad(account.noWeeklyLimit ? "不限" : percent(account.sevenDay), 4)
+        var week = "7天 " + leftPad(account.noWeeklyLimit ? "不限" : percent(account.sevenDay), 4)
+        if fable { week += "  Fable " + leftPad(percent(account.fable), 4) }
         var notes: [String] = []
         if !account.enabled { notes.append("已停用") }
         if account.project { notes.append("项目专用") }

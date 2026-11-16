@@ -4,11 +4,16 @@ import Foundation
 /// directory. The app writes the session's login, so a session goes through the same journal, renewal and relay rules
 /// as the default login. Nothing here carries a credential: the reply names a directory, never what is in it.
 public struct ControlRequest: Codable, Equatable, Sendable {
-    /// `list`, `session` (with `ids`) or `bypass` (with `bypass` to change it, without to ask).
+    /// `list`, `session` (with `ids`), `bypass` (with `bypass` to change it, without to ask) or `end` (with `session`;
+    /// `force` also closes the terminals still on it).
     public var action: String
     public var ids: [UUID]?
     public var bypass: Bool?
-    public init(action: String, ids: [UUID]? = nil, bypass: Bool? = nil) { self.action = action; self.ids = ids; self.bypass = bypass }
+    public var session: UUID?
+    public var force: Bool?
+    public init(action: String, ids: [UUID]? = nil, bypass: Bool? = nil, session: UUID? = nil, force: Bool? = nil) {
+        self.action = action; self.ids = ids; self.bypass = bypass; self.session = session; self.force = force
+    }
 }
 
 /// One account as `lilt` lists it, in the relay order the app shows.
@@ -29,11 +34,13 @@ public struct ControlAccount: Codable, Equatable, Sendable {
     public var sevenDay: Double?
     public var noWeeklyLimit: Bool
     public var sampledAt: Date?
+    /// What is left of the Fable weekly window; nil for a plan without one (or an app too old to say).
+    public var fable: Double?
     public init(id: UUID, label: String, active: Bool, enabled: Bool, project: Bool, sessionHeld: Bool = false, sessionSpare: Bool = false,
-                fiveHour: Double?, sevenDay: Double?, noWeeklyLimit: Bool, sampledAt: Date?) {
+                fiveHour: Double?, sevenDay: Double?, noWeeklyLimit: Bool, sampledAt: Date?, fable: Double? = nil) {
         self.id = id; self.label = label; self.active = active; self.enabled = enabled; self.project = project
         self.sessionHeld = sessionHeld; self.sessionSpare = sessionSpare
-        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.noWeeklyLimit = noWeeklyLimit; self.sampledAt = sampledAt
+        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.noWeeklyLimit = noWeeklyLimit; self.sampledAt = sampledAt; self.fable = fable
     }
 }
 
@@ -43,8 +50,14 @@ public struct ControlSessionSummary: Codable, Equatable, Sendable {
     public var holding: String?
     public var terminals: Int
     public var note: String?
-    public init(pool: [String], holding: String?, terminals: Int, note: String?) {
+    /// What `lilt end` needs: the session to name, its accounts to find it by, and the processes still on it. Optional
+    /// so a command and an app from different versions still understand each other's lists.
+    public var id: UUID?
+    public var accounts: [UUID]?
+    public var pids: [Int32]?
+    public init(pool: [String], holding: String?, terminals: Int, note: String?, id: UUID? = nil, accounts: [UUID]? = nil, pids: [Int32]? = nil) {
         self.pool = pool; self.holding = holding; self.terminals = terminals; self.note = note
+        self.id = id; self.accounts = accounts; self.pids = pids
     }
 }
 

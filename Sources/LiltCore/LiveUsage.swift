@@ -74,6 +74,15 @@ public extension UsageSnapshot {
         result.sevenDay = merged(sevenDay, earlier.sevenDay)
         return result
     }
+    /// This reading with `earlier`'s Fable window, and the time that window was read, when it has none of its own. The
+    /// status line never reports Fable, so without this every status line reading would blank the figure the usage
+    /// endpoint gave.
+    func keepingFable(from earlier: UsageSnapshot) -> UsageSnapshot {
+        guard fable == nil, let window = earlier.fable else { return self }
+        var result = self
+        result.fable = window; result.fableSampledAt = earlier.fableSampledAt ?? earlier.sampledAt
+        return result
+    }
 }
 
 /// How fast the account in use is being spent, so a hand-off can start before the threshold instead of after it.

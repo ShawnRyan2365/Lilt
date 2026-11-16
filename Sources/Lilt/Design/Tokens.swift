@@ -76,6 +76,12 @@ enum Tokens {
                                 lightHigh: .init(0.110, 0.361, 0.671), darkHigh: .init(0.427, 0.655, 0.925))
     static let sevenDay = Paint(light: .init(0.086, 0.627, 0.439), dark: .init(0.098, 0.620, 0.439),
                                 lightHigh: .init(0.039, 0.455, 0.314), darkHigh: .init(0.235, 0.776, 0.565))
+    /// Fable's own weekly window: magenta (OKLCH hue 342), stepped per mode. With blue and aqua it passes the dataviz
+    /// validator in both modes (all pairs: worst colour-blind ΔE 8.5 light, 8.4 dark; normal vision ≥ 20.9) on
+    /// Lilt's surfaces. Violet was too close to blue and orange or yellow would read as warning, so this one. It is
+    /// always drawn beside the word "Fable", never as colour alone.
+    static let fable = Paint(light: .init(0.816, 0.204, 0.643), dark: .init(0.871, 0.263, 0.694),
+                             lightHigh: .init(0.647, 0.133, 0.506), darkHigh: .init(0.945, 0.533, 0.800))
 
     // MARK: Accent
     /// Lilt green: the brand mark, and `.tint()` for the few system controls left (settings, focus rings).

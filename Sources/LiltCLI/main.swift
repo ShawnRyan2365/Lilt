@@ -42,7 +42,8 @@ func printLibrary(_ library: Library) {
         let active = account.id == library.activeID ? "*" : " "
         let disabled = account.enabled ? "" : " [已停用]"
         let issue = UsageFailure.shown(account.issue, capability: account.usageCapability).map { " · \($0)" } ?? ""
-        print("\(active) \(index + 1). \(account.label)\(disabled) · 5小时剩 \(remaining(account.usage?.fiveHour)) · 7天剩 \(remaining(account.usage?.sevenDay))\(issue)")
+        let fable = account.usage?.fable.map { " · Fable剩 \(remaining($0))" } ?? ""
+        print("\(active) \(index + 1). \(account.label)\(disabled) · 5小时剩 \(remaining(account.usage?.fiveHour)) · 7天剩 \(remaining(account.usage?.sevenDay))\(fable)\(issue)")
     }
 }
 func printStatus(_ response: DaemonResponse) {

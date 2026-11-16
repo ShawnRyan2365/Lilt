@@ -575,6 +575,7 @@ struct MenuPanel: View {
                     let unreadable = active.usageCapability == .unavailable
                     UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.thresholds.fiveHour, unreadable: unreadable, compact: true)
                     UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.thresholds.sevenDay, unreadable: unreadable, compact: true)
+                    if active.usage?.fable != nil { UsageMeter(kind: .fable, snapshot: active.usage, threshold: 0, compact: true) }
                 }
             } else if model.accounts.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {

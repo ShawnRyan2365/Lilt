@@ -182,6 +182,8 @@ final class AppModel {
     private var sessionPace: [UUID: (account: UUID, readings: [UsageSnapshot])] = [:]
     private var sessionRuntime: (UUID) -> RuntimeScope = { RuntimeScope(session: $0) }
     private var leaseAlive: (SessionLease) -> Bool = { ProcessLease.alive($0) }
+    /// Asks a terminal's Claude Code to quit, for `lilt end` when the user said to close the terminals still on it.
+    private var leaseEnd: (SessionLease) -> Void = { ProcessLease.terminate($0) }
     private var requestGap: TimeInterval = 2
     /// The profile endpoint, asked only when a scope's own records cannot say whose login it holds. Regression checks
     /// replace it so that no fixture token ever leaves the machine.
@@ -248,7 +250,7 @@ final class AppModel {
          projects: ProjectCatalog = ProjectCatalog(), projectRuntime: ((ProjectBinding) -> RuntimeScope)? = nil,
          identityFetch: ((Credential) async -> Data?)? = nil, tokenRenew: ((Credential) async throws -> Credential)? = nil,
          sessions: SessionCatalog = SessionCatalog(), sessionRuntime: ((UUID) -> RuntimeScope)? = nil,
-         leaseAlive: ((SessionLease) -> Bool)? = nil) {
+         leaseAlive: ((SessionLease) -> Bool)? = nil, leaseEnd: ((SessionLease) -> Void)? = nil) {
         retryClock = { .now }
         self.library = library
         fixtureRuntime = runtime
@@ -256,6 +258,7 @@ final class AppModel {
         sessionCatalog = sessions
         if let sessionRuntime { self.sessionRuntime = sessionRuntime }
         if let leaseAlive { self.leaseAlive = leaseAlive }
+        if let leaseEnd { self.leaseEnd = leaseEnd }
         if let usageFetch { self.usageFetch = usageFetch }
         if let tokenRenew { self.tokenRenew = tokenRenew }
         if let projectRuntime { self.projectRuntime = projectRuntime }
@@ -374,7 +377,8 @@ final class AppModel {
                                   sessionHeld: held.contains(account.id), sessionSpare: pooled.contains(account.id) && !held.contains(account.id),
                                   fiveHour: usage.flatMap { $0.lastKnownRemaining($0.fiveHour, at: now) },
                                   sevenDay: usage.flatMap { $0.lastKnownRemaining($0.sevenDay, at: now) },
-                                  noWeeklyLimit: usage?.hasNoWeeklyLimit == true, sampledAt: usage?.sampledAt)
+                                  noWeeklyLimit: usage?.hasNoWeeklyLimit == true, sampledAt: usage?.sampledAt,
+                                  fable: usage.flatMap { $0.lastKnownRemaining($0.fable, at: now) })
         }
         return ControlReply(ok: true, accounts: rows, sessions: sessionSummaries, bypass: sessionBypass)
     }
@@ -624,6 +628,8 @@ final class AppModel {
                 do { try await syncProject(project, target: account, reauthorized: true) } catch { failProject(project.id, error) }
             }
         }
+        // Likewise a terminal session holding it.
+        await reauthorizeSession(holding: id)
         guard id == library.activeID, library.preferences.scopeEnabled else { return }
         // Whatever the scope held for this account is superseded by what the user just saved.
         let runtime = self.runtime
@@ -1506,7 +1512,8 @@ final class AppModel {
         library.preferences.keepAPIMode = nil
         for (i, name) in ["日常创作", "深度工作", "备用账号"].enumerated() {
             var account = Account(label: name, kind: i == 2 ? .setupToken : .oauth)
-            account.usage = UsageSnapshot(fiveHour: UsageWindow(used: [28.0, 8, 56][i], resetsAt: .now.addingTimeInterval(7200)), sevenDay: UsageWindow(used: [46.0, 21, 62][i], resetsAt: .now.addingTimeInterval(259200)), source: "本地演示数据")
+            account.usage = UsageSnapshot(fiveHour: UsageWindow(used: [28.0, 8, 56][i], resetsAt: .now.addingTimeInterval(7200)), sevenDay: UsageWindow(used: [46.0, 21, 62][i], resetsAt: .now.addingTimeInterval(259200)), source: "本地演示数据",
+                                          fable: i == 2 ? nil : UsageWindow(used: [64.0, 18][i], resetsAt: .now.addingTimeInterval(259200)))
             account.usageCapability = .verified; account.hotSwitchCapability = .verified
             library.accounts.append(account)
         }
@@ -1523,7 +1530,10 @@ final class AppModel {
     /// Demo samples stay current the way a live poll would keep them, so the walkthrough does not expire mid-read.
     private func touchDemoSamples() {
         guard demo else { return }
-        for index in library.accounts.indices { library.accounts[index].usage?.sampledAt = .now; library.accounts[index].lastChecked = .now }
+        for index in library.accounts.indices {
+            library.accounts[index].usage?.sampledAt = .now; library.accounts[index].lastChecked = .now
+            if library.accounts[index].usage?.fable != nil { library.accounts[index].usage?.fableSampledAt = .now }
+        }
     }
     func simulateThreshold() async {
         guard demo, let id = active?.id else { return }
@@ -1531,7 +1541,8 @@ final class AppModel {
         let used = 100 - thresholds.fiveHour // read before `update` takes exclusive access to the library
         update(id) {
             let old = $0.usage
-            $0.usage = UsageSnapshot(fiveHour: UsageWindow(used: used, resetsAt: old?.fiveHour?.resetsAt), sevenDay: UsageWindow(used: old?.sevenDay?.used ?? 45, resetsAt: old?.sevenDay?.resetsAt), source: "本地演示数据")
+            $0.usage = UsageSnapshot(fiveHour: UsageWindow(used: used, resetsAt: old?.fiveHour?.resetsAt), sevenDay: UsageWindow(used: old?.sevenDay?.used ?? 45, resetsAt: old?.sevenDay?.resetsAt), source: "本地演示数据",
+                                     fable: old?.fable)
         }
         if autoRelay { await relay() } else { status = "演示额度已到阈值，开启自动接力可查看结果" }
     }
@@ -2173,8 +2184,9 @@ extension AppModel {
     private func label(_ id: UUID) -> String { library.accounts.first { $0.id == id }?.label ?? "已删除的账号" }
     var sessionSummaries: [ControlSessionSummary] {
         sessionCatalog.sessions.map { session in
-            ControlSessionSummary(pool: session.pool.map(label), holding: session.holding.map(label),
-                                  terminals: session.leases.filter(leaseAlive).count, note: session.note)
+            let alive = session.leases.filter(leaseAlive)
+            return ControlSessionSummary(pool: session.pool.map(label), holding: session.holding.map(label), terminals: alive.count,
+                                         note: session.note, id: session.id, accounts: session.pool, pids: alive.map(\.pid))
         }
     }
     /// How an account row names its part in a session: in its scope, or waiting in its pool. Nil for neither.
@@ -2312,27 +2324,125 @@ extension AppModel {
                 updateSession(session.id) { $0.leases = alive; if alive.isEmpty, $0.endedAt == nil { $0.endedAt = .now } }
                 changed = true
             }
-            if alive.isEmpty, await endSession(session.id) { changed = true }
+            if alive.isEmpty, case .ended = await endSession(session.id) { changed = true }
         }
         if changed { saveSessions() }
     }
-    private func endSession(_ id: UUID) async -> Bool {
-        guard sessionBusy.insert(id).inserted else { return false }
+    enum SessionEnding: Equatable {
+        /// Cleared. `lost` names the account whose login in the scope could not be accounted for and was dropped.
+        case ended(lost: String?)
+        /// Not yet: a read-back that may still succeed (`waiting`), or another step on this session under way (`busy`).
+        case waiting, busy
+        case failed(String)
+    }
+    /// Reads back the login of a session whose terminals are gone, clears its scope and gives its accounts back. A
+    /// login that cannot be accounted for yet is waited for up to `SessionRules.readBackGrace`, unless `forced`
+    /// (`lilt end`) or the user has since saved a newer login for that account, which leaves nothing to keep.
+    /// `replaced` means the user just did so: the older copy is then not read back at all, so it cannot go over the new one.
+    private func endSession(_ id: UUID, forced: Bool = false, replaced: Bool = false) async -> SessionEnding {
+        guard sessionBusy.insert(id).inserted else { return .busy }
         defer { sessionBusy.remove(id) }
-        guard let session = sessionCatalog.session(id: id) else { return false }
+        guard let session = sessionCatalog.session(id: id) else { return .ended(lost: nil) }
         let scope = sessionRuntime(id)
         let held: Credential?
-        do { held = try await IOQueue.run { try scope.currentCredential() } } catch { return false }
-        if held != nil, let holder = session.holding, let account = library.accounts.first(where: { $0.id == holder }) {
-            guard let verdict = try? await projectReadBack(account, in: scope) else { return false }
-            if verdict == .unverifiable, Date.now.timeIntervalSince(session.endedAt ?? .now) < SessionRules.readBackGrace { return false }
-            if verdict == .unverifiable || verdict == .foreign { SwitchLog.record("session-unverified") }
+        do { held = try await IOQueue.run { try scope.currentCredential() } }
+        catch { return .failed(Self.reason(error) ?? "会话的登录暂时读不出来。") }
+        var lost: String?
+        if !replaced, let held, let holder = session.holding, let account = library.accounts.first(where: { $0.id == holder }) {
+            // Nil when the read-back itself failed (a keychain or disk read): like an unproven login, worth another try.
+            let verdict = try? await projectReadBack(account, in: scope)
+            if verdict != .adopt, verdict != .unchanged {
+                let stored = await IOQueue.perform { (try? AccountVault.read(account: holder.uuidString)) ?? nil }
+                let outdated = stored.map { SessionRules.superseded(stored: $0, held: held.data) } ?? false
+                let unproven = verdict == nil || verdict == .unverifiable
+                if unproven, !outdated, !forced, Date.now.timeIntervalSince(session.endedAt ?? .now) < SessionRules.readBackGrace { return .waiting }
+                if !outdated {
+                    SwitchLog.record("session-unverified")
+                    if unproven { lost = account.label }
+                }
+            }
         }
-        do { try await IOQueue.run { try scope.discard() } } catch { return false }
+        do { try await IOQueue.run { try scope.discard() } }
+        catch { return .failed(Self.reason(error) ?? "会话的登录没能清掉。") }
         sessionCatalog.sessions.removeAll { $0.id == id }
         sessionPace[id] = nil
-        SwitchLog.record("session-end")
-        return true
+        SwitchLog.record("session-end", detail: forced ? "forced" : replaced ? "replaced" : nil)
+        return .ended(lost: lost)
+    }
+
+    /// `lilt end`: closes a session now rather than when it finishes by itself. Terminals still on it are closed first,
+    /// and only when the user said so (`closingTerminals`): their CLI has to be gone before its login is read back, or
+    /// it could renew that login after Lilt let it go. A login that cannot be accounted for is not waited for; the
+    /// reply says which account it was.
+    func endSessionNow(_ id: UUID, closingTerminals: Bool) async -> ControlReply {
+        guard !demo else { return .failure("Lilt 正在演示模式；先在 Lilt 里退出演示。") }
+        guard storageAvailable else { return .failure("Lilt 的本地数据不可用，没有改动。") }
+        guard let session = sessionCatalog.session(id: id) else { return ControlReply(ok: true, lines: ["这个独立会话已经结束了。"]) }
+        let names = session.pool.map(label).joined(separator: "、")
+        let alive = session.leases.filter(leaseAlive)
+        if !alive.isEmpty {
+            guard closingTerminals else {
+                return .failure("还有 \(alive.count) 个终端在用这个会话；先退出那里的 claude，或者用 lilt end -f 连它们一起关掉。")
+            }
+            for lease in alive { leaseEnd(lease) }
+            let deadline = Date.now.addingTimeInterval(10)
+            while Date.now < deadline, alive.contains(where: leaseAlive) { try? await Task.sleep(for: .milliseconds(250)) }
+            let left = alive.filter(leaseAlive)
+            guard left.isEmpty else {
+                return .failure("claude（pid \(left.map { String($0.pid) }.joined(separator: "、"))）没有退出；在那个终端里退出它后再试。")
+            }
+        }
+        updateSession(id) { $0.leases = []; if $0.endedAt == nil { $0.endedAt = .now } }
+        // A hand-off under way finishes first.
+        var outcome = await endSession(id, forced: true), tries = 0
+        while outcome == .busy, tries < 60 {
+            try? await Task.sleep(for: .milliseconds(500))
+            outcome = await endSession(id, forced: true); tries += 1
+        }
+        saveSessions()
+        switch outcome {
+        case .ended(let lost):
+            status = "已结束独立会话（\(names)）"
+            var lines = ["已结束独立会话（\(names)），这些账号回到 Lilt 里可用。"]
+            if let lost { lines.append("会话里“\(lost)”的登录没能确认是同一个，已丢弃；之后它若读不到额度，在 Lilt 里重新授权。") }
+            return ControlReply(ok: true, lines: lines)
+        case .waiting, .busy: return .failure("这个独立会话正在换号，稍后再试。")
+        case .failed(let reason): return .failure("没能结束独立会话：\(reason)")
+        }
+    }
+
+    /// The user just saved a new login for `id`. A terminal session holding it takes the new one as a project would: a
+    /// running session's CLI moves to it, and a session whose terminals are gone is closed now. Either way the older
+    /// copy in the session is never read back over the new one.
+    private func reauthorizeSession(holding id: UUID) async {
+        guard !demo, storageAvailable, let session = sessionCatalog.session(holding: id), let account = sessionAccount(id) else { return }
+        guard session.leases.contains(where: leaseAlive) else {
+            updateSession(session.id) { $0.leases = []; if $0.endedAt == nil { $0.endedAt = .now } }
+            var outcome = await endSession(session.id, replaced: true), tries = 0
+            while outcome == .busy, tries < 60 {
+                try? await Task.sleep(for: .milliseconds(500))
+                outcome = await endSession(session.id, replaced: true); tries += 1
+            }
+            saveSessions()
+            return
+        }
+        var tries = 0
+        while sessionBusy.contains(session.id), tries < 60 { try? await Task.sleep(for: .milliseconds(500)); tries += 1 }
+        guard sessionCatalog.session(id: session.id)?.holding == id, sessionBusy.insert(session.id).inserted else { return }
+        defer { sessionBusy.remove(session.id) }
+        let scope = sessionRuntime(session.id)
+        do {
+            // What the scope holds was replaced on purpose, so it is taken as the baseline instead of read back.
+            try await IOQueue.run { try scope.rebaseline() }
+            try await writeSession(session.id, to: account, scope: scope)
+            updateSession(session.id) { $0.note = nil; $0.retryAt = nil }
+            SwitchLog.record("session-reauthorized")
+        } catch {
+            let reason = Self.reason(error) ?? "凭据应用失败。"
+            logFailure("session-reauthorize-failed", reason)
+            updateSession(session.id) { $0.note = "新的登录没能写进独立会话：\(reason)结束这个会话（lilt end）后重新打开。" }
+        }
+        saveSessions()
     }
 
     /// Takes in the status line events of each session's terminals, as for the default login. True when one moved.
@@ -2471,4 +2581,7 @@ enum ProcessLease {
     }
     static func lease(pid: pid_t) -> SessionLease? { startTime(pid).map { SessionLease(pid: pid, started: $0) } }
     static func alive(_ lease: SessionLease) -> Bool { startTime(lease.pid) == lease.started }
+    /// Asks the terminal's Claude Code to quit. Only the process the lease names: a pid that came back as some other
+    /// process is left alone.
+    static func terminate(_ lease: SessionLease) { if alive(lease) { kill(lease.pid, SIGTERM) } }
 }

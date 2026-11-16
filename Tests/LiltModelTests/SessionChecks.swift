@@ -38,8 +38,10 @@ final class SessionKeychains: @unchecked Sendable {
     try scope.rebaseline()
     let keychains = SessionKeychains()
     var alive: Set<Int32> = [101, 102]
+    var terminated: [Int32] = []
     let model = AppModel(fixture: library, runtime: scope, usageFetch: { _ in throw UsageFailure.network },
-                         identityFetch: { _ in nil }, sessionRuntime: { keychains.scope($0) }, leaseAlive: { alive.contains($0.pid) })
+                         identityFetch: { _ in nil }, sessionRuntime: { keychains.scope($0) }, leaseAlive: { alive.contains($0.pid) },
+                         leaseEnd: { terminated.append($0.pid); alive.remove($0.pid) })
     let defaultBefore = held
 
     // The default login's account, or nothing at all, is refused.
@@ -126,7 +128,78 @@ final class SessionKeychains: @unchecked Sendable {
     alive = []
     await model.reapSessions()
     precondition(model.sessionCatalog.sessions.isEmpty)
-    print("PASS: terminal sessions — own scope and signal, default login untouched, default-login account refused, accounts reserved from default relay, deletion and projects, one account per session, same accounts join, pool hand-off keeping the CLI's renewal, waiting with a reason, permission bypass setting, read back and cleared when terminals end.")
+
+    // The account in a session is signed in again while it runs (here a setup token): the session's CLI is moved to
+    // the new login, and the older copy is not read back over it when the session ends.
+    let solo = SessionRules.scopeID(pool: [first.id])
+    alive = [105]
+    reply = await model.startSession([first.id], lease: SessionLease(pid: 105, started: 5))
+    precondition(reply.ok && model.sessionCatalog.session(id: solo)?.holding == first.id)
+    let freshToken = "sk-ant-oat01-fixture-session-reauthorized"
+    let saveFailure = await model.addToken(label: "Fixture S1", token: freshToken, replacing: first.id)
+    precondition(saveFailure == nil, "the new login was not saved: \(saveFailure ?? "")")
+    let fresh = try AccountVault.read(account: first.id.uuidString)
+    precondition(keychains.items[solo] == fresh, "a running session kept the login the user replaced")
+    alive = []
+    await model.reapSessions()
+    precondition(model.sessionCatalog.sessions.isEmpty && keychains.items[solo] == nil)
+    let keptFresh = try AccountVault.read(account: first.id.uuidString)
+    precondition(keptFresh == fresh, "the session's older copy went over the new login")
+
+    // The user's case: the terminal is gone, and the account had been signed in again (by a Lilt without the step
+    // above) while the session held its older login. Nothing can prove that copy, and nothing in it is worth keeping:
+    // the session is cleared at once rather than shown as finishing for half an hour.
+    try AccountVault.write(fixtureLogin("session-s2"), account: first.id.uuidString)
+    alive = [106]
+    reply = await model.startSession([first.id], lease: SessionLease(pid: 106, started: 6))
+    precondition(reply.ok && keychains.items[solo] == fixtureLogin("session-s2"))
+    var again = try JSONSerialization.jsonObject(with: fixtureLogin("session-s1")) as! [String: Any]
+    var againOAuth = again["claudeAiOauth"] as! [String: Any]
+    againOAuth["accessToken"] = "fixture-access-session-s1-again"; againOAuth["refreshToken"] = "fixture-refresh-session-s1-again"
+    againOAuth["expiresAt"] = 4_102_448_400_000.0
+    again["claudeAiOauth"] = againOAuth
+    let signedInAgain = try JSONSerialization.data(withJSONObject: again)
+    try AccountVault.write(signedInAgain, account: first.id.uuidString)
+    alive = []
+    await model.reapSessions()
+    precondition(model.sessionCatalog.sessions.isEmpty && keychains.items[solo] == nil, "an ended session with a replaced login kept waiting")
+    let keptAgain = try AccountVault.read(account: first.id.uuidString)
+    precondition(keptAgain == signedInAgain && model.reservedAccountIDs.isEmpty)
+
+    // The session's CLI renewed its login with a new refresh token and nothing proves whose it is: an ended session
+    // waits for a proof, and `lilt end` closes it now and says which login it dropped.
+    alive = [107]
+    reply = await model.startSession([first.id], lease: SessionLease(pid: 107, started: 7))
+    precondition(reply.ok)
+    var rotated = try JSONSerialization.jsonObject(with: signedInAgain) as! [String: Any]
+    var rotatedOAuth = rotated["claudeAiOauth"] as! [String: Any]
+    rotatedOAuth["accessToken"] = "fixture-access-session-s1-rotated"; rotatedOAuth["refreshToken"] = "fixture-refresh-session-s1-rotated"
+    rotatedOAuth["expiresAt"] = 4_102_452_000_000.0
+    rotated["claudeAiOauth"] = rotatedOAuth
+    keychains.items[solo] = try JSONSerialization.data(withJSONObject: rotated)
+    alive = []
+    await model.reapSessions()
+    precondition(model.sessionCatalog.session(id: solo)?.endedAt != nil && keychains.items[solo] != nil, "an unproven login was not waited for")
+    precondition(model.commandLineList().sessions?.first?.terminals == 0 && model.commandLineList().sessions?.first?.id == solo)
+    reply = await model.endSessionNow(solo, closingTerminals: false)
+    precondition(reply.ok && reply.lines.count == 2 && reply.lines[1].contains("Fixture S1"), "lilt end did not say what it dropped: \(reply.lines)")
+    precondition(model.sessionCatalog.sessions.isEmpty && keychains.items[solo] == nil && model.reservedAccountIDs.isEmpty)
+    let notTaken = try AccountVault.read(account: first.id.uuidString)
+    precondition(notTaken == signedInAgain, "an unproven login was taken in")
+
+    // A terminal still on it: `lilt end` refuses unless told to close it, and then ends its claude before reading back.
+    alive = [108]
+    reply = await model.startSession([first.id], lease: SessionLease(pid: 108, started: 8))
+    precondition(reply.ok)
+    reply = await model.endSessionNow(solo, closingTerminals: false)
+    precondition(!reply.ok && reply.lines[0].contains("1 个终端") && terminated.isEmpty && model.sessionCatalog.session(id: solo) != nil)
+    precondition(model.commandLineList().sessions?.first?.pids == [108])
+    reply = await model.endSessionNow(solo, closingTerminals: true)
+    precondition(reply.ok && reply.lines.count == 1 && terminated == [108], "lilt end -f did not close the terminal: \(reply.lines)")
+    precondition(model.sessionCatalog.sessions.isEmpty && keychains.items[solo] == nil && model.reservedAccountIDs.isEmpty)
+    reply = await model.endSessionNow(solo, closingTerminals: false)
+    precondition(reply.ok, "ending a session that is gone is not an error")
+    print("PASS: terminal sessions — own scope and signal, default login untouched, default-login account refused, accounts reserved from default relay, deletion and projects, one account per session, same accounts join, pool hand-off keeping the CLI's renewal, waiting with a reason, permission bypass setting, read back and cleared when terminals end, a new login reaching a running session, an ended session with a replaced login cleared at once, lilt end with and without terminals.")
 }
 
 /// The default status line script tells sessions apart: Lilt's own terminal sessions record into their own spool and

@@ -394,6 +394,61 @@ final class RelayTests {
         let s = try UsageParser.parse(Data("{\"five_hour\":{\"utilization\":99},\"seven_day\":null}".utf8), at: now)
         expect(s.exhausted(threshold: 1, at: now)); expectFalse(s.available(threshold: 1, at: now))
     }
+    /// The Fable window: read from the usage endpoint's `limits[]` the way Claude Code picks "Current week (Fable)", kept
+    /// through status line readings with its own time, read again every 15 minutes while live readings hold polling
+    /// back, and never part of relay decisions.
+    func testFableWindow() throws {
+        // Shaped like a real response (Claude Code's cached copy, 2026-11-16), figures and times made up.
+        let body = #"""
+        {"five_hour":{"utilization":40,"resets_at":"2027-01-15T10:00:00.5+00:00"},"seven_day":{"utilization":30,"resets_at":"2027-01-19T03:00:00+00:00"},
+         "seven_day_cowork":{"utilization":0,"resets_at":"2027-01-19T03:00:00+00:00"},
+         "limits":[{"kind":"session","group":"session","percent":40,"resets_at":"2027-01-15T10:00:00.5+00:00","scope":null,"severity":"normal","is_active":true},
+                   {"kind":"weekly_all","group":"weekly","percent":30,"resets_at":"2027-01-19T03:00:00+00:00","scope":null,"severity":"normal","is_active":false},
+                   {"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":"2027-01-19T03:00:00+00:00","scope":{"model":null,"surface":{"display_name":"Cowork"}},"severity":"normal","is_active":false},
+                   {"kind":"weekly_scoped","group":"weekly","percent":62,"resets_at":"2027-01-19T03:00:00+00:00","scope":{"model":{"display_name":"Fable"},"surface":null},"severity":"warning","is_active":false}]}
+        """#
+        let read = try UsageParser.parse(Data(body.utf8), at: now)
+        expectEqual(read.fable?.used, 62); expectEqual(read.fableSampledAt, now)
+        expect(read.fable?.resetsAt == ISO8601DateFormatter().date(from: "2027-01-19T03:00:00Z"))
+        // No row, a surface row, a name that only starts with the letters, or a malformed row: no Fable, and the read stands.
+        for limits in ["", #","limits":null"#, #","limits":[{"kind":"weekly_scoped","percent":5,"scope":{"surface":{"display_name":"Fable"}}}]"#,
+                       #","limits":[{"kind":"weekly_scoped","percent":5,"scope":{"model":{"display_name":"Fabled"}}}]"#,
+                       #","limits":[{"kind":"weekly_scoped","percent":true,"scope":{"model":{"display_name":"Fable"}}}]"#,
+                       #","limits":[{"kind":"weekly_scoped","percent":101,"scope":{"model":{"display_name":"Fable"}}}]"#,
+                       #","limits":[{"kind":"weekly_scoped","percent":5,"resets_at":"soon","scope":{"model":{"display_name":"Fable"}}}]"#,
+                       #","limits":[{"kind":"weekly_all","percent":5,"scope":{"model":{"display_name":"Fable"}}}]"#] {
+            let plain = try UsageParser.parse(Data((#"{"five_hour":{"utilization":10}"# + limits + "}").utf8), at: now)
+            expect(plain.fable == nil && plain.fableSampledAt == nil && plain.fiveHour?.used == 10)
+        }
+        // Several Fable rows ("Fable 5.2", any case): the fullest counts. No reset time is allowed.
+        let two = try UsageParser.parse(Data(#"{"five_hour":{"utilization":10},"limits":[{"kind":"weekly_scoped","percent":20,"scope":{"model":{"display_name":"FABLE 5.2"}}},{"kind":"weekly_scoped","percent":35,"scope":{"model":{"display_name":"Fable"}}}]}"#.utf8), at: now)
+        expectEqual(two.fable?.used, 35); expect(two.fable?.resetsAt == nil)
+        // A saved reading from before Fable decodes, without one.
+        let old = try JSONDecoder().decode(UsageSnapshot.self, from: Data(#"{"fiveHour":{"used":10},"sampledAt":800000000,"source":"x"}"#.utf8))
+        expect(old.fable == nil && old.fableSampledAt == nil)
+        // Relay never reads it: a Fable window used up leaves the account available.
+        var spent = read; spent.fable = UsageWindow(used: 100, resetsAt: now.addingTimeInterval(86400))
+        expect(spent.available(threshold: 1, at: now)); expectFalse(spent.exhausted(threshold: 1, at: now))
+        // Status line readings keep the polled Fable figure and the time it was read.
+        let resets = (read.fiveHour?.resetsAt ?? now, read.sevenDay?.resetsAt ?? now)
+        func event(_ used: Double, at date: Date) -> LiveUsageEvent {
+            LiveUsageEvent(id: UUID().uuidString, scope: LiveUsageEvent.defaultScope, snapshot: UsageSnapshot(
+                fiveHour: UsageWindow(used: used, resetsAt: resets.0), sevenDay: UsageWindow(used: 30, resetsAt: resets.1),
+                sampledAt: date, source: UsageParser.statusLineSource))
+        }
+        let folded = LiveUsageFold.readings([event(45, at: now.addingTimeInterval(60)), event(50, at: now.addingTimeInterval(120))],
+                                            scope: LiveUsageEvent.defaultScope, known: read, since: .distantPast, at: now.addingTimeInterval(130))
+        expectEqual(folded.count, 2); expectEqual(folded.last?.fiveHour?.used, 50)
+        expectEqual(folded.last?.fable?.used, 62); expectEqual(folded.last?.fableSampledAt, now)
+        // The account in use, on fresh status line readings, is polled again once its Fable figure is 15 minutes old.
+        var active = Account(label: "Active", kind: .oauth); active.lastChecked = now
+        active.usage = folded.last; active.usage?.sampledAt = now.addingTimeInterval(899)
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(899)))
+        active.usage?.sampledAt = now.addingTimeInterval(900)
+        expect(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(900)))
+        active.usage?.fable = nil
+        expectFalse(UsagePolling.due(active, active: true, autoRelay: true, urgent: false, watching: true, at: now.addingTimeInterval(900)))
+    }
     /// Unused logins renew an hour ahead; the default threshold stays 1%.
     func testRenewalLeadIsOneHour() {
         expectEqual(RelayPolicy.renewalLead, 3600)
@@ -856,6 +911,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         suite.testUnreadableCredentialKeepsItsReason()
         suite.testUsagePollingKeepsAlternatesAndResetsMoving()
         try suite.testParserRejectsMalformedAndBooleanUsage()
+        try suite.testFableWindow()
         suite.testRenewalLeadIsOneHour()
         try suite.testRejectedRefreshLeavesAutomaticRelayUntilReauthorized()
         suite.testAccountJustLeftIsSkippedUntilTheCooldownEnds()
@@ -887,7 +943,7 @@ func expectThrows<T>(_ body: @autoclosure () throws -> T) { do { _ = try body();
         try credentialTransferChecks()
         currentLoginChecks()
         try oauthCredentialFileChecks()
-        print("PASS: 51 rule suites + secure storage checks — boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, early hand-off tiers, lilt account lookup, terminal session rules, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
+        print("PASS: 52 rule suites + secure storage checks — Fable window (limits[] row, kept through status line readings, polled every 15 minutes, outside relay), boundaries, freshness, last-known display, reset, candidates, live relay, held trigger, keychain hex, stored preferences, token renewal, read-back, status line readings, deduplication, backoff, Retry-After and its log line, a 429 wait kept across relaunch, renewal after a refused token and its log line, per-account 429, usage scope, exhausted accounts held, unreadable reason kept, parsing, renewal lead, refresh quarantine, departure cooldown, sooner weekly, automatic order, no weekly limit first, emptiest account first, the account taken read first, moving on from a spent one, retry at the first reset, a threshold per window, pace ahead of the threshold, update versions, update feed, update boundaries, burst channel, early hand-off tiers, lilt account lookup, terminal session rules, candidate margin and switch cost, preparation timing, retry at the earliest applicable time, per-event spool and high-water mark, fold rules, project rules, import plan and transaction, encrypted archive, saving the current login, OAuth credential files")
     }
 }
 

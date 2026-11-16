@@ -106,6 +106,16 @@ final class ConcurrencyChecks: Sendable {
         expectEqual(SessionRules.firstHolder([a], threshold: 1, at: .now)?.id, a.id)
         expectEqual(SessionRules.relayOrder([a.id, b.id, c.id, d.id], after: c.id), [d.id, a.id, b.id])
         expectEqual(SessionRules.relayOrder([a.id, b.id], after: nil), [a.id, b.id])
+        // A stored login newer than the session's copy (signed in again) supersedes it; one the session's CLI renewed,
+        // the same one, or one without an expiry does not.
+        func login(_ name: String, expires: Int64?) -> Data {
+            Data(#"{"claudeAiOauth":{"accessToken":"fixture-access-\#(name)","refreshToken":"fixture-refresh-\#(name)"\#(expires.map { ",\"expiresAt\":\($0)" } ?? "")}}"#.utf8)
+        }
+        let inSession = login("held", expires: 4_102_444_800_000), signedInAgain = login("again", expires: 4_102_448_400_000)
+        expect(SessionRules.superseded(stored: signedInAgain, held: inSession))
+        expect(!SessionRules.superseded(stored: inSession, held: signedInAgain))
+        expect(!SessionRules.superseded(stored: inSession, held: inSession))
+        expect(!SessionRules.superseded(stored: login("token", expires: nil), held: inSession))
         let split = SessionRules.split(["001", "ent", "-c", "--model", "opus"])
         expectEqual(split.selectors, ["001", "ent"]); expectEqual(split.passthrough, ["-c", "--model", "opus"])
         let prompt = SessionRules.split(["001", "--", "fix the build", "-p"])

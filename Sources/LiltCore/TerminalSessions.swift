@@ -109,6 +109,15 @@ public enum SessionRules {
         return nil
     }
 
+    /// Whether the login a session's scope holds is older than the one Lilt stores for the same account. Lilt never
+    /// renews a login a session holds, so a newer stored one means the user signed the account in again (or imported
+    /// it) after it went into the session: the scope's copy was replaced on purpose and has nothing left to keep. A
+    /// session that ended then clears it at once instead of waiting `readBackGrace` for a proof that cannot come.
+    public static func superseded(stored: Data, held: Data) -> Bool {
+        guard let kept = OAuthDocument.expiry(stored), let inScope = OAuthDocument.expiry(held) else { return false }
+        return inScope < kept
+    }
+
     /// The account a new session starts on: the first listed that its last reading does not show used up until a
     /// reset, an account without a reading counting as worth a try; the first listed when all are used up.
     public static func firstHolder(_ pool: [Account], threshold: Thresholds, at now: Date) -> Account? {

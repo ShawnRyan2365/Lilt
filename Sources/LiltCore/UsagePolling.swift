@@ -9,6 +9,10 @@ public enum UsagePolling {
     public static let relayUrgentInterval: TimeInterval = 60
     public static let resetSlack: TimeInterval = 5
     public static let alternatesPerPass = 2
+    /// How old the Fable figure of the account in use may get while status line readings keep it from being polled.
+    /// Only the usage endpoint reports Fable, so it is read at this pace, no faster than the account in use was read
+    /// before the status line existed.
+    public static let fableInterval: TimeInterval = 900
 
     public static func paceLifetime(of usage: UsageSnapshot) -> TimeInterval {
         usage.source == UsageParser.statusLineSource ? 300 : relayActiveInterval
@@ -69,7 +73,8 @@ public enum UsagePolling {
         if resetNeedsRefresh(account.usage, lastChecked: account.lastChecked, at: now) { return true }
         if active, let usage = account.usage, usage.source == UsageParser.statusLineSource {
             let liveWindow: TimeInterval = autoRelay ? 60 : 300
-            if now.timeIntervalSince(usage.sampledAt) < liveWindow { return false }
+            let fableDue = usage.fable != nil && now.timeIntervalSince(usage.fableSampledAt ?? usage.sampledAt) >= fableInterval
+            if now.timeIntervalSince(usage.sampledAt) < liveWindow, !fableDue { return false }
         }
         let age = now.timeIntervalSince(account.lastChecked ?? .distantPast)
         return age < 0 || age >= interval(active: active, autoRelay: autoRelay, urgent: urgent, watching: watching)

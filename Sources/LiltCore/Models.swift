@@ -30,8 +30,18 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     public var sevenDay: UsageWindow?
     public var sampledAt: Date
     public var source: String
-    public init(fiveHour: UsageWindow? = nil, sevenDay: UsageWindow? = nil, sampledAt: Date = .now, source: String = "OAuth usage · 实验接口") {
+    /// The Fable models' own weekly window, which Claude's usage page shows as "Current week (Fable)". On Max and Ultra
+    /// plans (and premium seats) Fable may take up to half of the weekly limit: this is how much of that half is used.
+    /// Fable also counts toward `sevenDay`, so either one running out stops Fable. Display only; relay never reads it.
+    /// Nil when the plan has no such window (Pro and standard seats pay for Fable with credits) or the reading has none.
+    public var fable: UsageWindow?
+    /// When `fable` was read. Only the usage endpoint reports it; a status line reading keeps the last one it was given
+    /// with this time, so a figure carried along is never shown as newer than it is.
+    public var fableSampledAt: Date?
+    public init(fiveHour: UsageWindow? = nil, sevenDay: UsageWindow? = nil, sampledAt: Date = .now, source: String = "OAuth usage · 实验接口",
+                fable: UsageWindow? = nil, fableSampledAt: Date? = nil) {
         self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.sampledAt = sampledAt; self.source = source
+        self.fable = fable; self.fableSampledAt = fable == nil ? nil : fableSampledAt ?? sampledAt
     }
     public func isFresh(at now: Date, lifetime: TimeInterval = 60) -> Bool {
         let age = now.timeIntervalSince(sampledAt)
@@ -478,7 +488,38 @@ public enum UsageParser {
             return UsageWindow(used: value.doubleValue, resetsAt: reset)
         }
         guard root.keys.contains("five_hour") || root.keys.contains("seven_day") else { throw UsageFailure.invalidResponse }
-        return try UsageSnapshot(fiveHour: window("five_hour"), sevenDay: window("seven_day"), sampledAt: now)
+        return try UsageSnapshot(fiveHour: window("five_hour"), sevenDay: window("seven_day"), sampledAt: now, fable: fable(in: root))
+    }
+
+    /// The Fable row of the endpoint's `limits[]`: kind `weekly_scoped`, scoped to a model whose display name starts
+    /// with "Fable", the way Claude Code 2.1.325 picks it for "Current week (Fable)". The CLI names the same window
+    /// `seven_day_overage_included` ("Fable limit") where it reads response headers. With several such rows, the fullest
+    /// counts. A malformed row is left out rather than failing the read: the two main windows still decide relay.
+    static func fable(in root: [String: Any]) -> UsageWindow? {
+        guard let rows = root["limits"] as? [[String: Any]] else { return nil }
+        var found: UsageWindow?
+        for row in rows where row["kind"] as? String == "weekly_scoped" {
+            guard let scope = row["scope"] as? [String: Any], let model = scope["model"] as? [String: Any],
+                  let name = model["display_name"] as? String, isFable(name),
+                  let percent = row["percent"] as? NSNumber, CFGetTypeID(percent) != CFBooleanGetTypeID(),
+                  percent.doubleValue.isFinite, (0...100).contains(percent.doubleValue) else { continue }
+            var reset: Date?
+            if let text = row["resets_at"] as? String {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                reset = formatter.date(from: text)
+                if reset == nil { formatter.formatOptions = [.withInternetDateTime]; reset = formatter.date(from: text) }
+                guard reset != nil else { continue }
+            }
+            if found.map({ percent.doubleValue > $0.used }) ?? true { found = UsageWindow(used: percent.doubleValue, resetsAt: reset) }
+        }
+        return found
+    }
+    /// "Fable", "Fable 5.2": the word itself, in any case, not a name that merely begins with those letters.
+    static func isFable(_ name: String) -> Bool {
+        let words = name.trimmingCharacters(in: .whitespaces).lowercased()
+        guard words.hasPrefix("fable") else { return false }
+        return words.dropFirst(5).first.map { !($0.isLetter || $0.isNumber || $0 == "_") } ?? true
     }
 }
 import CoreFoundation

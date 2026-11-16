@@ -134,8 +134,10 @@ struct MainView: View {
                 .buttonStyle(.liltIcon(.filled))
                 .help("刷新额度").accessibilityLabel("刷新当前账号额度")
             }
+            // A third meter (Fable) narrows all three, so the default window still keeps them in one row.
+            let three = active.usage?.fable != nil
             ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 36) { meters(active).frame(minWidth: 220) }
+                HStack(alignment: .top, spacing: three ? 28 : 36) { meters(active).frame(minWidth: three ? 170 : 220) }
                 VStack(alignment: .leading, spacing: 24) { meters(active) }
             }
         }
@@ -146,6 +148,7 @@ struct MainView: View {
         let unreadable = active.usageCapability == .unavailable
         UsageMeter(kind: .fiveHour, snapshot: active.usage, threshold: model.thresholds.fiveHour, unreadable: unreadable)
         UsageMeter(kind: .sevenDay, snapshot: active.usage, threshold: model.thresholds.sevenDay, unreadable: unreadable)
+        if active.usage?.fable != nil { UsageMeter(kind: .fable, snapshot: active.usage, threshold: 0) }
     }
     /// Who runs next. Left to right is relay order; pressing an orb passes the baton.
     private var track: some View {
@@ -224,7 +227,7 @@ struct MainView: View {
     // MARK: Accounts
     private var accountsPage: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if model.accounts.isEmpty { EmptyAccounts(model: model) } else { AccountColumnLabels().padding(.bottom, -4) }
+            if model.accounts.isEmpty { EmptyAccounts(model: model) } else { AccountColumnLabels(kinds: model.quotaColumns).padding(.bottom, -4) }
             ForEach(Array(model.accounts.enumerated()), id: \.element.id) { index, account in
                 AccountRow(model: model, account: account, index: index, selection: inUse,
                            onRename: { rename = account.label; renameID = account.id }, onDelete: { deleteAccount = account })
