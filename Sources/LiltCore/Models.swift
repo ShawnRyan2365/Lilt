@@ -30,10 +30,11 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     public var sevenDay: UsageWindow?
     public var sampledAt: Date
     public var source: String
-    /// The Fable models' own weekly window, which Claude's usage page shows as "Current week (Fable)". On Max and Ultra
-    /// plans (and premium seats) Fable may take up to half of the weekly limit: this is how much of that half is used.
+    /// The Fable models' own weekly window, which Claude's usage page shows as "Current week (Fable)". Where a plan
+    /// includes Fable, it may take up to half of the weekly limit: this is how much of that half is used. Which plans
+    /// include it changes (Max, Ultra and premium seats; Pro and standard seats too during the Fable 5.2 launch week,
+    /// 2026-11-09 to 11-16 PT), so nothing here is decided by plan: the endpoint reports the window or it does not.
     /// Fable also counts toward `sevenDay`, so either one running out stops Fable. Display only; relay never reads it.
-    /// Nil when the plan has no such window (Pro and standard seats pay for Fable with credits) or the reading has none.
     public var fable: UsageWindow?
     /// When `fable` was read. Only the usage endpoint reports it; a status line reading keeps the last one it was given
     /// with this time, so a figure carried along is never shown as newer than it is.
